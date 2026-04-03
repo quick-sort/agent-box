@@ -9,6 +9,7 @@ services:
     volumes:
       - ./data:/home/node/.openclaw
       - ./workspace:/home/node/.openclaw/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - TZ=Asia/Shanghai
     # 如需使用 host 网络模式（推荐用于本地开发）:
