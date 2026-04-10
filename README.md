@@ -1,148 +1,111 @@
-# OpenClaw + Claude Code Docker Image
+# Agent Box
 
-预装 uv、qqbot、weixin channel 的 OpenClaw Docker 镜像，使用清华镜像源加速。
+集成 OpenClaw + Claude Code + GitHub Runner 的 AI 开发环境 Docker 镜像。
 
-## 特性
+## 内置工具
 
-- **OpenClaw**: AI Agent 运行时，支持 Claude Code 工具
-- **uv**: Python 包管理器
-- **qqbot**: QQ 机器人通道
-- **weixin**: 微信通道（官方 ClawBot）
-- **清华镜像源**: apt、npm、pip、uv 全部使用国内镜像加速
+OpenClaw, Claude Code, GitHub Actions Runner, pnpm, uv (Python), Rust, Git, gh CLI, Docker CLI, Chromium
 
 ## 快速开始
 
-### 1. 复制配置
-
 ```bash
-cp openclaw.json.example openclaw.json
-```
-
-编辑 `openclaw.json`，填入你的配置：
-
-- `models.providers.claude.apiKey`: Anthropic API Key
-- `channels.qqbot.appId` / `clientSecret`: QQ 机器人凭据
-- `channels.weixin.*`: 微信 ClawBot 凭据
-- `gateway.auth.token`: 访问令牌
-
-### 2. 构建镜像
-
-```bash
-docker build -t openclaw-cq .
-```
-
-### 3. 运行
-
-```bash
+cp docker-compose.yml docker-compose.override.yml
+# 编辑 override 文件填入环境变量
 docker-compose up -d
 ```
 
-或手动运行：
+## 环境变量
 
-```bash
-docker run -d \
-  --name openclaw \
-  -p 18789:18789 \
-  -p 18790:18790 \
-  -v $(pwd)/data:/home/node/.openclaw \
-  -v $(pwd)/workspace:/home/node/.openclaw/workspace \
-  openclaw-cq
-```
+### LLM (Claude Code + OpenClaw 共用)
 
-### 4. 访问
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `ANTHROPIC_API_KEY` | API Key | - |
+| `ANTHROPIC_BASE_URL` | API 端点 | `https://api.anthropic.com` |
+| `ANTHROPIC_MODEL` | 模型名称 | `claude-sonnet-4-5` |
+| `CLAUDE_CODE_USE_BEDROCK` | 使用 Bedrock | - |
+| `CLAUDE_CODE_USE_VERTEX` | 使用 Vertex | - |
 
-- Web UI: http://localhost:18789
-- Gateway API: http://localhost:18790
+### OpenClaw Channel
 
-默认访问令牌: `your-dev-token-change me`（请在配置中修改）
+| 变量 | 说明 |
+|------|------|
+| `OPENCLAW_CHANNEL_TYPE` | `qqbot` 或 `feishu` |
+| `OPENCLAW_GATEWAY_TOKEN` | Gateway 令牌 |
+| `QQBOT_APP_ID` | QQ 机器人 AppID |
+| `QQBOT_CLIENT_SECRET` | QQ 机器人 Secret |
+| `FEISHU_APP_ID` | 飞书 AppID |
+| `FEISHU_APP_SECRET` | 飞书 AppSecret |
+| `FEISHU_VERIFICATION_TOKEN` | 飞书验证 Token |
+| `FEISHU_ENCRYPT_KEY` | 飞书加密 Key |
 
-## 端口说明
+### GitHub Runner
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `GITHUB_TOKEN` | GitHub PAT | - |
+| `GITHUB_RUNNER_REPO` | 仓库 `owner/repo` | - |
+| `GITHUB_RUNNER_NAME` | Runner 名称 | `agent-box` |
+| `GITHUB_RUNNER_LABELS` | 标签 | `self-hosted,agent-box` |
+
+## 服务启动条件
+
+| 服务 | 条件 |
+|------|------|
+| OpenClaw | `ANTHROPIC_API_KEY` + `OPENCLAW_CHANNEL_TYPE` 已设置 |
+| GitHub Runner | `GITHUB_TOKEN` + `GITHUB_RUNNER_REPO` 已设置 |
+
+两者都未配置时容器进入 sleep 模式，可通过 `docker exec` 进入使用。
+
+## 配置持久化
+
+初始化脚本检查配置文件是否存在：
+- 存在 → 跳过（支持重启保留配置）
+- 不存在 → 从环境变量生成
+
+配置文件位置：
+- OpenClaw: `data/openclaw.json`
+- Claude Code: `data/../.claude/settings.json`
+
+## 端口
 
 | 端口 | 用途 |
 |------|------|
-| 18789 | Web 控制界面 |
+| 18789 | OpenClaw Web UI |
 | 18790 | Gateway API |
 
-## 目录说明
+## 数据卷
 
-| 目录 | 用途 |
+| 挂载 | 用途 |
 |------|------|
-| `data/` | OpenClaw 配置和数据持久化 |
-| `workspace/` | Agent 工作目录 |
-
-## 环境变量
-
-| 变量 | 说明 | 默认值 |
-|------|------|-------|
-| `TZ` | 时区 | `Asia/Shanghai` |
-
-## 获取 QQ 机器人凭据
-
-1. 访问 [QQ 开放平台](https://q.qq.com/)
-2. 创建应用 → 选择 QQ 小程序或公众号
-3. 获取 `AppID` 和 `AppSecret`
-4. 在 [QQ BOT 管理平台](https://bot.q.qq.com/) 配置机器人
-
-## 获取微信 ClawBot 凭据
-
-微信需要使用官方 ilink 服务：
-
-1. 访问 [微信 ilink](https://ilinkai.weixin.qq.com/)
-2. 创建企业/个人 Bot
-3. 获取 `AppID`、`AppSecret`、`Token`、`EncodingAESKey`
+| `./data` → `/home/node/.openclaw` | 配置 + 数据 |
+| `./workspace` → `/home/node/.openclaw/workspace` | 工作目录 |
+| `/var/run/docker.sock` | Docker 操作 |
 
 ## 常用命令
 
 ```bash
-# 查看日志
-docker-compose logs -f
+docker-compose logs -f          # 查看日志
+docker-compose down             # 停止
+docker-compose restart          # 重启
+docker exec -it agent-box bash  # 进入容器
 
-# 停止服务
-docker-compose down
-
-# 重启服务
-docker-compose restart
-
-# 进入容器
-docker exec -it openclaw bash
+# 容器内
+openclaw --help
+claude --help
+gh --help
+rustc --version
+uv --version
+pnpm --version
 ```
 
-## OpenClaw CLI
+## 构建
 
 ```bash
-# 在容器内执行
-docker exec -it openclaw openclaw --help
-
-# 启动
-docker exec -it openclaw openclaw start
-
-# 查看版本
-docker exec -it openclaw openclaw --version
-
-# 安装插件
-docker exec -it openclaw openclaw plugins install <package>
-
-# 列出插件
-docker exec -it openclaw openclaw plugins list
+docker build -t agent-box .
 ```
 
-## 更新 OpenClaw
-
-```bash
-docker-compose pull
-docker-compose up -d
-```
-
-## 注意事项
-
-1. 首次启动后，需要在 Web UI 中完成 AI 模型配置
-2. QQ/微信 需要在对应的开发者平台完成认证
-3. 建议修改默认的 `gateway.auth.token`
-4. 数据目录 `data/` 会持久化配置，请定期备份
-
-## 仓库地址
-
-https://github.com/justlovemaki/openclaw-docker-cn-im
+镜像通过 GitHub Actions 自动构建并推送到 GHCR。
 
 ## License
 

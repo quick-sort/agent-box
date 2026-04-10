@@ -1,132 +1,133 @@
-# OpenClaw + Claude Code Docker Image
-# 预装: uv, qqbot, weixin channel, 清华镜像源
+# Agent Box - Integrated AI Development Environment
 FROM node:22-slim
 
-# 设置工作目录
 WORKDIR /app
 
-# 配置 Debian 清华镜像源
+# ============================================================
+# 1. System dependencies + apt mirror
+# ============================================================
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-       bash \
-       ca-certificates \
-       chromium \
-       curl \
-       fonts-liberation \
-       fonts-noto-cjk \
-       fonts-noto-color-emoji \
-       git \
-       gosu \
-       jq \
-       python3 \
-       python3-pip \
-       python3-venv \
-       socat \
-       tini \
-       unzip \
-       websockify \
+       bash ca-certificates chromium curl fonts-liberation fonts-noto-cjk \
+       fonts-noto-color-emoji git gosu jq python3 python3-pip python3-venv \
+       socat tini unzip websockify libicu-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 GitHub CLI (gh)
+# ============================================================
+# 2. GitHub CLI (gh)
+# ============================================================
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null \
+      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y gh \
-    && rm -rf /var/lib/apt/lists/*
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
-# 安装 Docker CLI (通过挂载宿主机 /var/run/docker.sock 控制宿主机 Docker)
+# ============================================================
+# 3. Docker CLI
+# ============================================================
 RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
-    | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian bookworm stable" \
-    | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y docker-ce-cli \
-    && rm -rf /var/lib/apt/lists/*
+      > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y docker-ce-cli && rm -rf /var/lib/apt/lists/*
 
-# 配置 npm 清华镜像源
-RUN npm config set registry https://mirrors.tuna.tsinghua.edu.cn/npm/
+# ============================================================
+# 4. pnpm
+# ============================================================
+RUN npm config set registry https://mirrors.tuna.tsinghua.edu.cn/npm/ \
+    && npm install -g pnpm
 
-# 更新 npm
-RUN npm install -g npm@latest
-
-# 安装 bun
-RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
-ENV BUN_INSTALL="/usr/local"
-ENV PATH="$BUN_INSTALL/bin:$PATH"
-
-# 安装 uv (Python 包管理器) - 使用清华镜像
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local sh \
-    && uv pip install --system --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple pip --upgrade
-
-# 配置 pip 清华镜像源
+# ============================================================
+# 5. uv (Python package manager)
+# ============================================================
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local sh
 RUN mkdir -p /etc/xdg/uv \
-    && echo '[global]\nindex-url = https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple' > /etc/xdg/uv/uv.toml \
-    && mkdir -p /root/.config/pip \
-    && echo '[global]\nindex-url = https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple' > /root/.config/pip/pip.conf
+    && printf '[pip]\nindex-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"\n' > /etc/xdg/uv/uv.toml
 
-# 安装 qmd
-RUN bun install -g https://github.com/tobi/qmd
+# ============================================================
+# 6. Rust (rustup) with Tsinghua mirror
+# ============================================================
+ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:$PATH"
 
-# 安装 OpenClaw
+# ============================================================
+# 7. Claude Code CLI
+# ============================================================
+RUN npm install -g @anthropic-ai/claude-code
+
+# ============================================================
+# 8. OpenClaw + plugins
+# ============================================================
 RUN npm install -g openclaw@latest
 
-# 安装 Playwright 和 Chromium
+# Playwright (Node.js + Python) with Chromium
 RUN npm install -g playwright && npx playwright install chromium --with-deps
+RUN uv pip install --system playwright
 
-# 安装 playwright-extra 和 stealth 插件
-RUN npm install -g playwright-extra puppeteer-extra-plugin-stealth
-
-# 安装 bird
-RUN npm install -g @steipete/bird
-
-# 创建配置目录并设置权限
-RUN mkdir -p /home/node/.openclaw/workspace \
+# Create dirs
+RUN mkdir -p /home/node/.openclaw/workspace /home/node/.claude \
     && chown -R node:node /home/node
 
-# 切换到 node 用户安装插件
 USER node
 
-# 安装 QQ 机器人插件
+# QQBot plugin
 RUN cd /tmp \
     && git clone https://github.com/tencent-connect/openclaw-qqbot.git qqbot \
-    && cd qqbot \
-    && timeout 300 openclaw plugins install . || true
+    && cd qqbot && timeout 300 openclaw plugins install . || true
 
-# 安装微信插件 (官方微信 ClawBot)
-RUN timeout 300 openclaw plugins install @tencent-weixin/openclaw-weixin || true
+# Feishu plugin
+RUN timeout 300 openclaw plugins install @nicepkg/openclaw-plugin-feishu || true
 
-# 切换回 root
 USER root
 
-# 确保 extensions 目录权限正确
+# Fix extension permissions
 RUN if [ -d /home/node/.openclaw/extensions ]; then \
-      find /home/node/.openclaw/extensions -type d -name node_modules -prune -o -exec chown node:node {} +; \
+      chown -R node:node /home/node/.openclaw/extensions; \
     fi
 
-# 配置 UV 镜像给 node 用户
-RUN mkdir -p /home/node/.config/pip \
-    && echo '[global]\nindex-url = https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple' > /home/node/.config/pip/pip.conf \
-    && chown -R node:node /home/node/.config
+# ============================================================
+# 9. GitHub Actions Runner
+# ============================================================
+ARG RUNNER_VERSION=2.322.0
+ARG RUNNER_ARCH=linux-x64
+RUN mkdir -p /opt/runner \
+    && cd /opt/runner \
+    && curl -fsSL -o runner.tar.gz \
+       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
+    && tar xzf runner.tar.gz && rm runner.tar.gz \
+    && ./bin/installdependencies.sh || true \
+    && chown -R node:node /opt/runner
 
-# 复制初始化脚本
-COPY ./init.sh /usr/local/bin/init.sh
-RUN chmod +x /usr/local/bin/init.sh
+# ============================================================
+# 10. Copy scripts
+# ============================================================
+COPY scripts/init.py /usr/local/bin/init.py
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 设置基础环境变量
+# ============================================================
+# 11. Environment
+# ============================================================
 ENV HOME=/home/node \
     TERM=xterm-256color \
     NODE_PATH=/usr/local/lib/node_modules \
-    UV_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+    UV_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
+    PATH="/home/node/.cargo/bin:$PATH"
 
-# 暴露端口
+# Move rust toolchain to node user
+RUN if [ -d /root/.rustup ]; then \
+      mv /root/.rustup /home/node/.rustup && mv /root/.cargo /home/node/.cargo \
+      && chown -R node:node /home/node/.rustup /home/node/.cargo; \
+    fi
+ENV RUSTUP_HOME=/home/node/.rustup
+ENV CARGO_HOME=/home/node/.cargo
+
 EXPOSE 18789 18790
 
-# 设置工作目录
 WORKDIR /home/node
 
-# 使用初始化脚本作为入口点
-ENTRYPOINT ["/bin/bash", "/usr/local/bin/init.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,7 +1,7 @@
 services:
-  openclaw:
+  agent-box:
     build: .
-    container_name: openclaw
+    container_name: agent-box
     restart: unless-stopped
     ports:
       - "18789:18789"
@@ -10,7 +10,7 @@ services:
       - ./data:/home/node/.openclaw
       - ./workspace:/home/node/.openclaw/workspace
       - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
     environment:
       - TZ=Asia/Shanghai
-    # 如需使用 host 网络模式（推荐用于本地开发）:
-    # network_mode: host
