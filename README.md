@@ -1,5 +1,7 @@
 # Agent Box
 
+[![Build and Push Docker Image](https://github.com/quick-sort/agent-box/actions/workflows/docker.yml/badge.svg)](https://github.com/quick-sort/agent-box/actions/workflows/docker.yml)
+
 集成 OpenClaw + Claude Code + GitHub Runner 的 AI 开发环境 Docker 镜像。
 
 ## 内置工具
