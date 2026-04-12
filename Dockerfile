@@ -44,6 +44,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local sh
 RUN mkdir -p /etc/xdg/uv \
     && printf '[pip]\nindex-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"\n' > /etc/xdg/uv/uv.toml
+ENV PATH="/usr/local/bin:$PATH"
 
 # ============================================================
 # 6. Rust (rustup) with Tsinghua mirror
@@ -65,7 +66,7 @@ RUN npm install -g openclaw@latest
 
 # Playwright (Node.js + Python) with Chromium
 RUN npm install -g playwright && npx playwright install chromium --with-deps
-RUN uv pip install --system playwright
+RUN pip3 install playwright
 
 # Create dirs
 RUN mkdir -p /home/node/.openclaw/workspace /home/node/.claude \
