@@ -9,7 +9,7 @@ WORKDIR /app
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-       bash ca-certificates chromium curl fonts-liberation fonts-noto-cjk \
+       bash ca-certificates chromium curl gnupg fonts-liberation fonts-noto-cjk \
        fonts-noto-color-emoji git gosu jq python3 python3-pip python3-venv \
        socat tini unzip websockify libicu-dev \
     && rm -rf /var/lib/apt/lists/*
