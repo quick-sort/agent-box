@@ -36,8 +36,7 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
 # ============================================================
 # 4. pnpm
 # ============================================================
-RUN npm config set registry https://mirrors.tuna.tsinghua.edu.cn/npm/ \
-    && npm install -g pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # ============================================================
 # 5. uv (Python package manager)
