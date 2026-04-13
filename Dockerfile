@@ -66,7 +66,7 @@ RUN npm install -g openclaw@latest
 
 # Playwright (Node.js + Python) with Chromium
 RUN npm install -g playwright && npx playwright install chromium --with-deps
-RUN pip3 install playwright
+RUN uv pip install --system playwright
 
 # Create dirs
 RUN mkdir -p /home/node/.openclaw/workspace /home/node/.claude \
