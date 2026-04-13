@@ -66,7 +66,6 @@ RUN npm install -g openclaw@latest
 
 # Playwright (Node.js + Python) with Chromium
 RUN npm install -g playwright && npx playwright install chromium --with-deps
-RUN uv pip install --system playwright
 
 # Create dirs
 RUN mkdir -p /home/node/.openclaw/workspace /home/node/.claude \
@@ -116,7 +115,7 @@ ENV HOME=/home/node \
     TERM=xterm-256color \
     NODE_PATH=/usr/local/lib/node_modules \
     UV_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
-    PATH="/home/node/.cargo/bin:$PATH"
+    PATH="/home/node/.cargo/bin:/usr/local/bin:$PATH"
 
 # Move rust toolchain to node user
 RUN if [ -d /root/.rustup ]; then \
