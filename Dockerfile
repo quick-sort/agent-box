@@ -20,7 +20,6 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN uv sync --no-dev
 
-COPY channels/ channels/
 COPY src/ src/
 
 # Persist weixin state and project data across restarts
