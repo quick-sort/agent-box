@@ -66,7 +66,8 @@ async def test_weixin_start_polls_and_emits(tmp_path):
 
     send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
 
-    with patch("agent_box.channels.weixin.AccountClient") as MockAC:
+    with patch("agent_box.channels.weixin.AccountClient") as MockAC, \
+         patch("agent_box.channels.weixin._resolve_account_id", return_value="fake_id"):
         MockAC.from_store.return_value = fake_account
         channel = WeixinChannel(send)
         channel.account = fake_account
