@@ -6,7 +6,7 @@ from pathlib import Path
 import anyio
 import pytest
 
-from agent_box.models import IncomingMessage, OutgoingMessage, ProjectInfo
+from agent_box.models import IncomingMessage, OutgoingMessage
 from agent_box.session_manager import SessionManager
 
 
@@ -19,7 +19,7 @@ def _make_app(tmp_path: Path):
     from agent_box.main import App
 
     with patch("agent_box.main.settings") as mock_settings:
-        mock_settings.workspace = tmp_path / "workspace"
+        mock_settings.workspace_dir = tmp_path / "workspace"
         mock_settings.router_agent_type = "claude_code"
         with patch("agent_box.main.Router") as MockRouter:
             app = App.__new__(App)
@@ -29,15 +29,26 @@ def _make_app(tmp_path: Path):
     return app
 
 
+def _async_iter_agent(reply_text):
+    """Create a mock agent whose run() yields a single OutgoingMessage."""
+    mock_agent = MagicMock()
+
+    async def fake_run(*args, **kwargs):
+        yield OutgoingMessage(text=reply_text, user_id=kwargs.get("user_id", ""))
+
+    mock_agent.run = fake_run
+    mock_agent.project = MagicMock()
+    mock_agent.project.session_id = None
+    return mock_agent
+
+
 @pytest.mark.anyio
 async def test_handle_message_default(tmp_path: Path):
     """Unmatched message goes to _default project."""
     app = _make_app(tmp_path)
     app.router.route = AsyncMock(return_value="DEFAULT")
 
-    mock_agent = AsyncMock()
-    mock_agent.run = AsyncMock(return_value="default reply")
-    mock_agent.project = ProjectInfo(slug="_default", name="_default", path=str(tmp_path))
+    mock_agent = _async_iter_agent("default reply")
 
     with patch("agent_box.main.create_agent", return_value=mock_agent):
         send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
@@ -59,9 +70,7 @@ async def test_handle_message_new_project(tmp_path: Path):
     app = _make_app(tmp_path)
     app.router.route = AsyncMock(return_value="NEW_PROJECT My App")
 
-    mock_agent = AsyncMock()
-    mock_agent.run = AsyncMock(return_value="agent reply")
-    mock_agent.project = ProjectInfo(slug="my-app", name="My App", path=str(tmp_path))
+    mock_agent = _async_iter_agent("agent reply")
 
     with patch("agent_box.main.create_agent", return_value=mock_agent):
         send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
@@ -87,9 +96,7 @@ async def test_handle_message_existing_project(tmp_path: Path):
     app.sessions.create("web-app")
     app.router.route = AsyncMock(return_value="web-app")
 
-    mock_agent = AsyncMock()
-    mock_agent.run = AsyncMock(return_value="done")
-    mock_agent.project = ProjectInfo(slug="web-app", name="web-app", path=str(tmp_path))
+    mock_agent = _async_iter_agent("done")
 
     with patch("agent_box.main.create_agent", return_value=mock_agent):
         send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)

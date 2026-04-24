@@ -6,7 +6,6 @@ import socket
 import ssl
 from dataclasses import asdict
 from http.client import HTTPResponse
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin

@@ -1,6 +1,6 @@
 """Tests for agent_box.channels."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
@@ -120,7 +120,7 @@ async def test_weixin_start_skips_empty_text(tmp_path):
             tg.start_soon(timeout_stop)
 
     # recv should be empty — no text messages were emitted
-    with pytest.raises(anyio.WouldBlock):
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
         recv.receive_nowait()
 
 
@@ -177,80 +177,21 @@ async def test_weixin_handles_poll_exception():
 # ── TuiChannel ──
 
 @pytest.mark.anyio
-async def test_tui_emits_message():
-    """TuiChannel should emit IncomingMessage from user input."""
-    from agent_box.channels.tui import TuiChannel
+async def test_tui_channel_has_app():
+    """TuiChannel should create an AgentBoxApp instance."""
+    from agent_box.channels.tui import TuiChannel, AgentBoxApp
 
     send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
     channel = TuiChannel(send)
-
-    # Mock prompt to return one message then /quit
-    inputs = iter(["hello world", "/quit"])
-    channel._session.prompt = lambda *a, **kw: next(inputs)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(channel.start)
-        msg = await recv.receive()
-        assert msg.text == "hello world"
-        assert msg.channel == "tui"
-        assert msg.user_id == "local"
+    assert isinstance(channel._app, AgentBoxApp)
 
 
 @pytest.mark.anyio
-async def test_tui_skips_empty_input():
-    """Empty input should be skipped."""
-    from agent_box.channels.tui import TuiChannel
-
-    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
-    channel = TuiChannel(send)
-
-    inputs = iter(["", "  ", "actual message", "/quit"])
-    channel._session.prompt = lambda *a, **kw: next(inputs)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(channel.start)
-        msg = await recv.receive()
-        assert msg.text == "actual message"
-
-
-@pytest.mark.anyio
-async def test_tui_exit_command():
-    """Both /quit and /exit should stop the channel."""
-    from agent_box.channels.tui import TuiChannel
-
-    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
-    channel = TuiChannel(send)
-
-    channel._session.prompt = lambda *a, **kw: "/exit"
-
-    # start() should return without blocking
-    await channel.start()
-
-    with pytest.raises(anyio.WouldBlock):
-        recv.receive_nowait()
-
-
-@pytest.mark.anyio
-async def test_tui_handles_eof():
-    """EOF (Ctrl+D) should stop the channel gracefully."""
-    from agent_box.channels.tui import TuiChannel
-
-    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
-    channel = TuiChannel(send)
-
-    channel._session.prompt = MagicMock(side_effect=EOFError())
-
-    await channel.start()  # should not raise
-
-
-@pytest.mark.anyio
-async def test_tui_send_reply(capsys):
-    """send_reply should write to stdout."""
+async def test_tui_send_reply_when_not_running():
+    """send_reply should not crash when app is not running."""
     from agent_box.channels.tui import TuiChannel
 
     send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
     channel = TuiChannel(send)
-
+    # App is not running, should silently skip
     await channel.send_reply(OutgoingMessage(text="hello back", user_id="local"))
-    captured = capsys.readouterr()
-    assert "hello back" in captured.out

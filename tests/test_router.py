@@ -1,6 +1,6 @@
 """Tests for agent_box.router."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,9 +15,14 @@ def _msg(text: str) -> IncomingMessage:
 def _make_router(tmp_projects: SessionManager, agent_response: str = "DEFAULT"):
     """Create a Router with a mocked agent."""
     from agent_box.router.router import Router
+    from agent_box.models import OutgoingMessage, MessageType
 
-    mock_agent = AsyncMock()
-    mock_agent.run = AsyncMock(return_value=agent_response)
+    mock_agent = MagicMock()
+
+    async def fake_run(*args, **kwargs):
+        yield OutgoingMessage(text=agent_response, user_id="", type=MessageType.text)
+
+    mock_agent.run = fake_run
 
     with patch("agent_box.router.router.create_agent", return_value=mock_agent):
         router = Router(tmp_projects)
@@ -47,7 +52,7 @@ async def test_switch_existing(tmp_projects: SessionManager):
     tmp_projects.create("web-app")
     router = _make_router(tmp_projects)
     result = await router.route(_msg("/switch web-app"))
-    assert result == "web-app"
+    assert result == "SWITCH web-app"
 
 
 @pytest.mark.anyio

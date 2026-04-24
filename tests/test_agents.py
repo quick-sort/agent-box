@@ -1,6 +1,6 @@
 """Tests for agent_box.agents."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -102,12 +102,13 @@ async def test_run_collects_text(sample_project: ProjectInfo):
     mock_client.receive_response = fake_receive
 
     agent = ClaudeCodeAgent(sample_project)
-    with patch("agent_box.agents.claude_code.ClaudeSDKClient", return_value=mock_client):
-        agent._client = mock_client
-        result = await agent.run("test prompt")
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("test prompt")]
 
     mock_client.query.assert_awaited_once_with("test prompt")
-    assert result == "Hello \nWorld"
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert "Hello" in texts[0]
+    assert "World" in texts[1]
     assert agent.project.session_id == "sess-abc"
 
 
@@ -128,8 +129,9 @@ async def test_run_no_response(sample_project: ProjectInfo):
 
     agent = ClaudeCodeAgent(sample_project)
     agent._client = mock_client
-    result = await agent.run("test")
-    assert result == "(no response)"
+    msgs = [m async for m in agent.run("test")]
+    # Only a result message, no text
+    assert all(m.type.value == "result" for m in msgs)
 
 
 @pytest.mark.anyio
