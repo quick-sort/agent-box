@@ -1,16 +1,9 @@
 services:
   agent-box:
     build: .
-    container_name: agent-box
-    restart: unless-stopped
-    ports:
-      - "18789:18789"
-      - "18790:18790"
+    env_file: .env
     volumes:
-      - ./data:/home/node/.openclaw
-      - ./workspace:/home/node/.openclaw/workspace
-      - /var/run/docker.sock:/var/run/docker.sock
-    env_file:
-      - .env
-    environment:
-      - TZ=Asia/Shanghai
+      - agent-data:/root
+
+volumes:
+  agent-data:

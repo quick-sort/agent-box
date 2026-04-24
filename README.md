@@ -1,113 +1,125 @@
-# Agent Box
+# agent-box
 
-[![Build and Push Docker Image](https://github.com/quick-sort/agent-box/actions/workflows/docker.yml/badge.svg)](https://github.com/quick-sort/agent-box/actions/workflows/docker.yml)
+IM → Router → Agent pipeline. Chat via WeChat (or terminal), route messages to project-specific Claude Code sessions.
 
-集成 OpenClaw + Claude Code + GitHub Runner 的 AI 开发环境 Docker 镜像。
+## Architecture
 
-## 内置工具
-
-OpenClaw, Claude Code, GitHub Actions Runner, pnpm, uv (Python), Rust, Git, gh CLI, Docker CLI, Chromium
-
-## 快速开始
-
-```bash
-cp docker-compose.yml docker-compose.override.yml
-# 编辑 override 文件填入环境变量
-docker-compose up -d
+```
+Channel (WeChat / TUI) → Router Agent → Project Agent → Channel
+                            │                 │
+                            │ classifies      │ Claude Code SDK
+                            │ to project      │ cwd = project folder
+                            ▼                 ▼
+                       SessionManager    ~/.claude/projects/
 ```
 
-## 环境变量
+- Single user, no auth
+- Concurrent agents — each message runs in its own task
+- Session persistence via `continue_conversation=True`
+- Router uses one-shot query to classify messages to projects
 
-### LLM (Claude Code + OpenClaw 共用)
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `ANTHROPIC_API_KEY` | API Key | - |
-| `ANTHROPIC_BASE_URL` | API 端点 | `https://api.anthropic.com` |
-| `ANTHROPIC_MODEL` | 模型名称 | `claude-sonnet-4-5` |
-| `CLAUDE_CODE_USE_BEDROCK` | 使用 Bedrock | - |
-| `CLAUDE_CODE_USE_VERTEX` | 使用 Vertex | - |
-
-### OpenClaw Channel
-
-| 变量 | 说明 |
-|------|------|
-| `OPENCLAW_CHANNEL_TYPE` | `qqbot` 或 `feishu` |
-| `OPENCLAW_GATEWAY_TOKEN` | Gateway 令牌 |
-| `QQBOT_APP_ID` | QQ 机器人 AppID |
-| `QQBOT_CLIENT_SECRET` | QQ 机器人 Secret |
-| `FEISHU_APP_ID` | 飞书 AppID |
-| `FEISHU_APP_SECRET` | 飞书 AppSecret |
-| `FEISHU_VERIFICATION_TOKEN` | 飞书验证 Token |
-| `FEISHU_ENCRYPT_KEY` | 飞书加密 Key |
-
-### GitHub Runner
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `GITHUB_TOKEN` | GitHub PAT | - |
-| `GITHUB_RUNNER_REPO` | 仓库 `owner/repo` | - |
-| `GITHUB_RUNNER_NAME` | Runner 名称 | `agent-box` |
-| `GITHUB_RUNNER_LABELS` | 标签 | `self-hosted,agent-box` |
-
-## 服务启动条件
-
-| 服务 | 条件 |
-|------|------|
-| OpenClaw | `ANTHROPIC_API_KEY` + `OPENCLAW_CHANNEL_TYPE` 已设置 |
-| GitHub Runner | `GITHUB_TOKEN` + `GITHUB_RUNNER_REPO` 已设置 |
-
-两者都未配置时容器进入 sleep 模式，可通过 `docker exec` 进入使用。
-
-## 配置持久化
-
-初始化脚本检查配置文件是否存在：
-- 存在 → 跳过（支持重启保留配置）
-- 不存在 → 从环境变量生成
-
-配置文件位置：
-- OpenClaw: `data/openclaw.json`
-- Claude Code: `data/../.claude/settings.json`
-
-## 端口
-
-| 端口 | 用途 |
-|------|------|
-| 18789 | OpenClaw Web UI |
-| 18790 | Gateway API |
-
-## 数据卷
-
-| 挂载 | 用途 |
-|------|------|
-| `./data` → `/home/node/.openclaw` | 配置 + 数据 |
-| `./workspace` → `/home/node/.openclaw/workspace` | 工作目录 |
-| `/var/run/docker.sock` | Docker 操作 |
-
-## 常用命令
+## Quick Start
 
 ```bash
-docker-compose logs -f          # 查看日志
-docker-compose down             # 停止
-docker-compose restart          # 重启
-docker exec -it agent-box bash  # 进入容器
+# 1. Clone & install
+git clone https://github.com/quick-sort/agent-box.git
+cd agent-box
+uv sync
 
-# 容器内
-openclaw --help
-claude --help
-gh --help
-rustc --version
-uv --version
-pnpm --version
+# 2. Configure
+cp sample.env .env
+# Edit .env — fill in ANTHROPIC_AUTH_TOKEN and other settings
+
+# 3. Run (terminal mode)
+uv run agent-box --tui
+
+# 4. Run (WeChat mode)
+uv run agent-box
 ```
 
-## 构建
+## Docker
+
+```bash
+cp sample.env .env
+# Edit .env with your settings
+
+docker compose up -d
+```
+
+Or build manually:
 
 ```bash
 docker build -t agent-box .
+docker run --env-file .env -v agent-data:/root agent-box
 ```
 
-镜像通过 GitHub Actions 自动构建并推送到 GHCR。
+The Docker image includes Node.js, Claude Code CLI, GitHub CLI (`gh`), and uv.
+
+On first startup, `entrypoint.sh` auto-initializes Claude Code config (`~/.claude.json` and `~/.claude/settings.json`).
+
+## Configuration
+
+All settings are configured via environment variables (or `.env` file). See `sample.env` for a full template.
+
+| Variable | Description | Default |
+|---|---|---|
+| `CONFIG_DIR` | Base config directory | `~/.agent-box` |
+| `WORKSPACE_DIR` | Project workspace root | `~/.agent-box/workspace` |
+| `WEIXIN_ACCOUNT_ID` | WeChat account ID | — |
+| `AGENTS` | Enabled agents (comma-separated) | `claude_code` |
+| `DEFAULT_AGENT` | Default agent backend | `claude_code` |
+| `AGENT_PERMISSION_MODE` | Claude Code permission mode | `bypassPermissions` |
+| `AGENT_MAX_TURNS` | Max agent turns per request | — |
+| `ROUTER_AGENT_TYPE` | Agent type for router | `claude_code` |
+| `ROUTER_MODEL` | Model override for router | — |
+| `ANTHROPIC_AUTH_TOKEN` | API token for Anthropic | — |
+| `ANTHROPIC_BASE_URL` | Anthropic API base URL | — |
+
+## Chat Commands
+
+- `/list` — list all projects
+- `/new-project <name>` — create a new project
+- `/switch <name>` — pin messages to a project
+- `/switch auto` — return to auto-routing
+
+## Project Structure
+
+```
+src/agent_box/
+├── main.py              # App: wires channels → router → agents
+├── config.py            # pydantic-settings from .env
+├── models.py            # IncomingMessage, OutgoingMessage, ProjectInfo
+├── session_manager.py   # Session registry + filesystem
+├── channels/
+│   ├── base.py          # BaseChannel ABC
+│   ├── weixin.py        # WeixinChannel (long-poll)
+│   └── tui.py           # TuiChannel (terminal REPL)
+├── router/
+│   └── router.py        # Router (one-shot query)
+└── agents/
+    ├── base.py          # BaseAgent ABC
+    └── claude_code.py   # ClaudeCodeAgent
+```
+
+## CI/CD
+
+Push to `main` or tag `v*` triggers:
+
+1. CI — lint (`ruff`) + tests (`pytest`)
+2. Docker build & push to `ghcr.io/quick-sort/agent-box`
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/quick-sort/agent-box:latest
+```
+
+## Development
+
+```bash
+uv sync --dev
+uv run ruff check .
+uv run pytest
+```
 
 ## License
 
