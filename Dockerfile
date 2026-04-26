@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ARG UID=1000
+ARG GID=1000
+
 # Install Node.js (required by Claude Code CLI) and uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git \
@@ -12,18 +15,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs gh \
     && npm install -g @anthropic-ai/claude-code@2.1.110 \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid $GID app \
+    && useradd --uid $UID --gid $GID -m app \
+    && curl -fsSL https://github.com/tianon/gosu/releases/download/1.18/gosu-amd64 -o /usr/local/bin/gosu \
+    && chmod +x /usr/local/bin/gosu
 
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/home/app/.local/bin:$PATH"
+ENV HOME="/home/app"
 
 WORKDIR /app
-COPY pyproject.toml .
+COPY --chown=app:app pyproject.toml .
 RUN uv sync --no-dev
 
-COPY src/ src/
+COPY --chown=app:app src/ src/
 
 # Persist weixin state and project data across restarts
-VOLUME ["/root"]
+VOLUME ["/home/app"]
 
 COPY entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

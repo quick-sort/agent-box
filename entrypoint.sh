@@ -1,7 +1,7 @@
 #!/bin/sh
-if [ ! -f /root/.claude.json ]; then
-  echo '{"hasCompletedOnboarding":true}' > /root/.claude.json
-  mkdir -p /root/.claude
-  echo '{"skipWebFetchPreflight":true}' > /root/.claude/settings.json
+if [ ! -f "$HOME/.claude.json" ]; then
+  echo '{"hasCompletedOnboarding":true}' > "$HOME/.claude.json"
+  mkdir -p "$HOME/.claude"
+  echo '{"skipWebFetchPreflight":true}' > "$HOME/.claude/settings.json"
 fi
-exec "$@"
+exec gosu app "$@"
