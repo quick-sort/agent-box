@@ -166,7 +166,7 @@ async def test_weixin_handles_poll_exception():
 
     send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
 
-    with patch("agent_box.channels.weixin.AccountClient"):
+    with patch("agent_box.channels.weixin.AccountClient.from_store", return_value=fake_account):
         channel = WeixinChannel.__new__(WeixinChannel)
         channel.send_stream = send
         channel._account_id = "fake-account"
