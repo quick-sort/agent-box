@@ -18,14 +18,14 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL = 1.0  # seconds between polls on empty response
 
 
-def _resolve_account_id(store: StateStore) -> str:
-    """Return account_id from env or from saved active account."""
+def _resolve_account_id(store: StateStore) -> str | None:
+    """Return account_id from env or from saved active account, or None if not found."""
     if settings.weixin_account_id:
         return settings.weixin_account_id
     saved = store.load_active_account_id()
     if saved:
         return saved
-    raise RuntimeError("No WEIXIN_ACCOUNT_ID set and no saved account found. Run login first.")
+    return None
 
 
 class WeixinChannel(BaseChannel):
@@ -34,11 +34,23 @@ class WeixinChannel(BaseChannel):
     def __init__(self, send_stream: anyio.abc.ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
         self._store = StateStore(settings.weixin_state_dir)
-        account_id = _resolve_account_id(self._store)
-        self.account = AccountClient.from_store(account_id, store=self._store)
+        self._account_id = _resolve_account_id(self._store)
+        self.account: AccountClient | None = None
 
     async def start(self) -> None:
-        log.info("weixin channel started for account %s", settings.weixin_account_id)
+        while True:
+            account_id = self._account_id or _resolve_account_id(self._store)
+            if account_id is None:
+                log.warning(
+                    "No weixin account found. Set WEIXIN_ACCOUNT_ID or run weixin-sdk login first. "
+                    "Retrying in 60 seconds."
+                )
+                await anyio.sleep(60)
+                continue
+            self._account_id = account_id
+            break
+        self.account = AccountClient.from_store(self._account_id, store=self._store)
+        log.info("weixin channel started for account %s", self._account_id)
         try:
             while True:
                 try:
@@ -66,6 +78,9 @@ class WeixinChannel(BaseChannel):
 
     async def send_reply(self, msg: OutgoingMessage) -> None:
         if msg.type != MessageType.text:
+            return
+        if self.account is None:
+            log.warning("Weixin account not initialized, cannot send reply.")
             return
         await anyio.to_thread.run_sync(
             lambda: self.account.send_text(to_user_id=msg.user_id, text=msg.text)
