@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update \
     && apt-get install -y nodejs gh \
     && npm install -g @anthropic-ai/claude-code@2.1.110 \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && UV_INSTALL_DIR=/usr/local/bin curl -LsSf https://astral.sh/uv/install.sh | sh \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid $GID app \
     && useradd --uid $UID --gid $GID -m app \
