@@ -50,12 +50,37 @@ Or build manually:
 
 ```bash
 docker build -t agent-box .
-docker run --env-file .env -v agent-data:/root agent-box
+docker run --env-file .env -v agent-data:/home/app agent-box
 ```
 
 The Docker image includes Node.js, Claude Code CLI, GitHub CLI (`gh`), and uv.
 
-On first startup, `entrypoint.sh` auto-initializes Claude Code config (`~/.claude.json` and `~/.claude/settings.json`).
+On first startup, `entrypoint.sh` auto-initializes Claude Code config (`$HOME/.claude.json` and `$HOME/.claude/settings.json`).
+
+## WeChat Channel Setup
+
+To receive messages via WeChat personal account, you need to log in once to obtain credentials:
+
+```bash
+# Scan QR code with WeChat to authenticate
+uv run python -m agent_box.channels.weixin_sdk login
+```
+
+The login flow:
+1. Prints a QR code in the terminal (or a URL if `qrcode` lib not installed)
+2. Scan with WeChat app and confirm
+3. Credentials are saved to `~/.agent-box/channels/weixin/`
+
+Once logged in, `uv run agent-box` will automatically pick up the saved account and start receiving messages. If no account is found, it retries every 60 seconds — so you can log in mid-flight.
+
+**Other useful commands:**
+```bash
+# List logged-in accounts
+uv run python -m agent_box.channels.weixin_sdk accounts
+
+# Override account manually via env
+WEIXIN_ACCOUNT_ID=<your-account-id> uv run agent-box
+```
 
 ## Configuration
 
