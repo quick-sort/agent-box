@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 class App:
     def __init__(self) -> None:
-        self.sessions = SessionManager(settings.workspace)
+        self.sessions = SessionManager(settings.workspace_dir)
         self.router = Router(self.sessions)
         self.agents: dict[str, BaseAgent] = {}
 
