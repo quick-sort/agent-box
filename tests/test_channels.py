@@ -107,6 +107,8 @@ async def test_weixin_start_skips_empty_text(tmp_path):
     with patch("agent_box.channels.weixin.AccountClient"):
         channel = WeixinChannel.__new__(WeixinChannel)
         channel.send_stream = send
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
         channel.account = fake_account
 
         async with anyio.create_task_group() as tg:
@@ -134,6 +136,8 @@ async def test_weixin_send_reply():
 
     with patch("agent_box.channels.weixin.AccountClient"):
         channel = WeixinChannel.__new__(WeixinChannel)
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
         channel.account = fake_account
 
         await channel.send_reply(OutgoingMessage(text="reply", user_id="wx_user"))
@@ -165,6 +169,8 @@ async def test_weixin_handles_poll_exception():
     with patch("agent_box.channels.weixin.AccountClient"):
         channel = WeixinChannel.__new__(WeixinChannel)
         channel.send_stream = send
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
         channel.account = fake_account
 
         async with anyio.create_task_group() as tg:
