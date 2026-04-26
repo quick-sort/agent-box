@@ -21,12 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://github.com/tianon/gosu/releases/download/1.18/gosu-amd64 -o /usr/local/bin/gosu \
     && chmod +x /usr/local/bin/gosu
 
-ENV PATH="/home/app/.local/bin:$PATH"
 ENV HOME="/home/app"
+ENV UV_CACHE_DIR="/var/cache/uv"
 
 WORKDIR /app
 COPY --chown=app:app pyproject.toml .
-RUN uv sync --no-dev
+RUN mkdir -p /var/cache/uv && chown app:app /var/cache/uv
+RUN gosu app uv sync --no-dev
 
 COPY --chown=app:app src/ src/
 
