@@ -13,20 +13,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
     && apt-get install -y nodejs gh \
-    && npm install -g @anthropic-ai/claude-code@2.1.110 \
     && pip install uv \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid $GID app \
     && useradd --uid $UID --gid $GID -m app \
+    && mkdir -p /home/app/.npm-global /home/app/.cache/uv \
+    && npm config set registry https://registry.npmmirror.com \
+    && npm install -g @anthropic-ai/claude-code@2.1.110 --prefix /home/app/.npm-global \
+    && chown -R app:app /home/app \
     && curl -fsSL https://github.com/tianon/gosu/releases/download/1.18/gosu-amd64 -o /usr/local/bin/gosu \
     && chmod +x /usr/local/bin/gosu
 
 ENV HOME="/home/app"
-ENV UV_CACHE_DIR="/var/cache/uv"
+ENV UV_CACHE_DIR="/home/app/.cache/uv"
+ENV NPM_CONFIG_PREFIX="/home/app/.npm-global"
+ENV PATH="/home/app/.npm-global/bin:${PATH}"
 
 WORKDIR /app
 COPY --chown=app:app pyproject.toml .
-RUN mkdir -p /var/cache/uv && chown app:app /var/cache/uv && chown -R app:app /app /home/app && gosu app uv sync --no-dev
+RUN chown -R app:app /app && gosu app uv sync --no-dev
 
 COPY --chown=app:app src/ src/
 
