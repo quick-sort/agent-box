@@ -26,7 +26,7 @@ ENV UV_CACHE_DIR="/var/cache/uv"
 
 WORKDIR /app
 COPY --chown=app:app pyproject.toml .
-RUN mkdir -p /var/cache/uv && chown app:app /var/cache/uv && chown -R app:app /app && gosu app uv sync --no-dev
+RUN mkdir -p /var/cache/uv && chown app:app /var/cache/uv && chown -R app:app /app /home/app && gosu app uv sync --no-dev
 
 COPY --chown=app:app src/ src/
 
