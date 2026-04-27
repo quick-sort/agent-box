@@ -1,6 +1,6 @@
 [project]
 name = "agent-box"
-version = "0.1.0"
+version = "0.1.2"
 description = "IM → Router → Agent pipeline for managing coding projects via chat"
 requires-python = ">=3.12"
 dependencies = [
