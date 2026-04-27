@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     volumes:
-      - agent-data:/root
+      - agent-data:/home/app
 
 volumes:
   agent-data:
