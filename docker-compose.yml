@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     volumes:
-      - agent-data:/home/app
+      - agent-data:/home/nonroot
 
 volumes:
   agent-data:
