@@ -28,14 +28,13 @@ COPY pyproject.toml uv.lock src /app
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
-
 USER agent
-RUN --mount=type=cache,target=/home/agent/.cache/uv uv sync --frozen --no-dev
-COPY entrypoint.sh /entrypoint.sh
-RUN chown -R agent:agent /app \
+RUN uv sync --frozen --no-dev \
+    && chown -R agent:agent /app \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '~/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110
+COPY entrypoint.sh /entrypoint.sh
 ENV PATH="~/.npm-global/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uv", "run", "agent-box"]
