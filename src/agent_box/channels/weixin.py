@@ -60,6 +60,13 @@ class WeixinChannel(BaseChannel):
                         if not text:
                             continue
                         user_id = raw_msg.get("from_user_id", "")
+                        try:
+                            await anyio.to_thread.run_sync(
+                                lambda uid=user_id: self._send_typing(uid),
+                                abandon_on_cancel=True,
+                            )
+                        except Exception:
+                            log.debug("failed to send typing indicator to %s", user_id)
                         await self.send_stream.send(
                             IncomingMessage(
                                 text=text,
@@ -75,6 +82,12 @@ class WeixinChannel(BaseChannel):
                     await anyio.sleep(POLL_INTERVAL)
         finally:
             await self.send_stream.aclose()
+
+    def _send_typing(self, user_id: str) -> None:
+        assert self.account is not None
+        ticket = self.account.get_typing_ticket(user_id=user_id)
+        if ticket:
+            self.account.send_typing(user_id=user_id, typing_ticket=ticket)
 
     async def send_reply(self, msg: OutgoingMessage) -> None:
         if msg.type != MessageType.text:
