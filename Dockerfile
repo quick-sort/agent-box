@@ -29,7 +29,7 @@ COPY pyproject.toml uv.lock src /app
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
 USER agent
-RUN chown -R agent:agent /app \
+RUN chown -R agent:agent /app /home/agent \
     && uv sync --frozen --no-dev \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '~/.npm-global' \
