@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && groupadd --gid $GID app \
     && useradd --uid $UID --gid $GID -m app \
     && mkdir -p /home/app/.npm-global /home/app/.cache/uv \
-    && npm config set registry https://registry.npmmirror.com \
+    && echo "registry=https://registry.npmmirror.com" > /home/app/.npmrc \
     && npm install -g @anthropic-ai/claude-code@2.1.110 --prefix /home/app/.npm-global \
     && chown -R app:app /home/app \
     && curl -fsSL https://github.com/tianon/gosu/releases/download/1.18/gosu-amd64 -o /usr/local/bin/gosu \
@@ -29,14 +29,14 @@ ENV UV_CACHE_DIR="/home/app/.cache/uv"
 ENV NPM_CONFIG_PREFIX="/home/app/.npm-global"
 ENV PATH="/home/app/.npm-global/bin:${PATH}"
 
+# Persist weixin state and project data across restarts
+VOLUME ["/home/app"]
+
 WORKDIR /app
-COPY --chown=app:app pyproject.toml .
+COPY --chown=app:app pyproject.toml uv.lock ./
 RUN chown -R app:app /app && gosu app uv sync --no-dev
 
 COPY --chown=app:app src/ src/
-
-# Persist weixin state and project data across restarts
-VOLUME ["/home/app"]
 
 COPY entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
