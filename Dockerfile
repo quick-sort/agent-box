@@ -35,9 +35,11 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
 
-COPY entrypoint.sh /entrypoint.sh
 USER agent
+COPY entrypoint.sh /entrypoint.sh
 RUN echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
+    && npm config set prefix '~/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110
+ENV PATH="~/.npm-global/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uv", "run", "agent-box"]
