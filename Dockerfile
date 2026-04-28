@@ -26,11 +26,11 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project
+    uv sync --frozen --no-install-project
 
 COPY pyproject.toml uv.lock src /app
 
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
