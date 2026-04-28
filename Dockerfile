@@ -30,7 +30,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY pyproject.toml uv.lock src /app
 
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev \
+    && chown -R agent:agent /app
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
@@ -42,4 +43,4 @@ RUN echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm install -g @anthropic-ai/claude-code@2.1.110
 ENV PATH="~/.npm-global/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["uv", "run", "agent-box"]
+CMD ["uv", "run", "--frozen", "agent-box"]
