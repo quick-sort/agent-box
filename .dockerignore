@@ -5,6 +5,7 @@ workspace/
 *.md
 LICENSE
 docs/
+.venv/
 .env
 *.env
 !sample.env
