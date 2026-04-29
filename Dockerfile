@@ -6,7 +6,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git wget unzip \
     && curl -o- https://fnm.vercel.app/install | bash \
-    && source /root/.bashrc \
+    && . /root/.bashrc \
     && fnm install 24 \
     && corepack enable pnpm \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
