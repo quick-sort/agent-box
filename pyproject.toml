@@ -30,8 +30,6 @@ dev = [
 ]
 
 [tool.uv]
-python-preference = "only-system"
-environments = ["python_version >= '3.12'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
