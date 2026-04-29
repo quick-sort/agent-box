@@ -3,12 +3,14 @@ FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Install Node.js (required by Claude Code CLI) and uv
+ENV FNM_DIR="/opt/fnm"
+ENV PATH="/opt/fnm/aliases/default/bin:$PATH"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git wget unzip \
-    && curl -o- https://fnm.vercel.app/install | bash \
-    && . /root/.bashrc \
+    && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
     && fnm install 24 \
-    && corepack enable pnpm \
+    && fnm default 24 \
+    && chmod -R 755 /opt/fnm/aliases/default/bin \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
