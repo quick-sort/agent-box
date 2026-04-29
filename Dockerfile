@@ -1,22 +1,23 @@
 FROM python:3.12-slim
 
-ARG UID=1000
-ARG GID=1000
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Install Node.js (required by Claude Code CLI) and uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates git \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+        curl ca-certificates git wget unzip \
+    && curl -o- https://fnm.vercel.app/install | bash \
+    && source /root/.bashrc \
+    && fnm install 24 \
+    && corepack enable pnpm \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends nodejs gh \
+    && apt-get install -y --no-install-recommends gh \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid $GID agent \
-    && useradd --uid $UID --gid $GID -m agent \
+    && groupadd --gid 999 agent \
+    && useradd --uid 1000 --gid 999 -m agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110
