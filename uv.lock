@@ -6,7 +6,7 @@ supported-markers = [
 
 [[package]]
 name = "agent-box"
-version = "0.1.2"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
