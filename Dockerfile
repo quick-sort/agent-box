@@ -32,10 +32,6 @@ ENV HOME="/home/agent"
 
 
 COPY pyproject.toml uv.lock /app/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project
-
-
 COPY src /app/src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked
