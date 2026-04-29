@@ -24,17 +24,19 @@ VOLUME ["/home/agent"]
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock src /app
+COPY pyproject.toml uv.lock /app/
+COPY src /app/src
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV HOME="/home/agent"
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
+
 RUN chown -R agent:agent /app /home/agent 
 USER agent
-RUN uv sync --frozen --no-dev \
+RUN uv sync --frozen --no-dev --no-editable \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '~/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110
-COPY entrypoint.sh /entrypoint.sh
 ENV PATH="~/.npm-global/bin:$PATH"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uv", "run", "agent-box"]
