@@ -9,17 +9,6 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-      - run: uv sync --dev
-      - run: uv run ruff check .
-      - run: uv run pytest
-
   docker:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
