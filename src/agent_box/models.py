@@ -39,9 +39,8 @@ class OutgoingMessage:
 
 @dataclass
 class ProjectInfo:
-    """Metadata for a managed project."""
+    """Metadata for a managed project. Identified by ``name``."""
 
-    slug: str
     name: str
     path: str  # absolute path to project folder
     agent_type: str = "claude_code"

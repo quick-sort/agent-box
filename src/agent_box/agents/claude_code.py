@@ -6,9 +6,9 @@ import json
 import logging
 from collections.abc import AsyncIterator
 
-from claude_code_sdk import (
+from claude_agent_sdk import (
     AssistantMessage,
-    ClaudeCodeOptions,
+    ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
     SystemMessage,
@@ -33,8 +33,8 @@ class ClaudeCodeAgent(BaseAgent):
         super().__init__(project)
         self._client: ClaudeSDKClient | None = None
 
-    def _build_options(self) -> ClaudeCodeOptions:
-        opts = ClaudeCodeOptions(
+    def _build_options(self) -> ClaudeAgentOptions:
+        opts = ClaudeAgentOptions(
             cwd=self.project.path,
             permission_mode=settings.agent_permission_mode,
             max_turns=settings.agent_max_turns,
@@ -49,7 +49,7 @@ class ClaudeCodeAgent(BaseAgent):
         if self._client is None:
             self._client = ClaudeSDKClient(self._build_options())
             await self._client.connect()
-            log.info("agent connected for project %s", self.project.slug)
+            log.info("agent connected for project %s", self.project.name)
         return self._client
 
     async def run(self, prompt: str, user_id: str = "") -> AsyncIterator[OutgoingMessage]:

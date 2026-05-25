@@ -1,6 +1,7 @@
 """Tests for agent_box.router."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,102 +13,140 @@ def _msg(text: str) -> IncomingMessage:
     return IncomingMessage(text=text, user_id="u1", channel="test")
 
 
-def _make_router(tmp_projects: SessionManager, agent_response: str = "DEFAULT"):
-    """Create a Router with a mocked agent."""
+def _make_router(tmp_projects: SessionManager, *, tool_call=None):
+    """Create a Router whose underlying anthropic client returns a fixed
+    response (either a single tool_use block or nothing)."""
     from agent_box.router.router import Router
-    from agent_box.models import OutgoingMessage, MessageType
 
-    mock_agent = MagicMock()
-
-    async def fake_run(*args, **kwargs):
-        yield OutgoingMessage(text=agent_response, user_id="", type=MessageType.text)
-
-    mock_agent.run = fake_run
-
-    with patch("agent_box.router.router.create_agent", return_value=mock_agent):
+    with patch("agent_box.router.router.AsyncAnthropic"):
         router = Router(tmp_projects)
 
-    router._agent = mock_agent
+    fake_resp = SimpleNamespace(content=[tool_call] if tool_call else [])
+    router._client = MagicMock()
+    router._client.messages = MagicMock()
+    router._client.messages.create = AsyncMock(return_value=fake_resp)
     return router
 
 
-# ── Explicit commands ──
+def _tool(tool_name: str, **inputs):
+    """Build a MagicMock that satisfies ``isinstance(_, ToolUseBlock)``."""
+    from agent_box.router.router import ToolUseBlock
+
+    fake = MagicMock(spec=ToolUseBlock)
+    fake.name = tool_name
+    fake.input = inputs
+    return fake
+
+
+# ── Forward (no tool call) ──
 
 @pytest.mark.anyio
-async def test_new_project_command(tmp_projects: SessionManager):
-    router = _make_router(tmp_projects)
-    result = await router.route(_msg("/new-project My App"))
-    assert result == "NEW_PROJECT My App"
-
-
-@pytest.mark.anyio
-async def test_new_project_underscore(tmp_projects: SessionManager):
-    router = _make_router(tmp_projects)
-    result = await router.route(_msg("/new_project foo bar"))
-    assert result == "NEW_PROJECT foo bar"
-
-
-@pytest.mark.anyio
-async def test_switch_existing(tmp_projects: SessionManager):
-    tmp_projects.create("web-app")
-    router = _make_router(tmp_projects)
-    result = await router.route(_msg("/switch web-app"))
-    assert result == "SWITCH web-app"
+async def test_forwards_to_default_when_no_tool_call(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=None)
+    result = await router.route(_msg("hello agent"))
+    assert result.reply is None
+    assert result.project == "_default"
 
 
 @pytest.mark.anyio
-async def test_switch_nonexistent(tmp_projects: SessionManager):
-    router = _make_router(tmp_projects)
-    result = await router.route(_msg("/switch nope"))
-    assert result == "DEFAULT"
+async def test_forwards_to_pinned_project(tmp_projects: SessionManager):
+    tmp_projects.create("pinned")
+    tmp_projects.set_current("pinned")
+    router = _make_router(tmp_projects, tool_call=None)
+    result = await router.route(_msg("do stuff"))
+    assert result.project == "pinned"
 
 
-# ── No projects → DEFAULT ──
-
-@pytest.mark.anyio
-async def test_no_projects_returns_default(tmp_projects: SessionManager):
-    router = _make_router(tmp_projects)
-    result = await router.route(_msg("do something"))
-    assert result == "DEFAULT"
-
-
-# ── Agent classification ──
+# ── create_project tool ──
 
 @pytest.mark.anyio
-async def test_agent_routes_to_known_project(tmp_projects: SessionManager):
-    tmp_projects.create("my-project")
-    router = _make_router(tmp_projects, agent_response="my-project")
-    result = await router.route(_msg("update the homepage"))
-    assert result == "my-project"
+async def test_create_project_tool(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("create_project", name="newp"))
+    result = await router.route(_msg("start a new project called newp"))
+    assert result.reply is not None and "newp" in result.reply
+    assert tmp_projects.get("newp") is not None
+    assert tmp_projects.get_current() == "newp"
 
 
 @pytest.mark.anyio
-async def test_agent_unknown_slug_returns_default(tmp_projects: SessionManager):
-    tmp_projects.create("real-project")
-    router = _make_router(tmp_projects, agent_response="nonexistent-slug")
-    result = await router.route(_msg("something random"))
-    assert result == "DEFAULT"
-
-
-@pytest.mark.anyio
-async def test_agent_suggests_new_project(tmp_projects: SessionManager):
+async def test_create_project_existing_switches(tmp_projects: SessionManager):
     tmp_projects.create("existing")
-    router = _make_router(tmp_projects, agent_response="NEW_PROJECT cool-idea")
-    result = await router.route(_msg("start a new project called cool-idea"))
-    assert result == "NEW_PROJECT cool-idea"
+    router = _make_router(tmp_projects, tool_call=_tool("create_project", name="existing"))
+    result = await router.route(_msg("create existing"))
+    assert result.reply is not None
+    assert tmp_projects.get_current() == "existing"
 
 
 @pytest.mark.anyio
-async def test_agent_multiline_takes_first_line(tmp_projects: SessionManager):
-    tmp_projects.create("my-proj")
-    router = _make_router(tmp_projects, agent_response="my-proj\nsome extra explanation")
-    result = await router.route(_msg("fix the bug"))
-    assert result == "my-proj"
+async def test_create_project_missing_name(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("create_project", name=""))
+    result = await router.route(_msg("create something"))
+    assert result.reply is not None and "required" in result.reply
 
 
-# ── .router folder ──
+# ── switch_project tool ──
+
+@pytest.mark.anyio
+async def test_switch_project_tool(tmp_projects: SessionManager):
+    tmp_projects.create("alpha")
+    router = _make_router(tmp_projects, tool_call=_tool("switch_project", name="alpha"))
+    result = await router.route(_msg("switch to alpha"))
+    assert result.reply is not None and "alpha" in result.reply
+    assert tmp_projects.get_current() == "alpha"
+
+
+@pytest.mark.anyio
+async def test_switch_unknown_project(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("switch_project", name="ghost"))
+    result = await router.route(_msg("switch to ghost"))
+    assert result.reply is not None and "Unknown" in result.reply
+
+
+@pytest.mark.anyio
+async def test_switch_to_default(tmp_projects: SessionManager):
+    tmp_projects.create("other")
+    tmp_projects.set_current("other")
+    router = _make_router(tmp_projects, tool_call=_tool("switch_project", name="_default"))
+    result = await router.route(_msg("go back to default"))
+    assert result.reply is not None
+    assert tmp_projects.get_current() == "_default"
+
+
+@pytest.mark.anyio
+async def test_switch_missing_name(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("switch_project", name=""))
+    result = await router.route(_msg("switch"))
+    assert result.reply is not None and "required" in result.reply
+
+
+# ── list_projects tool ──
+
+@pytest.mark.anyio
+async def test_list_projects_empty_after_ensure_default(tmp_projects: SessionManager):
+    # Router ctor ensures the default project exists, so it will appear here.
+    router = _make_router(tmp_projects, tool_call=_tool("list_projects"))
+    result = await router.route(_msg("what projects do I have?"))
+    assert result.reply is not None
+    assert "_default" in result.reply
+    assert "★" in result.reply
+
+
+@pytest.mark.anyio
+async def test_list_projects_with_pinned(tmp_projects: SessionManager):
+    tmp_projects.create("a")
+    tmp_projects.create("b")
+    tmp_projects.set_current("b")
+    router = _make_router(tmp_projects, tool_call=_tool("list_projects"))
+    result = await router.route(_msg("list"))
+    assert result.reply is not None
+    assert "a" in result.reply and "b" in result.reply
+    # 'b' should be marked with the star
+    star_line = next(line for line in result.reply.splitlines() if line.startswith("★"))
+    assert "b" in star_line
+
+
+# ── Router file layout ──
 
 def test_router_creates_dot_router_folder(tmp_projects: SessionManager):
-    router = _make_router(tmp_projects)
+    _make_router(tmp_projects)
     assert (tmp_projects.workspace / ".router").is_dir()
-    assert router._agent is not None

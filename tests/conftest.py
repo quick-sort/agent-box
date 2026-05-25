@@ -21,4 +21,4 @@ def sample_msg() -> IncomingMessage:
 def sample_project(tmp_path: Path) -> ProjectInfo:
     p = tmp_path / "test-proj"
     p.mkdir()
-    return ProjectInfo(slug="test-proj", name="Test Project", path=str(p))
+    return ProjectInfo(name="test-proj", path=str(p))

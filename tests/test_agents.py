@@ -26,7 +26,7 @@ def test_create_agent_not_enabled(sample_project: ProjectInfo):
     """Agent type exists but not in settings.agents."""
     from agent_box.config import settings
     original = settings.agents
-    settings.agents = ["opencode"]  # claude_code not enabled
+    settings.agents = ["opencode"]
     try:
         with pytest.raises(ValueError, match="not enabled"):
             create_agent("claude_code", sample_project)
@@ -80,7 +80,7 @@ async def test_ensure_client_creates_once(sample_project: ProjectInfo):
 
 @pytest.mark.anyio
 async def test_run_collects_text(sample_project: ProjectInfo):
-    from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
     mock_client = AsyncMock()
     mock_client.query = AsyncMock()
@@ -114,7 +114,7 @@ async def test_run_collects_text(sample_project: ProjectInfo):
 
 @pytest.mark.anyio
 async def test_run_no_response(sample_project: ProjectInfo):
-    from claude_code_sdk import ResultMessage
+    from claude_agent_sdk import ResultMessage
 
     mock_client = AsyncMock()
     mock_client.query = AsyncMock()
@@ -130,7 +130,6 @@ async def test_run_no_response(sample_project: ProjectInfo):
     agent = ClaudeCodeAgent(sample_project)
     agent._client = mock_client
     msgs = [m async for m in agent.run("test")]
-    # Only a result message, no text
     assert all(m.type.value == "result" for m in msgs)
 
 
@@ -148,4 +147,4 @@ async def test_close(sample_project: ProjectInfo):
 @pytest.mark.anyio
 async def test_close_when_no_client(sample_project: ProjectInfo):
     agent = ClaudeCodeAgent(sample_project)
-    await agent.close()  # should not raise
+    await agent.close()

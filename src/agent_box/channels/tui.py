@@ -18,7 +18,7 @@ from .base import BaseChannel
 
 log = logging.getLogger(__name__)
 
-_COMMANDS = ["/list", "/new-project", "/switch", "/quit", "/exit"]
+_COMMANDS = ["/quit", "/exit"]
 
 
 class AgentBoxApp(App):

@@ -7,6 +7,7 @@ import anyio
 import pytest
 
 from agent_box.models import IncomingMessage, OutgoingMessage
+from agent_box.router.base import RouteResult
 from agent_box.session_manager import SessionManager
 
 
@@ -20,7 +21,6 @@ def _make_app(tmp_path: Path):
 
     with patch("agent_box.main.settings") as mock_settings:
         mock_settings.workspace_dir = tmp_path / "workspace"
-        mock_settings.router_agent_type = "claude_code"
         with patch("agent_box.main.Router") as MockRouter:
             app = App.__new__(App)
             app.sessions = SessionManager(tmp_path / "workspace")
@@ -30,7 +30,7 @@ def _make_app(tmp_path: Path):
 
 
 def _async_iter_agent(reply_text):
-    """Create a mock agent whose run() yields a single OutgoingMessage."""
+    """Mock agent whose run() yields one OutgoingMessage."""
     mock_agent = MagicMock()
 
     async def fake_run(*args, **kwargs):
@@ -43,10 +43,10 @@ def _async_iter_agent(reply_text):
 
 
 @pytest.mark.anyio
-async def test_handle_message_default(tmp_path: Path):
-    """Unmatched message goes to _default project."""
+async def test_handle_message_forwards_to_default(tmp_path: Path):
+    """When router has no command, message is forwarded to pinned (default) project."""
     app = _make_app(tmp_path)
-    app.router.route = AsyncMock(return_value="DEFAULT")
+    app.router.route = AsyncMock(return_value=RouteResult(project="_default"))
 
     mock_agent = _async_iter_agent("default reply")
 
@@ -65,36 +65,26 @@ async def test_handle_message_default(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_handle_message_new_project(tmp_path: Path):
-    """NEW_PROJECT creates project and sends confirmation."""
+async def test_handle_message_router_reply_short_circuits(tmp_path: Path):
+    """If router returns a reply, App sends it and does not forward."""
     app = _make_app(tmp_path)
-    app.router.route = AsyncMock(return_value="NEW_PROJECT My App")
+    app.router.route = AsyncMock(return_value=RouteResult(reply="✅ Created project: foo"))
 
-    mock_agent = _async_iter_agent("agent reply")
-
-    with patch("agent_box.main.create_agent", return_value=mock_agent):
+    with patch("agent_box.main.create_agent") as mock_factory:
         send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
-        await app.handle_message(_msg("create my app"), send)
+        await app.handle_message(_msg("create a new project called foo"), send)
 
-    replies = []
-    while True:
-        try:
-            replies.append(recv.receive_nowait())
-        except anyio.WouldBlock:
-            break
-
-    texts = [r.text for r in replies]
-    assert any("Created project" in t for t in texts)
-    assert any("agent reply" in t for t in texts)
-    assert app.sessions.get("my-app") is not None
+    msg = recv.receive_nowait()
+    assert "Created project" in msg.text
+    mock_factory.assert_not_called()
 
 
 @pytest.mark.anyio
-async def test_handle_message_existing_project(tmp_path: Path):
-    """Route to existing project."""
+async def test_handle_message_forwards_to_pinned(tmp_path: Path):
+    """Forward to the project name returned by the router."""
     app = _make_app(tmp_path)
     app.sessions.create("web-app")
-    app.router.route = AsyncMock(return_value="web-app")
+    app.router.route = AsyncMock(return_value=RouteResult(project="web-app"))
 
     mock_agent = _async_iter_agent("done")
 
@@ -108,7 +98,7 @@ async def test_handle_message_existing_project(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_get_or_create_agent_caches(tmp_path: Path):
-    """Same slug should return same agent instance."""
+    """Same project name should return same agent instance."""
     app = _make_app(tmp_path)
     app.sessions.create("cached")
 
@@ -142,11 +132,10 @@ async def test_dispatch_loop_concurrent(tmp_path: Path):
         tg.start_soon(app._dispatch_loop, recv_in, send_out)
         await send_in.send(_msg("a"))
         await send_in.send(_msg("b"))
-        await anyio.sleep(0.05)  # let both start
+        await anyio.sleep(0.05)
         await send_in.aclose()
-        await anyio.sleep(0.2)  # let both finish
+        await anyio.sleep(0.2)
         tg.cancel_scope.cancel()
 
-    # Both should have started before either finished (concurrent)
     assert "start-a" in call_order
     assert "start-b" in call_order

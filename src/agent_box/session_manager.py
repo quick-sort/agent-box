@@ -1,10 +1,15 @@
-"""Session manager — manages project folders and a JSON registry under .router/."""
+"""Session manager — registry of projects and the currently pinned project.
+
+Stores two files under ``<workspace>/.router/``:
+
+- ``projects.json`` — map of ``name`` → ``ProjectInfo``
+- ``current_project`` — plain-text file holding the currently pinned project name
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 
 from .config import settings
@@ -12,14 +17,11 @@ from .models import ProjectInfo
 
 log = logging.getLogger(__name__)
 
-
-def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug or "project"
+DEFAULT_PROJECT_NAME = "_default"
 
 
 class SessionManager:
-    """Registry stored at <workspace>/.router/projects.json."""
+    """Project registry keyed by project name."""
 
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve()
@@ -27,6 +29,7 @@ class SessionManager:
         self._router_dir = self.workspace / ".router"
         self._router_dir.mkdir(parents=True, exist_ok=True)
         self._registry_path = self._router_dir / "projects.json"
+        self._current_path = self._router_dir / "current_project"
         self._projects: dict[str, ProjectInfo] = {}
         self._load()
 
@@ -34,68 +37,77 @@ class SessionManager:
     def router_dir(self) -> Path:
         return self._router_dir
 
+    # ── persistence ──
+
     def _load(self) -> None:
         if self._registry_path.exists():
             data = json.loads(self._registry_path.read_text())
-            self._projects = {
-                k: ProjectInfo(**v) for k, v in data.items()
-            }
+            self._projects = {k: ProjectInfo(**v) for k, v in data.items()}
 
     def _save(self) -> None:
         data = {k: v.__dict__ for k, v in self._projects.items()}
         self._registry_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-    def create(self, name: str, agent_type: str | None = None) -> ProjectInfo:
-        slug = _slugify(name)
-        base, i = slug, 1
-        while slug in self._projects:
-            slug = f"{base}-{i}"
-            i += 1
+    # ── projects ──
 
-        project_path = self.workspace / slug
+    def create(self, name: str, agent_type: str | None = None) -> ProjectInfo:
+        name = name.strip()
+        if not name:
+            raise ValueError("project name cannot be empty")
+        if name in self._projects:
+            return self._projects[name]
+
+        project_path = self.workspace / name
         project_path.mkdir(parents=True, exist_ok=True)
 
         info = ProjectInfo(
-            slug=slug,
             name=name,
             path=str(project_path),
             agent_type=agent_type or settings.default_agent,
         )
-        self._projects[slug] = info
+        self._projects[name] = info
         self._save()
-        log.info("created project %s (agent=%s) at %s", slug, info.agent_type, project_path)
+        log.info("created project %s (agent=%s) at %s", name, info.agent_type, project_path)
         return info
 
-    def get(self, slug: str) -> ProjectInfo | None:
-        return self._projects.get(slug)
+    def get(self, name: str) -> ProjectInfo | None:
+        return self._projects.get(name)
 
     def list_all(self) -> list[ProjectInfo]:
         return list(self._projects.values())
 
-    def delete(self, slug: str) -> bool:
-        if slug in self._projects:
-            del self._projects[slug]
+    def delete(self, name: str) -> bool:
+        if name in self._projects:
+            del self._projects[name]
             self._save()
+            if self.get_current() == name:
+                self.set_current(DEFAULT_PROJECT_NAME)
             return True
         return False
 
-    def update_session_id(self, slug: str, session_id: str) -> None:
-        project = self._projects.get(slug)
+    def update_session_id(self, name: str, session_id: str) -> None:
+        project = self._projects.get(name)
         if project:
             project.session_id = session_id
             self._save()
 
     def ensure_default(self) -> ProjectInfo:
-        if "_default" not in self._projects:
-            project_path = self.workspace / "_default"
-            project_path.mkdir(parents=True, exist_ok=True)
-            info = ProjectInfo(
-                slug="_default",
-                name="_default",
-                path=str(project_path),
-                agent_type=settings.default_agent,
-            )
-            self._projects["_default"] = info
-            self._save()
-            return info
-        return self._projects["_default"]
+        if DEFAULT_PROJECT_NAME not in self._projects:
+            return self.create(DEFAULT_PROJECT_NAME)
+        return self._projects[DEFAULT_PROJECT_NAME]
+
+    # ── current (pinned) project ──
+
+    def get_current(self) -> str:
+        """Return pinned project name, falling back to ``_default``."""
+        if self._current_path.exists():
+            value = self._current_path.read_text().strip()
+            if value and value in self._projects:
+                return value
+        return DEFAULT_PROJECT_NAME
+
+    def set_current(self, name: str) -> None:
+        """Pin a project. Must be an existing project name."""
+        if name not in self._projects:
+            raise ValueError(f"unknown project: {name!r}")
+        self._current_path.write_text(name)
