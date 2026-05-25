@@ -179,10 +179,10 @@ src/agent_box/
 
 ## CI/CD
 
-Push to `main` or tag `v*` triggers:
-
-1. CI — lint (`ruff`) + tests (`pytest`)
-2. Docker build & push to `ghcr.io/quick-sort/agent-box`
+Every push to `main` builds and pushes a Docker image to
+`ghcr.io/quick-sort/agent-box`, tagged only as `latest`. After each
+successful push the workflow prunes older GHCR versions, so only the most
+recent build is kept.
 
 ```bash
 # Pull the latest image

@@ -1,16 +1,20 @@
-name: CI & Docker
+name: Build & Push Docker Image
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Only one build at a time; cancel in-progress runs when a newer commit lands.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   docker:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,10 +39,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
+            type=raw,value=latest
 
       - uses: docker/build-push-action@v6
         with:
@@ -51,3 +52,13 @@ jobs:
           platforms: linux/amd64
           provenance: false
           sbom: false
+
+      # Keep only the freshest version on GHCR (the one we just pushed).
+      # The previously-`latest` image becomes untagged and gets deleted here.
+      - name: Prune old container versions
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          min-versions-to-keep: 1
