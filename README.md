@@ -174,6 +174,47 @@ If you name a project that doesn't exist (e.g. `switch to ghost`), the
 router will reply `❌ Unknown project: ghost` rather than silently
 switching to something else.
 
+## Project Background (description)
+
+Each project stored in `projects.json` has a `description` field. You can
+use it to record what a project is about so you (and future tooling) have
+context at a glance.
+
+**Set or edit a description directly in `projects.json`:**
+
+```bash
+# Open the registry
+$EDITOR ~/.agent-box/workspace/.router/projects.json
+```
+
+```json
+{
+  "demo": {
+    "name": "demo",
+    "path": "/home/user/.agent-box/workspace/demo",
+    "agent_type": "claude_code",
+    "description": "演示项目，用来测试 agent-box 的基本功能",
+    ...
+  }
+}
+```
+
+The file is plain JSON and is read on every start-up, so edits take effect
+the next time the app runs (no restart needed mid-session once loaded).
+
+**Session persistence is per-project.** Each project runs its own Claude
+Code session stored under `~/.claude/projects/<sanitized-path>/`. When you
+switch back to a project, the agent resumes the previous conversation — the
+entire coding history acts as implicit background. Switching projects is
+therefore the primary way to change context:
+
+```
+# WeChat / QQ message examples
+切换到 demo        → 📌 Pinned to project: demo
+回到默认项目       → 🔀 Pinned to: _default
+switch to demo     → 📌 Pinned to project: demo
+```
+
 ## Logging
 
 - TUI and `--test-router` modes log to `~/.agent-box/logs/agent-box.log`
