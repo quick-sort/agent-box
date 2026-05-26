@@ -1,9 +1,141 @@
 # agent-box
 
-IM → Router → Agent pipeline. Chat via WeChat, QQ, or terminal, route messages
-to project-specific Claude Code sessions.
+用 IM 聊天控制多个 AI 编程项目，每个项目独立上下文，随时切换。
 
-## Architecture
+## 特点
+
+- **多项目上下文切换** — 每个项目有独立的 Claude Code 会话，切换即恢复，互不干扰
+- **容器隔离运行** — Agent 在 Docker 容器内执行，文件系统与宿主机隔离，安全可控
+- **自然语言路由** — 无需斜杠命令，直接说"切换到 demo 项目"即可，中英文均支持
+- **可扩展** — Channel（WeChat、QQ…）和 Agent 后端（Claude Code、Codex…）均可独立插拔
+
+## 使用
+
+通过任意已连接的 IM 或终端直接发消息，机器人自动判断是项目管理命令还是编程任务：
+
+```
+你：新建一个项目叫 api-server
+Bot：✅ Created project: api-server
+
+你：帮我初始化一个 FastAPI 项目
+Bot：（Claude Code 执行，返回结果）
+
+你：切换到 demo
+Bot：📌 Pinned to project: demo
+
+你：继续上次的任务
+Bot：（demo 项目的 Claude Code 恢复上次会话，继续执行）
+```
+
+### 项目管理命令
+
+| 说什么 | 效果 |
+|---|---|
+| `新建一个项目 foo` / `create a project called foo` | 创建并切换到 `foo` |
+| `切换到 foo` / `switch to foo` | 切换到已有项目 `foo` |
+| `回到默认项目` / `switch to default` | 切换到 `_default` |
+| `当前有哪些项目` / `list projects` | 列出所有项目及当前激活项目 |
+| 其它任何内容 | 转发给当前激活项目的 Agent 执行 |
+
+### 项目背景
+
+每个项目有独立的 Claude Code 会话，存储在 `~/.claude/projects/<path>/`。
+切换回某个项目时，Agent 自动恢复上次的对话历史——整个编码历史即为隐式背景。
+
+还可以在 `projects.json` 里给项目添加 `description`，记录项目用途：
+
+```bash
+$EDITOR ~/.agent-box/workspace/.router/projects.json
+```
+
+```json
+{
+  "api-server": {
+    "name": "api-server",
+    "description": "用 FastAPI 写的后端服务，部署在 k8s 上",
+    ...
+  }
+}
+```
+
+## 快速开始
+
+**推荐方式（Docker）：**
+
+```bash
+cp sample.env .env
+# 填写 ANTHROPIC_API_KEY 等配置
+docker compose up -d
+```
+
+**本地运行：**
+
+```bash
+git clone https://github.com/quick-sort/agent-box.git
+cd agent-box
+uv sync
+cp sample.env .env
+uv run agent-box --tui        # 终端模式
+uv run agent-box              # WeChat 模式
+uv run agent-box --qq         # QQ Bot 模式
+uv run agent-box --test-router  # 只测试路由，不执行 Agent
+```
+
+## WeChat 渠道
+
+需先完成一次登录以获取凭证：
+
+```bash
+uv run python -m agent_box.channels.weixin_sdk login
+# 终端打印二维码 → 微信扫码确认 → 凭证保存至 ~/.agent-box/channels/weixin/
+```
+
+之后直接运行 `uv run agent-box` 即可，找不到账号时每 60 秒自动重试。
+
+```bash
+uv run python -m agent_box.channels.weixin_sdk accounts  # 查看已登录账号
+WEIXIN_ACCOUNT_ID=<id> uv run agent-box                  # 手动指定账号
+```
+
+## QQ Bot 渠道
+
+在 [QQ 开放平台](https://q.qq.com/) 注册机器人，然后配置：
+
+```env
+QQBOT_APP_ID=your_app_id
+QQBOT_CLIENT_SECRET=your_client_secret
+```
+
+```bash
+uv run agent-box --qq
+```
+
+支持 C2C 私聊和群聊 @机器人，回复自动携带原始消息 ID（被动回复）。
+
+## 配置
+
+所有配置通过环境变量或 `.env` 文件设置，详见 `sample.env`：
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Anthropic API 密钥 | — |
+| `ANTHROPIC_SMALL_FAST_MODEL` | 路由模型（优先） | — |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | 路由模型（回退） | — |
+| `ANTHROPIC_BASE_URL` | Anthropic API 地址 | — |
+| `WEIXIN_ACCOUNT_ID` | 微信账号 ID | — |
+| `QQBOT_APP_ID` | QQ Bot AppID | — |
+| `QQBOT_CLIENT_SECRET` | QQ Bot Secret | — |
+| `CONFIG_DIR` | 配置根目录 | `~/.agent-box` |
+| `WORKSPACE_DIR` | 项目工作区根目录 | `~/.agent-box/workspace` |
+| `AGENT_PERMISSION_MODE` | Claude Code 权限模式 | `bypassPermissions` |
+| `AGENT_MAX_TURNS` | 单次请求最大轮数 | — |
+
+路由模型优先读取 `ANTHROPIC_SMALL_FAST_MODEL`，回退到 `ANTHROPIC_DEFAULT_HAIKU_MODEL`，
+两者均未设置时启动失败。
+
+---
+
+## 架构
 
 ```
 Channel (WeChat / QQ / TUI) → Router (LLM + tools) → Project Agent → Channel
@@ -20,250 +152,46 @@ Channel (WeChat / QQ / TUI) → Router (LLM + tools) → Project Agent → Chann
                     .router/current_project
 ```
 
-- Single user, no auth
-- Concurrent agents — each message runs in its own anyio task
-- Session persistence via `continue_conversation=True`
-- Router = one Anthropic API call with three tools (no slash commands —
-  natural language only, in any language). If no tool is invoked the
-  message is forwarded to the currently pinned project.
-- Projects identified by `name` (no slug). Default project is `_default`.
-- Pinned project persisted to `<workspace>/.router/current_project`.
+- 每条消息在独立 anyio task 中处理，多项目可同时执行
+- Router 每次做一次 Anthropic API 调用，暴露三个工具；未调用工具则消息直接转发
+- 项目以 `name` 为主键，默认项目为 `_default`
 
-## Quick Start
-
-```bash
-# 1. Clone & install
-git clone https://github.com/quick-sort/agent-box.git
-cd agent-box
-uv sync
-
-# 2. Configure
-cp sample.env .env
-# Edit .env — fill in ANTHROPIC_AUTH_TOKEN (and/or ANTHROPIC_API_KEY) plus
-# the model env vars listed below.
-
-# 3. Run (terminal mode)
-uv run agent-box --tui
-
-# 4. Run (WeChat mode)
-uv run agent-box
-
-# 5. Run (QQ Bot mode)
-uv run agent-box --qq
-
-# 6. Try the router in isolation (no agent execution, just tool decisions)
-uv run agent-box --test-router
-```
-
-## Docker
-
-```bash
-cp sample.env .env
-# Edit .env with your settings
-
-docker compose up -d
-```
-
-Or build manually:
-
-```bash
-docker build -t agent-box .
-docker run --env-file .env -v agent-data:/home/app agent-box
-```
-
-The Docker image includes Node.js, Claude Code CLI, GitHub CLI (`gh`), and uv.
-
-On first startup, `entrypoint.sh` auto-initializes Claude Code config
-(`$HOME/.claude.json` and `$HOME/.claude/settings.json`).
-
-## WeChat Channel Setup
-
-To receive messages via WeChat personal account, you need to log in once
-to obtain credentials:
-
-```bash
-# Scan QR code with WeChat to authenticate
-uv run python -m agent_box.channels.weixin_sdk login
-```
-
-The login flow:
-1. Prints a QR code in the terminal (or a URL if `qrcode` lib not installed)
-2. Scan with WeChat app and confirm
-3. Credentials are saved to `~/.agent-box/channels/weixin/`
-
-Once logged in, `uv run agent-box` will automatically pick up the saved
-account and start receiving messages. If no account is found, it retries
-every 60 seconds — so you can log in mid-flight.
-
-**Other useful commands:**
-
-```bash
-# List logged-in accounts
-uv run python -m agent_box.channels.weixin_sdk accounts
-
-# Override account manually via env
-WEIXIN_ACCOUNT_ID=<your-account-id> uv run agent-box
-```
-
-## QQ Bot Channel Setup
-
-To receive messages via QQ, register a bot on the [QQ Open Platform](https://q.qq.com/),
-then set two env vars:
-
-```env
-QQBOT_APP_ID=your_app_id
-QQBOT_CLIENT_SECRET=your_client_secret
-```
-
-```bash
-uv run agent-box --qq
-```
-
-The channel connects to QQ's WebSocket gateway and handles:
-
-- **C2C** — private messages sent directly to the bot
-- **Group** — messages that @mention the bot in a group chat
-
-Replies use the original message as a passive-reply anchor (QQ's `msg_id`
-field), which threads the response correctly in the client.
-
-## Configuration
-
-All settings are configured via environment variables (or `.env` file). See
-`sample.env` for a full template.
-
-| Variable | Description | Default |
-|---|---|---|
-| `CONFIG_DIR` | Base config directory | `~/.agent-box` |
-| `WORKSPACE_DIR` | Project workspace root | `~/.agent-box/workspace` |
-| `WEIXIN_ACCOUNT_ID` | WeChat account ID | — |
-| `QQBOT_APP_ID` | QQ Bot application ID | — |
-| `QQBOT_CLIENT_SECRET` | QQ Bot client secret | — |
-| `AGENTS` | Enabled agents (comma-separated) | `claude_code` |
-| `DEFAULT_AGENT` | Default agent backend | `claude_code` |
-| `AGENT_PERMISSION_MODE` | Claude Code permission mode | `bypassPermissions` |
-| `AGENT_MAX_TURNS` | Max agent turns per request | — |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | API token for Anthropic | — |
-| `ANTHROPIC_BASE_URL` | Anthropic API base URL | — |
-| `ANTHROPIC_SMALL_FAST_MODEL` | Router model (preferred) | — |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Router model (fallback) | — |
-
-The router picks its model from `ANTHROPIC_SMALL_FAST_MODEL`, falling back
-to `ANTHROPIC_DEFAULT_HAIKU_MODEL`. If neither is set the app fails fast
-on startup.
-
-`.env` is loaded into `os.environ` at import time, so any variable in
-`.env` is also visible to the spawned `claude` subprocess.
-
-## Talking to the Router
-
-There are no slash commands — just say it in natural language. The router
-calls one of three tools (`create_project`, `switch_project`,
-`list_projects`) or forwards the message verbatim to the currently pinned
-project.
-
-| You say… | Router does |
-|---|---|
-| `新建一个项目 demo` / `create a project called demo` | `create_project(name="demo")` → pins to `demo` |
-| `切换到 demo` / `switch to demo` / `use the demo project` | `switch_project(name="demo")` |
-| `回到默认项目` / `switch to default` | `switch_project(name="_default")` |
-| `当前有哪些项目` / `list projects` / `what is the current project` | `list_projects()` |
-| `帮我修一下 main.py` / `add a function for foo` | forwarded to the currently pinned project's agent |
-
-If you name a project that doesn't exist (e.g. `switch to ghost`), the
-router will reply `❌ Unknown project: ghost` rather than silently
-switching to something else.
-
-## Project Background (description)
-
-Each project stored in `projects.json` has a `description` field. You can
-use it to record what a project is about so you (and future tooling) have
-context at a glance.
-
-**Set or edit a description directly in `projects.json`:**
-
-```bash
-# Open the registry
-$EDITOR ~/.agent-box/workspace/.router/projects.json
-```
-
-```json
-{
-  "demo": {
-    "name": "demo",
-    "path": "/home/user/.agent-box/workspace/demo",
-    "agent_type": "claude_code",
-    "description": "演示项目，用来测试 agent-box 的基本功能",
-    ...
-  }
-}
-```
-
-The file is plain JSON and is read on every start-up, so edits take effect
-the next time the app runs (no restart needed mid-session once loaded).
-
-**Session persistence is per-project.** Each project runs its own Claude
-Code session stored under `~/.claude/projects/<sanitized-path>/`. When you
-switch back to a project, the agent resumes the previous conversation — the
-entire coding history acts as implicit background. Switching projects is
-therefore the primary way to change context:
-
-```
-# WeChat / QQ message examples
-切换到 demo        → 📌 Pinned to project: demo
-回到默认项目       → 🔀 Pinned to: _default
-switch to demo     → 📌 Pinned to project: demo
-```
-
-## Logging
-
-- TUI and `--test-router` modes log to `~/.agent-box/logs/agent-box.log`
-  only (with 5 MB rotation × 3 backups), so the terminal stays clean.
-- WeChat and QQ modes log to that file **and** stderr.
-
-```bash
-tail -f ~/.agent-box/logs/agent-box.log
-```
-
-## Project Structure
+## 项目结构
 
 ```
 src/agent_box/
-├── main.py              # App: wires channels → router → agents; CLI entrypoint
+├── main.py              # 入口：Channel → Router → Agent 串联；CLI
 ├── config.py            # pydantic-settings + load_dotenv()
 ├── models.py            # IncomingMessage, OutgoingMessage, ProjectInfo
-├── session_manager.py   # projects.json + current_project registry
+├── session_manager.py   # projects.json + current_project 注册表
 ├── channels/
 │   ├── base.py          # BaseChannel ABC
-│   ├── weixin.py        # WeixinChannel (long-poll)
-│   ├── qq.py            # QQChannel (WebSocket, Official Bot API)
-│   └── tui.py           # TuiChannel (terminal REPL)
+│   ├── weixin.py        # WeixinChannel（长轮询）
+│   ├── qq.py            # QQChannel（WebSocket，官方 Bot API）
+│   └── tui.py           # TuiChannel（终端 REPL）
 ├── router/
 │   ├── base.py          # BaseRouter ABC, RouteResult
-│   └── router.py        # Router: anthropic SDK + create/switch/list tools
+│   └── router.py        # Router：Anthropic SDK + 三个工具
 └── agents/
     ├── base.py          # BaseAgent ABC
-    └── claude_code.py   # ClaudeCodeAgent (claude-agent-sdk ClaudeSDKClient)
+    └── claude_code.py   # ClaudeCodeAgent（claude-agent-sdk）
 ```
 
 ## CI/CD
 
-Every push to `main` builds and pushes a Docker image to
-`ghcr.io/quick-sort/agent-box`, tagged only as `latest`. After each
-successful push the workflow prunes older GHCR versions, so only the most
-recent build is kept.
+每次推送到 `main` 自动构建并推送 Docker 镜像到 `ghcr.io/quick-sort/agent-box:latest`，旧版本自动清理。
 
 ```bash
-# Pull the latest image
 docker pull ghcr.io/quick-sort/agent-box:latest
 ```
 
-## Development
+## 开发
 
 ```bash
 uv sync --dev
 uv run ruff check .
 uv run pytest
+tail -f ~/.agent-box/logs/agent-box.log  # 查看日志
 ```
 
 ## License
