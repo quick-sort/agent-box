@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # Weixin channel
     weixin_account_id: str = ""
 
+    # QQ Bot Official API channel
+    qqbot_app_id: str = ""
+    qqbot_client_secret: str = ""
+
     # Config & workspace directories
     config_dir: Path = Path.home() / ".agent-box"
     workspace_dir: Path = Path.home() / ".agent-box" / "workspace"

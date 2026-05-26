@@ -53,6 +53,9 @@ class App:
         if channel_type == "tui":
             from .channels.tui import TuiChannel
             channel = TuiChannel(send_in)
+        elif channel_type == "qq":
+            from .channels.qq import QQChannel
+            channel = QQChannel(send_in)
         else:
             from .channels.weixin import WeixinChannel
             channel = WeixinChannel(send_in)
@@ -157,7 +160,12 @@ def main() -> None:
             pass
         return
 
-    channel = "tui" if "--tui" in sys.argv else "weixin"
+    if "--tui" in sys.argv:
+        channel = "tui"
+    elif "--qq" in sys.argv:
+        channel = "qq"
+    else:
+        channel = "weixin"
     _setup_logging(channel)
     app = App()
     try:
