@@ -1,12 +1,12 @@
 # agent-box
 
-IM → Router → Agent pipeline. Chat via WeChat (or terminal), route messages
+IM → Router → Agent pipeline. Chat via WeChat, QQ, or terminal, route messages
 to project-specific Claude Code sessions.
 
 ## Architecture
 
 ```
-Channel (WeChat / TUI) → Router (LLM + tools) → Project Agent → Channel
+Channel (WeChat / QQ / TUI) → Router (LLM + tools) → Project Agent → Channel
                             │                        │
                             │ tools:                 │ claude-agent-sdk
                             │  create_project        │ cwd = project folder
@@ -48,7 +48,10 @@ uv run agent-box --tui
 # 4. Run (WeChat mode)
 uv run agent-box
 
-# 5. Try the router in isolation (no agent execution, just tool decisions)
+# 5. Run (QQ Bot mode)
+uv run agent-box --qq
+
+# 6. Try the router in isolation (no agent execution, just tool decisions)
 uv run agent-box --test-router
 ```
 
@@ -102,6 +105,28 @@ uv run python -m agent_box.channels.weixin_sdk accounts
 WEIXIN_ACCOUNT_ID=<your-account-id> uv run agent-box
 ```
 
+## QQ Bot Channel Setup
+
+To receive messages via QQ, register a bot on the [QQ Open Platform](https://q.qq.com/),
+then set two env vars:
+
+```env
+QQBOT_APP_ID=your_app_id
+QQBOT_CLIENT_SECRET=your_client_secret
+```
+
+```bash
+uv run agent-box --qq
+```
+
+The channel connects to QQ's WebSocket gateway and handles:
+
+- **C2C** — private messages sent directly to the bot
+- **Group** — messages that @mention the bot in a group chat
+
+Replies use the original message as a passive-reply anchor (QQ's `msg_id`
+field), which threads the response correctly in the client.
+
 ## Configuration
 
 All settings are configured via environment variables (or `.env` file). See
@@ -112,6 +137,8 @@ All settings are configured via environment variables (or `.env` file). See
 | `CONFIG_DIR` | Base config directory | `~/.agent-box` |
 | `WORKSPACE_DIR` | Project workspace root | `~/.agent-box/workspace` |
 | `WEIXIN_ACCOUNT_ID` | WeChat account ID | — |
+| `QQBOT_APP_ID` | QQ Bot application ID | — |
+| `QQBOT_CLIENT_SECRET` | QQ Bot client secret | — |
 | `AGENTS` | Enabled agents (comma-separated) | `claude_code` |
 | `DEFAULT_AGENT` | Default agent backend | `claude_code` |
 | `AGENT_PERMISSION_MODE` | Claude Code permission mode | `bypassPermissions` |
@@ -151,7 +178,7 @@ switching to something else.
 
 - TUI and `--test-router` modes log to `~/.agent-box/logs/agent-box.log`
   only (with 5 MB rotation × 3 backups), so the terminal stays clean.
-- WeChat mode logs to that file **and** stderr.
+- WeChat and QQ modes log to that file **and** stderr.
 
 ```bash
 tail -f ~/.agent-box/logs/agent-box.log
@@ -168,6 +195,7 @@ src/agent_box/
 ├── channels/
 │   ├── base.py          # BaseChannel ABC
 │   ├── weixin.py        # WeixinChannel (long-poll)
+│   ├── qq.py            # QQChannel (WebSocket, Official Bot API)
 │   └── tui.py           # TuiChannel (terminal REPL)
 ├── router/
 │   ├── base.py          # BaseRouter ABC, RouteResult
