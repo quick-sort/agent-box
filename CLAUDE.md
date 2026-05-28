@@ -27,6 +27,7 @@ WeChat (long-poll) ──→ IncomingMessage ──→ Router (LLM+tools) ──
 - **Project identity** — projects are identified by `name` (no slug). The project folder is `<workspace>/<name>`.
 - **Default project** — `_default` is always created and used when nothing else is pinned.
 - **Channel abstraction** — `BaseChannel` ABC; weixin adapter wraps the sync `weixin_sdk` via `anyio.to_thread`
+- **Image handling** — QQ channel downloads incoming image attachments to `~/.agent-box/channels/qq/downloads/` and injects local paths into `IncomingMessage.text` as `[图片: /path]`; outgoing images are triggered by `OutgoingMessage.data = {"image_url": "..."}` or `{"image_path": "..."}` (upload → QQ CDN → msg_type=7). WeChat SDK has upload/download capability in `MediaClient` but the channel layer does not yet expose it.
 
 ## Project Structure
 
@@ -40,6 +41,7 @@ src/agent_box/
 ├── channels/
 │   ├── base.py          # BaseChannel ABC
 │   ├── weixin.py        # WeixinChannel (long-poll)
+│   ├── qq.py            # QQChannel (WebSocket gateway, image send/recv)
 │   └── tui.py           # TuiChannel (terminal REPL)
 ├── router/
 │   ├── base.py          # BaseRouter ABC, RouteResult
@@ -61,6 +63,8 @@ src/agent_box/
 ## Environment Variables
 
 - `WEIXIN_ACCOUNT_ID` — weixin_sdk account id (from login)
+- `QQBOT_APP_ID` — QQ Bot application ID
+- `QQBOT_CLIENT_SECRET` — QQ Bot client secret
 - `PROJECTS_DIR` — where project folders live (default: `data/projects`)
 - `ROUTER_MODEL` — model override for router (optional)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)

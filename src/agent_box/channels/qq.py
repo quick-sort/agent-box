@@ -10,15 +10,24 @@ Protocol overview:
 user_id format:
   "c2c:{user_openid}"    — private (C2C) chat
   "group:{group_openid}" — group @-message
+
+Attachment handling:
+  Incoming: image attachments are downloaded locally; local paths are injected
+  into IncomingMessage.text as "[图片: /path]" and into raw["image_paths"].
+  Outgoing: set msg.data = {"image_url": "...", "image_path": "..."} to send
+  an image; the channel uploads to QQ CDN then sends msg_type=7.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -50,9 +59,20 @@ _MENTION_RE = re.compile(r"<@!?\w+>\s*")
 
 RECONNECT_DELAY = 5.0  # seconds between reconnect attempts
 
+# QQ Bot media file_type value for images (API enum: 1=image 2=video 3=voice 4=file)
+_FILE_TYPE_IMAGE = 1
+
+_DOWNLOAD_TIMEOUT_S = 60.0
+
 
 def _next_msg_seq() -> int:
     return (int(time.time() * 1000) ^ random.randint(0, 65535)) % 65536
+
+
+def _normalize_url(url: str) -> str:
+    if url.startswith("//"):
+        return f"https:{url}"
+    return url
 
 
 class QQChannel(BaseChannel):
@@ -68,6 +88,7 @@ class QQChannel(BaseChannel):
         self._last_seq: int | None = None
         # Latest msg_id per user_id; used as passive-reply anchor
         self._last_msg_id: dict[str, str] = {}
+        self._download_dir: Path = settings.config_dir / "channels" / "qq" / "downloads"
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +131,95 @@ class QQChannel(BaseChannel):
         if not resp.is_success:
             log.error("QQ API %s → %s: %s", path, resp.status_code, resp.text[:300])
         return resp.json() if resp.content else {}
+
+    # ── Media helpers ─────────────────────────────────────────────────────────
+
+    async def _download_image(self, url: str, filename: str | None = None) -> str | None:
+        """Download image from URL to local storage, return path or None."""
+        url = _normalize_url(url)
+        self._download_dir.mkdir(parents=True, exist_ok=True)
+
+        suffix = Path(filename).suffix if filename else ""
+        stamp = f"{int(time.time() * 1000)}-{random.randint(0, 9999)}"
+        dest = self._download_dir / f"img-{stamp}{suffix or '.bin'}"
+
+        try:
+            async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    if not suffix:
+                        ct = resp.headers.get("content-type", "").split(";")[0].strip()
+                        ext = mimetypes.guess_extension(ct) if ct else None
+                        if ext:
+                            dest = dest.with_suffix(ext)
+                    dest.write_bytes(await resp.aread())
+            log.debug("QQ: image saved to %s", dest)
+            return str(dest)
+        except Exception:
+            log.exception("QQ: failed to download image from %s", url)
+            return None
+
+    async def _upload_image(
+        self,
+        target_id: str,
+        target_type: str,
+        *,
+        image_url: str | None = None,
+        image_path: str | None = None,
+    ) -> str | None:
+        """Upload image to QQ CDN; returns file_info string or None."""
+        body: dict[str, Any] = {"file_type": _FILE_TYPE_IMAGE, "srv_send_msg": False}
+
+        if image_url:
+            body["url"] = _normalize_url(image_url)
+        elif image_path:
+            try:
+                raw = Path(image_path).read_bytes()
+                body["file_data"] = base64.b64encode(raw).decode("ascii")
+            except Exception:
+                log.exception("QQ: failed to read image file %s", image_path)
+                return None
+        else:
+            return None
+
+        endpoint = f"/v2/users/{target_id}/files" if target_type == "c2c" else f"/v2/groups/{target_id}/files"
+        try:
+            result = await self._api_post(endpoint, body)
+            return result.get("file_info") or None
+        except Exception:
+            log.exception("QQ: image upload failed")
+            return None
+
+    async def _send_image(
+        self,
+        target_id: str,
+        target_type: str,
+        *,
+        image_url: str | None = None,
+        image_path: str | None = None,
+        msg_id: str | None = None,
+    ) -> None:
+        """Upload image and send as QQ media message (msg_type=7)."""
+        file_info = await self._upload_image(
+            target_id, target_type, image_url=image_url, image_path=image_path
+        )
+        if not file_info:
+            log.error("QQ: image upload failed, skipping send")
+            return
+
+        body: dict[str, Any] = {
+            "msg_type": 7,
+            "media": {"file_info": file_info},
+            "msg_seq": _next_msg_seq(),
+        }
+        if msg_id:
+            body["msg_id"] = msg_id
+
+        endpoint = f"/v2/users/{target_id}/messages" if target_type == "c2c" else f"/v2/groups/{target_id}/messages"
+        try:
+            await self._api_post(endpoint, body)
+        except Exception:
+            log.exception("QQ: failed to send image message")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -213,6 +323,43 @@ class QQChannel(BaseChannel):
         elif event in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             await self._handle_group(data)
 
+    # ── Attachment extraction ─────────────────────────────────────────────────
+
+    def _extract_image_atts(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return image-type entries from the event's attachments list."""
+        return [
+            a for a in (data.get("attachments") or [])
+            if isinstance(a, dict) and (a.get("content_type") or "").startswith("image/")
+        ]
+
+    async def _download_image_atts(
+        self, image_atts: list[dict[str, Any]]
+    ) -> tuple[list[str], list[str]]:
+        """
+        Download each image attachment sequentially.
+        Returns (local_paths, urls); local_paths[i] is "" if download failed.
+        """
+        urls: list[str] = []
+        local_paths: list[str] = []
+        for att in image_atts:
+            url = _normalize_url(att.get("url") or "")
+            urls.append(url)
+            if url:
+                local = await self._download_image(url, att.get("filename"))
+                local_paths.append(local or "")
+            else:
+                local_paths.append("")
+        return local_paths, urls
+
+    def _image_att_text(self, image_atts: list[dict[str, Any]], local_paths: list[str]) -> str:
+        """Build text description lines for image attachments."""
+        parts: list[str] = []
+        for i, att in enumerate(image_atts):
+            local = local_paths[i] if i < len(local_paths) else ""
+            label = local or _normalize_url(att.get("url") or "")
+            parts.append(f"[图片: {label}]")
+        return "\n".join(parts)
+
     # ── Inbound message handlers ──────────────────────────────────────────────
 
     async def _handle_c2c(self, data: dict[str, Any]) -> None:
@@ -220,8 +367,21 @@ class QQChannel(BaseChannel):
         openid = author.get("user_openid") or author.get("id", "")
         text = (data.get("content") or "").strip()
         msg_id = data.get("id", "")
-        if not openid or not text:
+        if not openid:
             return
+
+        image_atts = self._extract_image_atts(data)
+        local_paths: list[str] = []
+        urls: list[str] = []
+
+        if image_atts:
+            local_paths, urls = await self._download_image_atts(image_atts)
+            img_text = self._image_att_text(image_atts, local_paths)
+            text = f"{text}\n{img_text}".strip() if text else img_text
+
+        if not text:
+            return
+
         user_id = f"c2c:{openid}"
         self._last_msg_id[user_id] = msg_id
         log.debug("QQ c2c from %s: %s", openid, text[:80])
@@ -229,15 +389,34 @@ class QQChannel(BaseChannel):
             text=text,
             user_id=user_id,
             channel="qq",
-            raw={"type": "c2c", "target_id": openid, "msg_id": msg_id},
+            raw={
+                "type": "c2c",
+                "target_id": openid,
+                "msg_id": msg_id,
+                "image_paths": local_paths,
+                "image_urls": urls,
+            },
         ))
 
     async def _handle_group(self, data: dict[str, Any]) -> None:
         group_openid = data.get("group_openid", "")
         text = _MENTION_RE.sub("", data.get("content") or "").strip()
         msg_id = data.get("id", "")
-        if not group_openid or not text:
+        if not group_openid:
             return
+
+        image_atts = self._extract_image_atts(data)
+        local_paths: list[str] = []
+        urls: list[str] = []
+
+        if image_atts:
+            local_paths, urls = await self._download_image_atts(image_atts)
+            img_text = self._image_att_text(image_atts, local_paths)
+            text = f"{text}\n{img_text}".strip() if text else img_text
+
+        if not text:
+            return
+
         user_id = f"group:{group_openid}"
         self._last_msg_id[user_id] = msg_id
         log.debug("QQ group %s: %s", group_openid, text[:80])
@@ -245,7 +424,13 @@ class QQChannel(BaseChannel):
             text=text,
             user_id=user_id,
             channel="qq",
-            raw={"type": "group", "target_id": group_openid, "msg_id": msg_id},
+            raw={
+                "type": "group",
+                "target_id": group_openid,
+                "msg_id": msg_id,
+                "image_paths": local_paths,
+                "image_urls": urls,
+            },
         ))
 
     # ── Outbound ──────────────────────────────────────────────────────────────
@@ -256,8 +441,27 @@ class QQChannel(BaseChannel):
         if ":" not in msg.user_id:
             log.warning("QQ: unexpected user_id format %r", msg.user_id)
             return
+
         msg_type, target_id = msg.user_id.split(":", 1)
         msg_id = self._last_msg_id.get(msg.user_id)
+
+        # Image sending: caller puts image info in msg.data
+        image_data = msg.data or {}
+        image_url: str | None = image_data.get("image_url")
+        image_path: str | None = image_data.get("image_path")
+        if image_url or image_path:
+            if msg_type in ("c2c", "group"):
+                await self._send_image(
+                    target_id, msg_type,
+                    image_url=image_url,
+                    image_path=image_path,
+                    msg_id=msg_id,
+                )
+            else:
+                log.warning("QQ: unknown msg_type %r for image send", msg_type)
+            return
+
+        # Text sending
         body: dict[str, Any] = {
             "content": msg.text,
             "msg_type": 0,
