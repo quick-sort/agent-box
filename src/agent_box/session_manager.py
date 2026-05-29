@@ -91,6 +91,13 @@ class SessionManager:
             project.session_id = session_id
             self._save()
 
+    def set_model(self, name: str, model: str) -> None:
+        """Set the model for a project."""
+        project = self._projects.get(name)
+        if project:
+            project.model = model
+            self._save()
+
     def ensure_default(self) -> ProjectInfo:
         if DEFAULT_PROJECT_NAME not in self._projects:
             return self.create(DEFAULT_PROJECT_NAME)
