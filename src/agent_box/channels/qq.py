@@ -461,11 +461,11 @@ class QQChannel(BaseChannel):
                 log.warning("QQ: unknown msg_type %r for image send", msg_type)
             return
 
-        # Text sending
+        # Text sending (Markdown, msg_type=2)
         body: dict[str, Any] = {
-            "content": msg.text,
-            "msg_type": 0,
+            "msg_type": 2,
             "msg_seq": _next_msg_seq(),
+            "markdown": {"content": msg.text},
         }
         if msg_id:
             body["msg_id"] = msg_id
