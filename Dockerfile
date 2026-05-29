@@ -16,13 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends gh \
+    && apt-get install -y --no-install-recommends gh openssh-client \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 999 agent \
     && useradd --uid 1000 --gid 999 -m agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
-    && npm install -g @anthropic-ai/claude-code@2.1.110
+    && npm install -g @anthropic-ai/claude-code@2.1.110 \
+    && npm cache clean --force
 
 
 # Persist weixin state and project data across restarts
@@ -36,12 +37,12 @@ ENV HOME="/home/agent"
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project
+    uv sync --locked --no-install-project --no-dev
 
 COPY pyproject.toml uv.lock /app/
 COPY src /app/src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked
+    uv sync --locked --no-dev
 
 RUN chown -R agent:agent /app /home/agent 
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
