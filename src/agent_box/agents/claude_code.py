@@ -30,11 +30,44 @@ log = logging.getLogger(__name__)
 _TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion"})
 
 
-def _format_tool_summary(block: ToolUseBlock) -> str:
+def _build_path_prefixes(project_path: str) -> tuple[str, ...]:
+    """Collect directory prefixes to strip from file paths in tool summaries.
+
+    Two categories:
+    1. Project workspace — so ``/home/.../project/src/main.py`` → ``src/main.py``
+    2. Channel download dirs — so ``~/.agent-box/channels/weixin/downloads/img.jpg`` → ``img.jpg``
+    """
+    prefixes: list[str] = []
+    # Project path
+    pp = project_path.rstrip("/")
+    if pp:
+        prefixes.append(pp)
+    # Channel download dirs (WeChat + QQ)
+    for ch in ("weixin", "qq"):
+        d = str((settings.config_dir / "channels" / ch / "downloads").resolve())
+        prefixes.append(d)
+    return tuple(prefixes)
+
+
+def _shorten_path(path: str, prefixes: tuple[str, ...]) -> str:
+    """Strip known directory prefixes from a file path.
+
+    Turns ``/home/user/.agent-box/workspace/project/src/main.py``
+    into ``src/main.py`` when ``/home/user/.agent-box/workspace/project``
+    is in *prefixes*.
+    """
+    for p in prefixes:
+        if path.startswith(p) and len(path) > len(p):
+            return path[len(p):].lstrip("/")
+    return path
+
+
+def _format_tool_summary(block: ToolUseBlock, *, prefixes: tuple[str, ...] = ()) -> str:
     """Return a one-line status for a tool call — just enough to signal
     *activity*, not enough to overwhelm the IM channel."""
     name = block.name
     inp = block.input or {}
+    _s = lambda p: _shorten_path(p, prefixes)
 
     if name == "Bash":
         cmd = inp.get("command", "")
@@ -42,9 +75,9 @@ def _format_tool_summary(block: ToolUseBlock) -> str:
             cmd = cmd[:57] + "..."
         return f"🔧 {cmd}"
     if name == "Read":
-        return f"📖 {inp.get('file_path', '')}"
+        return f"📖 {_s(inp.get('file_path', ''))}"
     if name in ("Edit", "Write", "MultiEdit"):
-        return f"✏️ {inp.get('file_path', '')}"
+        return f"✏️ {_s(inp.get('file_path', ''))}"
     if name == "Grep":
         return f"🔍 {inp.get('pattern', '')}"
     if name == "Glob":
@@ -177,6 +210,11 @@ class ClaudeCodeAgent(BaseAgent):
         else:
             await client.query(prompt)
 
+        # Build prefixes to strip from file paths in tool summaries.
+        # - Project path: /home/.../workspace/project  → src/main.py
+        # - Channel downloads: ~/.agent-box/channels/*/downloads → image.jpg
+        _path_prefixes = _build_path_prefixes(self.project.path)
+
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -209,7 +247,7 @@ class ClaudeCodeAgent(BaseAgent):
                             yield OutgoingMessage(text=cleaned, user_id=user_id, type=MessageType.text)
                     elif isinstance(block, ToolUseBlock):
                         # Brief one-liner so the user knows something is happening.
-                        summary = _format_tool_summary(block)
+                        summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
                             text=summary, user_id=user_id, type=MessageType.text,
                             data={"id": block.id, "name": block.name, "input": block.input},
