@@ -279,6 +279,69 @@ async def test_ask_user_question_no_options(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
+async def test_ask_user_question_with_prompt_field(sample_project: ProjectInfo):
+    """AskUserQuestion using 'prompt' field instead of 'question' should still work."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_prompt",
+                    name="AskUserQuestion",
+                    input={"prompt": "What file should I edit?"},
+                )
+            ],
+            model="test",
+            session_id="sess-prompt",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("edit something")]
+
+    assert len(msgs) == 1
+    assert "What file should I edit?" in msgs[0].text
+
+
+@pytest.mark.anyio
+async def test_ask_user_question_empty_input(sample_project: ProjectInfo):
+    """AskUserQuestion with empty input should show default message."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_empty",
+                    name="AskUserQuestion",
+                    input={},
+                )
+            ],
+            model="test",
+            session_id="sess-empty",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("do something")]
+
+    assert len(msgs) == 1
+    # Should show default message instead of empty
+    assert "(agent requires your input)" in msgs[0].text or msgs[0].text == ""
+
+
+@pytest.mark.anyio
 async def test_close_clears_pending_ask(sample_project: ProjectInfo):
     """close() should clear any pending ask state."""
     mock_client = AsyncMock()
@@ -376,6 +439,26 @@ def test_shorten_paths_in_cmd_escaped():
         "cd /home/user/my\\ project && ls",
         ("/home/user/my project",),
     ) == "cd . && ls"
+
+
+def test_shorten_paths_in_cmd_quoted():
+    """Paths with quoted directory names containing spaces should be shortened."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        'cd /home/user/workspace/"my project"/subdir && npm test',
+        ("/home/user/workspace/my project",),
+    ) == "cd ./subdir && npm test"
+
+
+def test_shorten_paths_in_cmd_single_quoted():
+    """Single-quoted directory names should be shortened."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "cd /home/user/workspace/'agent box'/agent-box && ls",
+        ("/home/user/workspace/agent box",),
+    ) == "cd ./agent-box && ls"
 
 
 def test_shorten_paths_in_cmd_no_match():
@@ -487,6 +570,104 @@ def test_format_tool_summary_edit_with_download_prefix():
     )
     result = _format_tool_summary(block, prefixes=(dl,))
     assert result == "✏️ report.pdf"
+
+
+# ── _format_question tests ──
+
+
+def test_format_question_with_question_field():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t1",
+        name="AskUserQuestion",
+        input={"question": "Which file?", "options": [{"label": "A"}, {"label": "B"}]},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "Which file?\n\n  1. A\n  2. B"
+
+
+def test_format_question_with_prompt_field():
+    """Should support 'prompt' as alternative to 'question'."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t2",
+        name="AskUserQuestion",
+        input={"prompt": "Select a mode"},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "Select a mode"
+
+
+def test_format_question_empty_returns_default():
+    """Empty input should return default message."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t3",
+        name="AskUserQuestion",
+        input={},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "(agent requires your input)"
+
+
+def test_format_question_with_questions_array():
+    """Claude Code's actual AskUserQuestion format has questions array."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t4",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        {"label": "Option A", "description": "First choice"},
+                        {"label": "Option B", "description": "Second choice"},
+                    ],
+                }
+            ]
+        },
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert "[Library]" in result
+    assert "Which library should we use?" in result
+    assert "1. Option A — First choice" in result
+    assert "2. Option B — Second choice" in result
+
+
+def test_format_question_multiple_questions():
+    """Test handling multiple questions in one AskUserQuestion."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t5",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "First question?",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                },
+                {
+                    "question": "Second question?",
+                    "options": [{"label": "X"}, {"label": "Y"}],
+                },
+            ]
+        },
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert "First question?" in result
+    assert "Second question?" in result
 
 
 @pytest.mark.anyio

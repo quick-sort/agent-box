@@ -62,10 +62,16 @@ def _shorten_path(path: str, prefixes: tuple[str, ...]) -> str:
     return path
 
 
+import re
+
+
 def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
     """Replace known path prefixes inside a shell command string.
 
-    Handles both plain paths and shell-escaped paths (backslash-space).
+    Handles:
+    - Plain paths: /home/.../workspace/project → .
+    - Shell-escaped paths: /home/.../workspace/project\\ box → .
+    - Quoted paths: /home/.../workspace/"project name"/subdir → .
     Replaces the project path with ``.`` since that's the cwd.
     """
     for p in prefixes:
@@ -73,7 +79,47 @@ def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
         escaped = p.replace(" ", "\\ ")
         if escaped in cmd:
             cmd = cmd.replace(escaped, ".")
-        elif p in cmd:
+            continue
+
+        # Use regex to handle quoted path components with spaces
+        # e.g., /workspace/"agent box"/agent-box
+        # Split path and build pattern that matches with optional quotes
+        parts = p.split("/")
+        pattern_parts = []
+        for i, part in enumerate(parts):
+            if not part:
+                continue
+            escaped_part = re.escape(part)
+            if i == len(parts) - 1:
+                # Last part (may contain spaces) - allow optional quotes around it
+                pattern_parts.append(f'(?:{escaped_part}|"{escaped_part}"|\'{escaped_part}\')')
+            else:
+                pattern_parts.append(escaped_part)
+
+        pattern = "/" + "/".join(pattern_parts) + "(?=/?)"
+        try:
+            # Replace matched prefix with "."
+            new_cmd = re.sub(pattern, ".", cmd, count=1)
+            if new_cmd != cmd:
+                cmd = new_cmd
+                continue
+        except re.error:
+            pass
+
+        # Fallback: check for exact quoted prefix
+        if f'"{p}"' in cmd:
+            cmd = cmd.replace(f'"{p}"', ".")
+        elif f"'{p}'" in cmd:
+            cmd = cmd.replace(f"'{p}'", ".")
+
+        # Handle quoted path prefix: "/path/"dirname""
+        if f'"{p}/' in cmd:
+            cmd = cmd.replace(f'"{p}/', '"./')
+        elif f"'{p}/" in cmd:
+            cmd = cmd.replace(f"'{p}/", "'.")
+
+        # Plain path
+        if p in cmd:
             cmd = cmd.replace(p, ".")
     return cmd
 
@@ -146,12 +192,76 @@ class ClaudeCodeAgent(BaseAgent):
 
     @staticmethod
     def _format_question(block: ToolUseBlock) -> str:
-        """Render AskUserQuestion tool input as human-readable text."""
-        inp = block.input or {}
-        question = inp.get("question", "")
-        if not question:
-            question = "(agent requires your input)"
+        """Render AskUserQuestion tool input as human-readable text.
 
+        Claude Code's AskUserQuestion tool has this schema:
+        {
+            questions: [{
+                question: string,  // The actual question text
+                header: string,    // Short label (max chip width chars)
+                options: [{label, description, preview}],
+                multiSelect: boolean
+            }]
+        }
+        """
+        inp = block.input or {}
+
+        # Handle the actual schema: questions is an array of question objects
+        questions_data = inp.get("questions")
+
+        if questions_data and isinstance(questions_data, list):
+            lines = []
+            for i, q in enumerate(questions_data):
+                if not isinstance(q, dict):
+                    continue
+
+                # Get question text - try multiple field names
+                question_text = q.get("question") or q.get("prompt") or q.get("message") or ""
+
+                # Get header if present
+                header = q.get("header", "")
+                if header:
+                    lines.append(f"[{header}]")
+
+                if not question_text:
+                    question_text = "(agent requires your input)"
+
+                lines.append(question_text)
+
+                # Format options
+                options = q.get("options")
+                if options and isinstance(options, list):
+                    for j, opt in enumerate(options, 1):
+                        if isinstance(opt, dict):
+                            label = opt.get("label", f"Option {j}")
+                            desc = opt.get("description", "")
+                            if desc:
+                                lines.append(f"  {j}. {label} — {desc}")
+                            else:
+                                lines.append(f"  {j}. {label}")
+                        else:
+                            lines.append(f"  {j}. {opt}")
+
+                # Add separator between multiple questions
+                if i < len(questions_data) - 1:
+                    lines.append("")
+
+            result = "\n".join(lines)
+            if not result:
+                log.warning("AskUserQuestion with empty questions, input=%s", inp)
+                return "(agent requires your input)"
+            return result
+
+        # Fallback for other formats
+        question = inp.get("question") or inp.get("prompt") or inp.get("message") or ""
+        if not question:
+            log.warning(
+                "AskUserQuestion with empty question, input=%s",
+                inp,
+            )
+            return "(agent requires your input)"
+
+        # Build options display
         options = inp.get("options")
         if options and isinstance(options, list):
             lines = [question, ""]
@@ -239,6 +349,12 @@ class ClaudeCodeAgent(BaseAgent):
                         isinstance(block, ToolUseBlock)
                         and block.name in _TOOLS_REQUIRING_USER_INPUT
                     ):
+                        # Log the full input for debugging
+                        log.info(
+                            "AskUserQuestion detected, tool_use_id=%s, input=%s",
+                            block.id,
+                            block.input,
+                        )
                         question_text = self._format_question(block)
                         yield OutgoingMessage(
                             text=question_text,
@@ -251,8 +367,9 @@ class ClaudeCodeAgent(BaseAgent):
                         }
                         log.info(
                             "AskUserQuestion intercepted, pausing run() "
-                            "tool_use_id=%s",
+                            "tool_use_id=%s, question_text=%s",
                             block.id,
+                            question_text,
                         )
                         return  # Stop yielding; next run() will resume
 
