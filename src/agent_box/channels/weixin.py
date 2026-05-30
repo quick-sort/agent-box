@@ -151,6 +151,41 @@ class WeixinChannel(BaseChannel):
         if self.account is None:
             log.warning("Weixin account not initialized, cannot send reply.")
             return
+
+        data = msg.data or {}
+
+        # File/media sending via MediaClient
+        file_path = data.get("file_path")
+        if file_path:
+            try:
+                await anyio.to_thread.run_sync(
+                    lambda: self.account.media.send_file(
+                        file_path=file_path,
+                        to_user_id=msg.user_id,
+                    ),
+                    abandon_on_cancel=True,
+                )
+            except Exception:
+                log.exception("weixin: failed to send file %s", file_path)
+            return
+
+        # Legacy image sending
+        image_path = data.get("image_path")
+        if image_path:
+            try:
+                await anyio.to_thread.run_sync(
+                    lambda: self.account.media.send_file(
+                        file_path=image_path,
+                        to_user_id=msg.user_id,
+                        forced_kind="image",
+                    ),
+                    abandon_on_cancel=True,
+                )
+            except Exception:
+                log.exception("weixin: failed to send image %s", image_path)
+            return
+
+        # Text sending
         await anyio.to_thread.run_sync(
             lambda: self.account.send_text(to_user_id=msg.user_id, text=msg.text)
         )

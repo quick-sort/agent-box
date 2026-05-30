@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -28,6 +29,34 @@ log = logging.getLogger(__name__)
 # generator until the user replies. The next ``run()`` call sends the
 # reply back as a ``tool_result`` so the CLI can continue.
 _TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion"})
+
+# Regex to match [SEND_FILE:/path/to/file] markers in agent text output.
+_SEND_FILE_RE = re.compile(r"\[SEND_FILE:([^\]]+)\]")
+
+# System prompt appended to Claude Code's default prompt, instructing the
+# agent to use [SEND_FILE:path] markers when generating files the user
+# should receive.
+_SEND_FILE_INSTRUCTION = (
+    "When you generate a file that the user should receive (images, charts, "
+    "PDFs, documents), include a marker on its own line:\n"
+    "[SEND_FILE:/absolute/path/to/file]\n"
+    "You can include multiple markers for multiple files. The markers will be "
+    "automatically removed from your response and the files will be sent to "
+    "the user. Only use this for files the user explicitly asked for or that "
+    "are final deliverables — not intermediate temporary files."
+)
+
+
+def _parse_send_file_markers(text: str) -> tuple[str, list[str]]:
+    """Extract ``[SEND_FILE:path]`` markers from text.
+
+    Returns ``(cleaned_text, file_paths)``.
+    """
+    paths = _SEND_FILE_RE.findall(text)
+    if not paths:
+        return text, []
+    cleaned = _SEND_FILE_RE.sub("", text).strip()
+    return cleaned, paths
 
 
 def _build_path_prefixes(project_path: str) -> tuple[str, ...]:
@@ -174,6 +203,11 @@ class ClaudeCodeAgent(BaseAgent):
             max_turns=settings.agent_max_turns,
             continue_conversation=True,
             model=self.project.model,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": _SEND_FILE_INSTRUCTION,
+            },
         )
         if self.project.session_id:
             opts.resume = self.project.session_id
@@ -315,7 +349,7 @@ class ClaudeCodeAgent(BaseAgent):
     # Main run loop
     # ------------------------------------------------------------------
 
-    async def run(self, prompt: str, user_id: str = "") -> AsyncIterator[OutgoingMessage]:
+    async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
         client = await self._ensure_client()
 
         # If a previous run() paused with a pending AskUserQuestion, the
@@ -359,6 +393,7 @@ class ClaudeCodeAgent(BaseAgent):
                         yield OutgoingMessage(
                             text=question_text,
                             user_id=user_id,
+                            channel=channel,
                             type=MessageType.text,
                         )
                         self._pending_ask = {
@@ -377,26 +412,34 @@ class ClaudeCodeAgent(BaseAgent):
                     if isinstance(block, TextBlock):
                         cleaned = block.text.strip()
                         if cleaned:
-                            yield OutgoingMessage(text=cleaned, user_id=user_id, type=MessageType.text)
+                            text, file_paths = _parse_send_file_markers(cleaned)
+                            if text:
+                                yield OutgoingMessage(text=text, user_id=user_id, channel=channel, type=MessageType.text)
+                            for fp in file_paths:
+                                log.info("Agent requested file send: %s", fp)
+                                yield OutgoingMessage(
+                                    text="", user_id=user_id, channel=channel, type=MessageType.text,
+                                    data={"file_path": fp},
+                                )
                     elif isinstance(block, ToolUseBlock):
                         # Brief one-liner so the user knows something is happening.
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
-                            text=summary, user_id=user_id, type=MessageType.text,
+                            text=summary, user_id=user_id, channel=channel, type=MessageType.text,
                             data={"id": block.id, "name": block.name, "input": block.input},
                         )
                     # ThinkingBlock / ToolResultBlock deliberately skipped —
                     # too noisy for IM channels.
             elif isinstance(msg, SystemMessage):
                 yield OutgoingMessage(
-                    text=msg.subtype, user_id=user_id, type=MessageType.system,
+                    text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
                     data=msg.data,
                 )
             elif isinstance(msg, ResultMessage):
                 if msg.session_id and msg.session_id != self.project.session_id:
                     self.project.session_id = msg.session_id
                 yield OutgoingMessage(
-                    text=msg.result or "", user_id=user_id, type=MessageType.result,
+                    text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
                     data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
                 )
 

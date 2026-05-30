@@ -33,6 +33,7 @@ class OutgoingMessage:
 
     text: str
     user_id: str
+    channel: str = ""  # target channel name (e.g. "qq", "weixin")
     type: MessageType = MessageType.text
     data: dict[str, Any] | None = None  # extra payload per type
 
