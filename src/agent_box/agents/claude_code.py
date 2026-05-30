@@ -14,10 +14,7 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
     ToolUseBlock,
-    UserMessage,
 )
 
 from ..config import settings
@@ -31,6 +28,37 @@ log = logging.getLogger(__name__)
 # generator until the user replies. The next ``run()`` call sends the
 # reply back as a ``tool_result`` so the CLI can continue.
 _TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion"})
+
+
+def _format_tool_summary(block: ToolUseBlock) -> str:
+    """Return a one-line status for a tool call — just enough to signal
+    *activity*, not enough to overwhelm the IM channel."""
+    name = block.name
+    inp = block.input or {}
+
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        return f"🔧 {cmd}"
+    if name == "Read":
+        return f"📖 {inp.get('file_path', '')}"
+    if name in ("Edit", "Write", "MultiEdit"):
+        return f"✏️ {inp.get('file_path', '')}"
+    if name == "Grep":
+        return f"🔍 {inp.get('pattern', '')}"
+    if name == "Glob":
+        return f"📂 {inp.get('pattern', '')}"
+    if name == "Agent":
+        desc = inp.get("description") or inp.get("prompt", "")
+        if len(desc) > 40:
+            desc = desc[:37] + "..."
+        return f"🤖 {desc}" if desc else "🤖 子任务"
+    if name == "WebSearch":
+        return f"🌐 {inp.get('query', '')}"
+    if name == "WebFetch":
+        return f"🌐 {inp.get('url', '')}"
+    return f"⚙️ {name}"
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -179,21 +207,15 @@ class ClaudeCodeAgent(BaseAgent):
                         cleaned = block.text.strip()
                         if cleaned:
                             yield OutgoingMessage(text=cleaned, user_id=user_id, type=MessageType.text)
-                    elif isinstance(block, ThinkingBlock):
-                        yield OutgoingMessage(text=block.thinking, user_id=user_id, type=MessageType.thinking)
                     elif isinstance(block, ToolUseBlock):
+                        # Brief one-liner so the user knows something is happening.
+                        summary = _format_tool_summary(block)
                         yield OutgoingMessage(
-                            text=block.name, user_id=user_id, type=MessageType.tool_use,
+                            text=summary, user_id=user_id, type=MessageType.text,
                             data={"id": block.id, "name": block.name, "input": block.input},
                         )
-            elif isinstance(msg, UserMessage):
-                for block in msg.content:
-                    if isinstance(block, ToolResultBlock):
-                        content = block.content if isinstance(block.content, str) else json.dumps(block.content, ensure_ascii=False) if block.content else ""
-                        yield OutgoingMessage(
-                            text=content, user_id=user_id, type=MessageType.tool_result,
-                            data={"tool_use_id": block.tool_use_id, "is_error": block.is_error},
-                        )
+                    # ThinkingBlock / ToolResultBlock deliberately skipped —
+                    # too noisy for IM channels.
             elif isinstance(msg, SystemMessage):
                 yield OutgoingMessage(
                     text=msg.subtype, user_id=user_id, type=MessageType.system,

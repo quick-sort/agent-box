@@ -293,7 +293,7 @@ async def test_close_clears_pending_ask(sample_project: ProjectInfo):
 
 @pytest.mark.anyio
 async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
-    """Regular tool calls (Bash, Read, etc.) should NOT be intercepted."""
+    """Regular tool calls should be yielded as brief text summaries."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
 
     mock_client = AsyncMock()
@@ -302,7 +302,7 @@ async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
     async def fake_receive():
         yield AssistantMessage(
             content=[
-                ToolUseBlock(id="toolu_bash", name="Bash", input={"command": "ls"}),
+                ToolUseBlock(id="toolu_bash", name="Bash", input={"command": "ls -la"}),
             ],
             model="test",
         )
@@ -317,8 +317,111 @@ async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
     agent._client = mock_client
     msgs = [m async for m in agent.run("list files")]
 
-    # Bash tool_use should be yielded normally (not intercepted)
-    tool_uses = [m for m in msgs if m.type.value == "tool_use"]
-    assert len(tool_uses) == 1
-    assert tool_uses[0].text == "Bash"
+    # Tool should be yielded as text (not tool_use) so IM channels can send it
+    texts = [m for m in msgs if m.type.value == "text"]
+    assert any("ls -la" in m.text for m in texts)
     assert agent._pending_ask is None
+
+
+# ── Tool summary formatting ──
+
+
+def test_format_tool_summary_bash():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t1", name="Bash", input={"command": "npm test"})
+    assert _format_tool_summary(block) == "🔧 npm test"
+
+
+def test_format_tool_summary_bash_long_command():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    long_cmd = "a" * 100
+    block = ToolUseBlock(id="t1", name="Bash", input={"command": long_cmd})
+    result = _format_tool_summary(block)
+    assert result.startswith("🔧 ")
+    assert len(result) <= 63  # emoji + 60 chars max
+
+
+def test_format_tool_summary_read():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t2", name="Read", input={"file_path": "src/main.py"})
+    assert _format_tool_summary(block) == "📖 src/main.py"
+
+
+def test_format_tool_summary_edit():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t3", name="Edit", input={"file_path": "src/utils.py"})
+    assert _format_tool_summary(block) == "✏️ src/utils.py"
+
+
+def test_format_tool_summary_grep():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t4", name="Grep", input={"pattern": "TODO"})
+    assert _format_tool_summary(block) == "🔍 TODO"
+
+
+def test_format_tool_summary_agent():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t5", name="Agent", input={"description": "explore codebase"})
+    assert _format_tool_summary(block) == "🤖 explore codebase"
+
+
+def test_format_tool_summary_unknown():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(id="t6", name="CustomTool", input={})
+    assert _format_tool_summary(block) == "⚙️ CustomTool"
+
+
+@pytest.mark.anyio
+async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
+    """Multiple tool calls should each yield a brief text line."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"}),
+            ],
+            model="test",
+        )
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(id="t2", name="Bash", input={"command": "npm test"}),
+            ],
+            model="test",
+        )
+        yield AssistantMessage(
+            content=[TextBlock(text="Done!")],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=1000, duration_api_ms=900,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("test")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert "📖 a.py" in texts
+    assert "🔧 npm test" in texts
+    assert "Done!" in texts
