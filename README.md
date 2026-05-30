@@ -124,12 +124,15 @@ uv run agent-box --qq
 | 变量 | 说明 | 默认值 |
 |---|---|---|
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Anthropic API 密钥 | — |
+| `ANTHROPIC_BASE_URL` | Anthropic API 地址 | — |
 | `ANTHROPIC_SMALL_FAST_MODEL` | 路由模型（优先） | — |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | 路由模型（回退） | — |
-| `ANTHROPIC_BASE_URL` | Anthropic API 地址 | — |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Claude Code 默认 Sonnet 模型 | — |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Claude Code 默认 Opus 模型 | — |
 | `WEIXIN_ACCOUNT_ID` | 微信账号 ID | — |
 | `QQBOT_APP_ID` | QQ Bot AppID | — |
 | `QQBOT_CLIENT_SECRET` | QQ Bot Secret | — |
+| `GH_TOKEN` | GitHub token（供 Agent 使用 `gh` CLI） | — |
 | `CONFIG_DIR` | 配置根目录 | `~/.agent-box` |
 | `WORKSPACE_DIR` | 项目工作区根目录 | `~/.agent-box/workspace` |
 | `AGENT_PERMISSION_MODE` | Claude Code 权限模式 | `bypassPermissions` |
@@ -137,6 +140,9 @@ uv run agent-box --qq
 
 路由模型优先读取 `ANTHROPIC_SMALL_FAST_MODEL`，回退到 `ANTHROPIC_DEFAULT_HAIKU_MODEL`，
 两者均未设置时启动失败。
+
+Agent 执行的模型可通过对话切换：说"切换模型到 claude-sonnet-4-6"即可，无需重启。
+切换模型功能由 Router 的 `switch_model` 工具实现，每个项目独立记忆使用的模型。
 
 ---
 
@@ -192,6 +198,8 @@ src/agent_box/
 ```bash
 docker pull ghcr.io/quick-sort/agent-box:latest
 ```
+
+容器内已安装 GitHub CLI (`gh`) 和 SSH 客户端。设置 `GH_TOKEN` 环境变量后，Agent 即可直接使用 `gh` 操作 GitHub（创建 PR、查看 Issue 等）。
 
 ## 开发
 
