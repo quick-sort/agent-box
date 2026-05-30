@@ -5,6 +5,9 @@
 ## 特点
 
 - **多项目上下文切换** — 每个项目有独立的 Claude Code 会话，切换即恢复，互不干扰
+- **多渠道同时在线** — WeChat + QQ + TUI 可同时运行，消息自动路由回来源渠道
+- **文件收发** — 用户发送的图片/文件/语音自动下载传给 Agent；Agent 生成的文件自动发回给用户
+- **实时进度** — 工具执行状态（读文件、写代码、运行命令）实时反馈到聊天窗口
 - **容器隔离运行** — Agent 在 Docker 容器内执行，文件系统与宿主机隔离，安全可控
 - **自然语言路由** — 无需斜杠命令，直接说"切换到 demo 项目"即可，中英文均支持
 - **可扩展** — Channel（WeChat、QQ…）和 Agent 后端（Claude Code、Codex…）均可独立插拔
@@ -78,6 +81,7 @@ cp sample.env .env
 uv run agent-box --tui        # 终端模式
 uv run agent-box              # WeChat 模式
 uv run agent-box --qq         # QQ Bot 模式
+uv run agent-box --qq --weixin # WeChat + QQ 同时运行
 uv run agent-box --test-router  # 只测试路由，不执行 Agent
 ```
 
@@ -111,6 +115,7 @@ uv run agent-box --qq
 ```
 
 支持 C2C 私聊和群聊 @机器人，回复自动携带原始消息 ID（被动回复）。
+支持通过分片上传发送图片（30MB）、视频（100MB）、语音（20MB）、文件（100MB）。
 
 ## 配置
 
@@ -152,9 +157,12 @@ Channel (WeChat / QQ / TUI) → Router (LLM + tools) → Project Agent → Chann
                     .router/current_project
 ```
 
+- 多渠道可同时运行（`--qq --weixin`），回复通过 `OutgoingMessage.channel` 路由回来源渠道
 - 每条消息在独立 anyio task 中处理，多项目可同时执行
 - Router 每次做一次 Anthropic API 调用，暴露三个工具；未调用工具则消息直接转发
 - 项目以 `name` 为主键，默认项目为 `_default`
+- Agent 生成文件时使用 `[SEND_FILE:路径]` 标记，自动发回给用户
+- 工具执行状态（读文件、写代码等）以简短文本实时反馈到聊天窗口
 
 ## 项目结构
 

@@ -1,33 +1,38 @@
 # agent-box
 
-IM → Router → Agent pipeline. Chat via WeChat, route messages to project-specific Claude Code sessions.
+IM → Router → Agent pipeline. Chat via WeChat/QQ, route messages to project-specific Claude Code sessions.
 
 ## Architecture
 
 ```
-WeChat (long-poll) ──→ IncomingMessage ──→ Router (LLM+tools) ──→ Project Agent ──→ OutgoingMessage ──→ WeChat
-                                            │                          │
-                                            │ tools:                   │ ClaudeSDKClient
-                                            │  create_project          │ cwd=project folder
-                                            │  switch_project          │ continue_conversation=True
-                                            │ else: forward to         │
-                                            │ pinned project           │
-                                            ▼                          ▼
-                                  SessionManager                 ~/.claude/projects/
-                                  .router/projects.json          (session storage)
-                                  .router/current_project
+WeChat ─┐                                       ┌─→ WeixinChannel.send_reply()
+        ├─→ IncomingMessage ─→ Router ─→ Agent ─┤
+QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_reply()
+                                    │                          │
+                                    │ tools:                   │ ClaudeSDKClient
+                                    │  create_project          │ cwd=project folder
+                                    │  switch_project          │ continue_conversation=True
+                                    │ else: forward to         │
+                                    │ pinned project           │
+                                    ▼                          ▼
+                          SessionManager                 ~/.claude/projects/
+                          .router/projects.json          (session storage)
+                          .router/current_project
 ```
 
 ## Key Design Decisions
 
 - **Single user** — no auth, one router, one set of projects
+- **Multi-channel** — multiple channels (WeChat + QQ + TUI) can run simultaneously; replies are routed to the originating channel via `OutgoingMessage.channel`
 - **Concurrent agents** — each `handle_message` runs in its own anyio task; multiple projects can execute simultaneously
 - **Session persistence** — `ClaudeSDKClient(continue_conversation=True)` resumes the last session for each project's cwd; Claude Code stores sessions under `~/.claude/projects/<sanitized-cwd>/`
 - **Router** — direct Anthropic SDK call with three tools (`create_project`, `switch_project`, `list_projects`). If no tool is invoked, the message is forwarded to the currently pinned project. The pinned project is persisted to `.router/current_project`. No slash-command shortcuts — natural language only.
 - **Project identity** — projects are identified by `name` (no slug). The project folder is `<workspace>/<name>`.
 - **Default project** — `_default` is always created and used when nothing else is pinned.
 - **Channel abstraction** — `BaseChannel` ABC; weixin adapter wraps the sync `weixin_sdk` via `anyio.to_thread`
-- **Image handling** — QQ channel downloads incoming image attachments to `~/.agent-box/channels/qq/downloads/` and injects local paths into `IncomingMessage.text` as `[图片: /path]`; outgoing images are triggered by `OutgoingMessage.data = {"image_url": "..."}` or `{"image_path": "..."}` (upload → QQ CDN → msg_type=7). WeChat SDK has upload/download capability in `MediaClient` but the channel layer does not yet expose it.
+- **File handling** — both channels download incoming media attachments and inject local paths into `IncomingMessage.text`. Outgoing files are sent via `OutgoingMessage.data = {"file_path": "..."}`. QQ uses chunked upload (up to 100MB), WeChat uses `MediaClient.send_file()` (AES + CDN).
+- **Agent → channel file bridge** — agent uses `[SEND_FILE:/path]` markers (injected via system prompt) to signal file delivery. Agent layer parses markers and generates `OutgoingMessage(data={"file_path": path})`.
+- **Tool progress feedback** — tool calls (Bash, Read, Edit, etc.) are shown as brief one-line status messages on IM channels. File paths are shortened by stripping project/workspace prefixes.
 
 ## Project Structure
 
@@ -53,12 +58,12 @@ src/agent_box/
 
 ## Message Flow
 
-1. `WeixinChannel.start()` long-polls weixin_sdk, emits `IncomingMessage` to stream
+1. Channels emit `IncomingMessage` (with `channel` field) to shared inbound stream
 2. `App._dispatch_loop` picks up each message, spawns `handle_message` task
 3. `Router.route()` makes one anthropic API call exposing three tools (`create_project`, `switch_project`, `list_projects`). If the model calls a tool, the router runs it and returns a `RouteResult(reply=...)`. Otherwise it returns `RouteResult(project=<pinned>)`.
-4. If `RouteResult.reply` is set, `App` sends it back directly. Otherwise it resolves `project` → `ClaudeCodeAgent` and calls `agent.run(prompt)`.
+4. If `RouteResult.reply` is set, `App` sends it back directly. Otherwise it resolves `project` → `ClaudeCodeAgent` and calls `agent.run(prompt, user_id, channel)`.
 5. `ClaudeCodeAgent` sends prompt via `ClaudeSDKClient.query()`, collects response via `receive_response()`
-6. Response sent back as `OutgoingMessage` → `WeixinChannel.send_reply()`
+6. Each `OutgoingMessage` carries `channel` field → `_route_outbound()` dispatches to correct channel
 
 ## Environment Variables
 
@@ -78,6 +83,12 @@ uv run agent-box --tui
 
 # WeChat channel mode (default)
 uv run agent-box
+
+# QQ Bot channel mode
+uv run agent-box --qq
+
+# Run both WeChat and QQ simultaneously
+uv run agent-box --qq --weixin
 ```
 
 ## Docker
