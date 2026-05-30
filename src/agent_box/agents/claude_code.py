@@ -62,10 +62,16 @@ def _shorten_path(path: str, prefixes: tuple[str, ...]) -> str:
     return path
 
 
+import re
+
+
 def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
     """Replace known path prefixes inside a shell command string.
 
-    Handles both plain paths and shell-escaped paths (backslash-space).
+    Handles:
+    - Plain paths: /home/.../workspace/project → .
+    - Shell-escaped paths: /home/.../workspace/project\\ box → .
+    - Quoted paths: /home/.../workspace/"project name"/subdir → .
     Replaces the project path with ``.`` since that's the cwd.
     """
     for p in prefixes:
@@ -73,7 +79,47 @@ def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
         escaped = p.replace(" ", "\\ ")
         if escaped in cmd:
             cmd = cmd.replace(escaped, ".")
-        elif p in cmd:
+            continue
+
+        # Use regex to handle quoted path components with spaces
+        # e.g., /workspace/"agent box"/agent-box
+        # Split path and build pattern that matches with optional quotes
+        parts = p.split("/")
+        pattern_parts = []
+        for i, part in enumerate(parts):
+            if not part:
+                continue
+            escaped_part = re.escape(part)
+            if i == len(parts) - 1:
+                # Last part (may contain spaces) - allow optional quotes around it
+                pattern_parts.append(f'(?:{escaped_part}|"{escaped_part}"|\'{escaped_part}\')')
+            else:
+                pattern_parts.append(escaped_part)
+
+        pattern = "/" + "/".join(pattern_parts) + "(?=/?)"
+        try:
+            # Replace matched prefix with "."
+            new_cmd = re.sub(pattern, ".", cmd, count=1)
+            if new_cmd != cmd:
+                cmd = new_cmd
+                continue
+        except re.error:
+            pass
+
+        # Fallback: check for exact quoted prefix
+        if f'"{p}"' in cmd:
+            cmd = cmd.replace(f'"{p}"', ".")
+        elif f"'{p}'" in cmd:
+            cmd = cmd.replace(f"'{p}'", ".")
+
+        # Handle quoted path prefix: "/path/"dirname""
+        if f'"{p}/' in cmd:
+            cmd = cmd.replace(f'"{p}/', '"./')
+        elif f"'{p}/" in cmd:
+            cmd = cmd.replace(f"'{p}/", "'.")
+
+        # Plain path
+        if p in cmd:
             cmd = cmd.replace(p, ".")
     return cmd
 

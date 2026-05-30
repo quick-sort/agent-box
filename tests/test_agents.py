@@ -378,6 +378,26 @@ def test_shorten_paths_in_cmd_escaped():
     ) == "cd . && ls"
 
 
+def test_shorten_paths_in_cmd_quoted():
+    """Paths with quoted directory names containing spaces should be shortened."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        'cd /home/user/workspace/"my project"/subdir && npm test',
+        ("/home/user/workspace/my project",),
+    ) == "cd ./subdir && npm test"
+
+
+def test_shorten_paths_in_cmd_single_quoted():
+    """Single-quoted directory names should be shortened."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "cd /home/user/workspace/'agent box'/agent-box && ls",
+        ("/home/user/workspace/agent box",),
+    ) == "cd ./agent-box && ls"
+
+
 def test_shorten_paths_in_cmd_no_match():
     from agent_box.agents.claude_code import _shorten_paths_in_cmd
 
