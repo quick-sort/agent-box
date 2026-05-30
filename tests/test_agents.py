@@ -710,3 +710,87 @@ async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
     assert "📖 a.py" in texts
     assert "🔧 npm test" in texts
     assert "Done!" in texts
+
+
+# ── SEND_FILE marker parsing ──
+
+
+def test_parse_send_file_markers_single():
+    from agent_box.agents.claude_code import _parse_send_file_markers
+
+    text, paths = _parse_send_file_markers(
+        "Here is the chart:\n[SEND_FILE:/tmp/chart.png]\nHope you like it!"
+    )
+    assert paths == ["/tmp/chart.png"]
+    assert "[SEND_FILE:" not in text
+    assert "Here is the chart:" in text
+    assert "Hope you like it!" in text
+
+
+def test_parse_send_file_markers_multiple():
+    from agent_box.agents.claude_code import _parse_send_file_markers
+
+    text, paths = _parse_send_file_markers(
+        "Charts:\n[SEND_FILE:/tmp/a.png]\n[SEND_FILE:/tmp/b.pdf]"
+    )
+    assert paths == ["/tmp/a.png", "/tmp/b.pdf"]
+    assert "[SEND_FILE:" not in text
+
+
+def test_parse_send_file_markers_none():
+    from agent_box.agents.claude_code import _parse_send_file_markers
+
+    text, paths = _parse_send_file_markers("No markers here.")
+    assert paths == []
+    assert text == "No markers here."
+
+
+# ── run() with SEND_FILE markers ──
+
+
+@pytest.mark.anyio
+async def test_run_yields_file_from_send_file_marker(sample_project: ProjectInfo):
+    """When agent text contains [SEND_FILE:path], yield a separate OutgoingMessage with file_path."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[TextBlock(text="Here's the chart:\n[SEND_FILE:/tmp/chart.png]")],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("make a chart")]
+
+    # Should have: text (without marker), file_path message, result
+    file_msgs = [m for m in msgs if m.data and "file_path" in m.data]
+    assert len(file_msgs) == 1
+    assert file_msgs[0].data["file_path"] == "/tmp/chart.png"
+
+    # Text message should not contain the marker
+    text_msgs = [m for m in msgs if m.text and m.type.value == "text"]
+    assert any("chart" in m.text for m in text_msgs)
+    assert not any("[SEND_FILE:" in m.text for m in text_msgs)
+
+
+# ── system_prompt injection ──
+
+
+def test_build_options_includes_system_prompt(sample_project: ProjectInfo):
+    opts = agent._build_options() if False else ClaudeCodeAgent(sample_project)._build_options()
+    assert opts.system_prompt is not None
+    assert isinstance(opts.system_prompt, dict)
+    assert opts.system_prompt["type"] == "preset"
+    assert opts.system_prompt["preset"] == "claude_code"
+    assert "append" in opts.system_prompt
+    assert "SEND_FILE" in opts.system_prompt["append"]
