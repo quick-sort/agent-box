@@ -616,6 +616,60 @@ def test_format_question_empty_returns_default():
     assert result == "(agent requires your input)"
 
 
+def test_format_question_with_questions_array():
+    """Claude Code's actual AskUserQuestion format has questions array."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t4",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        {"label": "Option A", "description": "First choice"},
+                        {"label": "Option B", "description": "Second choice"},
+                    ],
+                }
+            ]
+        },
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert "[Library]" in result
+    assert "Which library should we use?" in result
+    assert "1. Option A — First choice" in result
+    assert "2. Option B — Second choice" in result
+
+
+def test_format_question_multiple_questions():
+    """Test handling multiple questions in one AskUserQuestion."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t5",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "First question?",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                },
+                {
+                    "question": "Second question?",
+                    "options": [{"label": "X"}, {"label": "Y"}],
+                },
+            ]
+        },
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert "First question?" in result
+    assert "Second question?" in result
+
+
 @pytest.mark.anyio
 async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
     """Multiple tool calls should each yield a brief text line."""

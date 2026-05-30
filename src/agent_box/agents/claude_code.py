@@ -192,18 +192,74 @@ class ClaudeCodeAgent(BaseAgent):
 
     @staticmethod
     def _format_question(block: ToolUseBlock) -> str:
-        """Render AskUserQuestion tool input as human-readable text."""
+        """Render AskUserQuestion tool input as human-readable text.
+
+        Claude Code's AskUserQuestion tool has this schema:
+        {
+            questions: [{
+                question: string,  // The actual question text
+                header: string,    // Short label (max chip width chars)
+                options: [{label, description, preview}],
+                multiSelect: boolean
+            }]
+        }
+        """
         inp = block.input or {}
 
-        # Try different field names for the question
-        question = inp.get("question") or inp.get("prompt") or inp.get("message") or ""
+        # Handle the actual schema: questions is an array of question objects
+        questions_data = inp.get("questions")
 
+        if questions_data and isinstance(questions_data, list):
+            lines = []
+            for i, q in enumerate(questions_data):
+                if not isinstance(q, dict):
+                    continue
+
+                # Get question text - try multiple field names
+                question_text = q.get("question") or q.get("prompt") or q.get("message") or ""
+
+                # Get header if present
+                header = q.get("header", "")
+                if header:
+                    lines.append(f"[{header}]")
+
+                if not question_text:
+                    question_text = "(agent requires your input)"
+
+                lines.append(question_text)
+
+                # Format options
+                options = q.get("options")
+                if options and isinstance(options, list):
+                    for j, opt in enumerate(options, 1):
+                        if isinstance(opt, dict):
+                            label = opt.get("label", f"Option {j}")
+                            desc = opt.get("description", "")
+                            if desc:
+                                lines.append(f"  {j}. {label} — {desc}")
+                            else:
+                                lines.append(f"  {j}. {label}")
+                        else:
+                            lines.append(f"  {j}. {opt}")
+
+                # Add separator between multiple questions
+                if i < len(questions_data) - 1:
+                    lines.append("")
+
+            result = "\n".join(lines)
+            if not result:
+                log.warning("AskUserQuestion with empty questions, input=%s", inp)
+                return "(agent requires your input)"
+            return result
+
+        # Fallback for other formats
+        question = inp.get("question") or inp.get("prompt") or inp.get("message") or ""
         if not question:
             log.warning(
                 "AskUserQuestion with empty question, input=%s",
                 inp,
             )
-            question = "(agent requires your input)"
+            return "(agent requires your input)"
 
         # Build options display
         options = inp.get("options")
