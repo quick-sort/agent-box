@@ -204,6 +204,65 @@ async def test_tui_send_reply_when_not_running():
     await channel.send_reply(OutgoingMessage(text="hello back", user_id="local"))
 
 
+# ── WeixinChannel file sending ──
+
+
+@pytest.mark.anyio
+async def test_weixin_send_reply_with_file_path():
+    """send_reply with file_path should call MediaClient.send_file."""
+    from agent_box.channels.weixin import WeixinChannel
+
+    fake_account = MagicMock()
+    fake_account.media = MagicMock()
+    fake_account.media.send_file = MagicMock()
+
+    with patch("agent_box.channels.weixin.AccountClient"):
+        channel = WeixinChannel.__new__(WeixinChannel)
+        channel.send_stream = MagicMock()
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
+        channel.account = fake_account
+
+        await channel.send_reply(OutgoingMessage(
+            text="report",
+            user_id="wx_user",
+            data={"file_path": "/tmp/report.pdf"},
+        ))
+
+    fake_account.media.send_file.assert_called_once()
+    call_kwargs = fake_account.media.send_file.call_args
+    assert call_kwargs.kwargs.get("file_path") == "/tmp/report.pdf"
+    assert call_kwargs.kwargs.get("to_user_id") == "wx_user"
+
+
+@pytest.mark.anyio
+async def test_weixin_send_reply_with_image_path():
+    """send_reply with image_path should call send_file with forced_kind='image'."""
+    from agent_box.channels.weixin import WeixinChannel
+
+    fake_account = MagicMock()
+    fake_account.media = MagicMock()
+    fake_account.media.send_file = MagicMock()
+
+    with patch("agent_box.channels.weixin.AccountClient"):
+        channel = WeixinChannel.__new__(WeixinChannel)
+        channel.send_stream = MagicMock()
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
+        channel.account = fake_account
+
+        await channel.send_reply(OutgoingMessage(
+            text="photo",
+            user_id="wx_user",
+            data={"image_path": "/tmp/photo.jpg"},
+        ))
+
+    fake_account.media.send_file.assert_called_once()
+    call_kwargs = fake_account.media.send_file.call_args
+    assert call_kwargs.kwargs.get("file_path") == "/tmp/photo.jpg"
+    assert call_kwargs.kwargs.get("forced_kind") == "image"
+
+
 # ── QQ Channel media helpers ──
 
 

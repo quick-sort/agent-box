@@ -9,6 +9,7 @@ import anyio
 
 from .agents import create_agent
 from .agents.base import BaseAgent
+from .channels.base import BaseChannel
 from .config import settings
 from .models import IncomingMessage, OutgoingMessage
 from .router.router import Router
@@ -30,50 +31,89 @@ class App:
             self.agents[name] = create_agent(project.agent_type, project)
         return self.agents[name]
 
+    def _create_channel(self, channel_type: str, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
+        """Instantiate a channel by type name."""
+        if channel_type == "tui":
+            from .channels.tui import TuiChannel
+            return TuiChannel(send_in)
+        elif channel_type == "qq":
+            from .channels.qq import QQChannel
+            return QQChannel(send_in)
+        else:
+            from .channels.weixin import WeixinChannel
+            return WeixinChannel(send_in)
+
     async def handle_message(
         self, msg: IncomingMessage, reply: anyio.abc.ObjectSendStream[OutgoingMessage]
     ) -> None:
         result = await self.router.route(msg)
 
         if result.reply is not None:
-            await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id))
+            await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
             return
 
         project_name = result.project or self.sessions.get_current()
         self.sessions.ensure_default()  # always available as a fallback
         agent = self._get_or_create_agent(project_name)
-        async for out_msg in agent.run(msg.text, user_id=msg.user_id):
+        async for out_msg in agent.run(msg.text, user_id=msg.user_id, channel=msg.channel):
             await reply.send(out_msg)
         self.sessions.update_session_id(project_name, agent.project.session_id or "")
 
-    async def run(self, channel_type: str = "weixin") -> None:
-        send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](16)
-        send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](16)
+    async def run(self, channel_types: list[str] | None = None) -> None:
+        """Run the app with one or more channels simultaneously.
 
-        if channel_type == "tui":
-            from .channels.tui import TuiChannel
-            channel = TuiChannel(send_in)
-        elif channel_type == "qq":
-            from .channels.qq import QQChannel
-            channel = QQChannel(send_in)
-        else:
-            from .channels.weixin import WeixinChannel
-            channel = WeixinChannel(send_in)
+        Each channel gets its own outbound stream. A router task fans out
+        outgoing messages to the correct channel based on ``msg.channel``.
+        """
+        if not channel_types:
+            channel_types = ["weixin"]
+
+        send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](16)
+        send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](16)
+
+        # Create all channels
+        channels: dict[str, BaseChannel] = {}
+        for ct in channel_types:
+            channels[ct] = self._create_channel(ct, send_in)
 
         async with anyio.create_task_group() as tg:
-            async def _run_then_cancel() -> None:
-                await channel.start()
-                tg.cancel_scope.cancel()
+            # Start each channel's inbound listener and outbound sender
+            for ct, ch in channels.items():
+                # Each channel gets a filtered outbound stream
+                ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](16)
+                tg.start_soon(ch.start)
+                tg.start_soon(ch.send_loop, ch_recv)
+                # Store the send stream for routing
+                ch._outbound_send = ch_send  # type: ignore[attr-defined]
 
-            tg.start_soon(_run_then_cancel)
+            # Route outbound messages to correct channel
+            tg.start_soon(self._route_outbound, recv_out, channels)
+
+            # Dispatch inbound messages to handler
             tg.start_soon(self._dispatch_loop, recv_in, send_out)
-            tg.start_soon(channel.send_loop, recv_out)
 
         for agent in list(self.agents.values()):
             try:
                 await agent.close()
             except Exception:
                 pass
+
+    async def _route_outbound(
+        self,
+        recv: anyio.abc.ObjectReceiveStream[OutgoingMessage],
+        channels: dict[str, BaseChannel],
+    ) -> None:
+        """Route outgoing messages to the correct channel's send stream."""
+        async for msg in recv:
+            ch = channels.get(msg.channel)
+            if ch is None:
+                log.warning("No channel '%s' for outgoing message, dropping", msg.channel)
+                continue
+            send_stream: anyio.abc.ObjectSendStream[OutgoingMessage] | None = getattr(ch, "_outbound_send", None)
+            if send_stream is not None:
+                await send_stream.send(msg)
+            else:
+                log.warning("Channel '%s' has no outbound stream", msg.channel)
 
     async def _dispatch_loop(
         self,
@@ -160,16 +200,19 @@ def main() -> None:
             pass
         return
 
+    # Parse channel flags: --qq --weixin --tui
+    channel_types: list[str] = []
+    if "--qq" in sys.argv:
+        channel_types.append("qq")
     if "--tui" in sys.argv:
-        channel = "tui"
-    elif "--qq" in sys.argv:
-        channel = "qq"
-    else:
-        channel = "weixin"
-    _setup_logging(channel)
+        channel_types.append("tui")
+    if "--weixin" in sys.argv or not channel_types:
+        channel_types.append("weixin")
+
+    _setup_logging(",".join(channel_types))
     app = App()
     try:
-        anyio.run(app.run, channel)
+        anyio.run(app.run, channel_types)
     except KeyboardInterrupt:
         pass
     # Suppress "Event loop is closed" from subprocess GC at shutdown

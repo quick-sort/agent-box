@@ -349,7 +349,7 @@ class ClaudeCodeAgent(BaseAgent):
     # Main run loop
     # ------------------------------------------------------------------
 
-    async def run(self, prompt: str, user_id: str = "") -> AsyncIterator[OutgoingMessage]:
+    async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
         client = await self._ensure_client()
 
         # If a previous run() paused with a pending AskUserQuestion, the
@@ -393,6 +393,7 @@ class ClaudeCodeAgent(BaseAgent):
                         yield OutgoingMessage(
                             text=question_text,
                             user_id=user_id,
+                            channel=channel,
                             type=MessageType.text,
                         )
                         self._pending_ask = {
@@ -413,32 +414,32 @@ class ClaudeCodeAgent(BaseAgent):
                         if cleaned:
                             text, file_paths = _parse_send_file_markers(cleaned)
                             if text:
-                                yield OutgoingMessage(text=text, user_id=user_id, type=MessageType.text)
+                                yield OutgoingMessage(text=text, user_id=user_id, channel=channel, type=MessageType.text)
                             for fp in file_paths:
                                 log.info("Agent requested file send: %s", fp)
                                 yield OutgoingMessage(
-                                    text="", user_id=user_id, type=MessageType.text,
+                                    text="", user_id=user_id, channel=channel, type=MessageType.text,
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
                         # Brief one-liner so the user knows something is happening.
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
-                            text=summary, user_id=user_id, type=MessageType.text,
+                            text=summary, user_id=user_id, channel=channel, type=MessageType.text,
                             data={"id": block.id, "name": block.name, "input": block.input},
                         )
                     # ThinkingBlock / ToolResultBlock deliberately skipped —
                     # too noisy for IM channels.
             elif isinstance(msg, SystemMessage):
                 yield OutgoingMessage(
-                    text=msg.subtype, user_id=user_id, type=MessageType.system,
+                    text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
                     data=msg.data,
                 )
             elif isinstance(msg, ResultMessage):
                 if msg.session_id and msg.session_id != self.project.session_id:
                     self.project.session_id = msg.session_id
                 yield OutgoingMessage(
-                    text=msg.result or "", user_id=user_id, type=MessageType.result,
+                    text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
                     data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
                 )
 
