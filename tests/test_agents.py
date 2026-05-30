@@ -148,3 +148,177 @@ async def test_close(sample_project: ProjectInfo):
 async def test_close_when_no_client(sample_project: ProjectInfo):
     agent = ClaudeCodeAgent(sample_project)
     await agent.close()
+
+
+# ── AskUserQuestion interception ──
+
+
+@pytest.mark.anyio
+async def test_ask_user_question_intercepted(sample_project: ProjectInfo):
+    """When the agent calls AskUserQuestion, run() yields the question as
+    text, stores pending state, and returns early — it must NOT deadlock."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_123",
+                    name="AskUserQuestion",
+                    input={
+                        "question": "Which file?",
+                        "options": [
+                            {"label": "main.py"},
+                            {"label": "utils.py"},
+                        ],
+                    },
+                )
+            ],
+            model="test",
+            session_id="sess-ask",
+        )
+        # The real CLI would block here waiting for tool_result.
+        # Our generator should return before reaching this point.
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("refactor the code")]
+
+    # Question should be yielded as plain text so the channel can deliver it
+    assert len(msgs) == 1
+    assert msgs[0].type.value == "text"
+    assert "Which file?" in msgs[0].text
+    assert "main.py" in msgs[0].text
+
+    # Pending state should be saved
+    assert agent._pending_ask is not None
+    assert agent._pending_ask["tool_use_id"] == "toolu_123"
+    assert agent._pending_ask["session_id"] == "sess-ask"
+    assert agent.has_pending_question is True
+
+
+@pytest.mark.anyio
+async def test_ask_user_question_resume(sample_project: ProjectInfo):
+    """Second run() with a pending ask should send tool_result, not a new query."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    mock_client = AsyncMock()
+    mock_client._transport = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(content=[TextBlock(text="OK, editing main.py")], model="test")
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=500, duration_api_ms=400,
+            num_turns=2, total_cost_usd=0.02, usage=None, session_id="sess-ask",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {
+        "tool_use_id": "toolu_123",
+        "session_id": "sess-ask",
+    }
+
+    msgs = [m async for m in agent.run("main.py")]
+
+    # Should NOT have called query() — instead sends tool_result via transport
+    mock_client.query.assert_not_awaited()
+    mock_client._transport.write.assert_awaited_once()
+    written = mock_client._transport.write.call_args[0][0]
+    assert "tool_result" in written
+    assert "toolu_123" in written
+    assert "main.py" in written
+
+    # Pending ask should be cleared
+    assert agent._pending_ask is None
+    assert agent.has_pending_question is False
+
+    # Should have yielded the assistant response and result
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert any("OK, editing main.py" in t for t in texts)
+
+
+@pytest.mark.anyio
+async def test_ask_user_question_no_options(sample_project: ProjectInfo):
+    """AskUserQuestion without options should still format the question."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_456",
+                    name="AskUserQuestion",
+                    input={"question": "What is your name?"},
+                )
+            ],
+            model="test",
+            session_id="sess-2",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("hello")]
+
+    assert len(msgs) == 1
+    assert "What is your name?" in msgs[0].text
+    assert agent._pending_ask["tool_use_id"] == "toolu_456"
+
+
+@pytest.mark.anyio
+async def test_close_clears_pending_ask(sample_project: ProjectInfo):
+    """close() should clear any pending ask state."""
+    mock_client = AsyncMock()
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {"tool_use_id": "toolu_789", "session_id": "s"}
+
+    await agent.close()
+    assert agent._pending_ask is None
+    assert agent._client is None
+
+
+@pytest.mark.anyio
+async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
+    """Regular tool calls (Bash, Read, etc.) should NOT be intercepted."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(id="toolu_bash", name="Bash", input={"command": "ls"}),
+            ],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="sess-norm",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("list files")]
+
+    # Bash tool_use should be yielded normally (not intercepted)
+    tool_uses = [m for m in msgs if m.type.value == "tool_use"]
+    assert len(tool_uses) == 1
+    assert tool_uses[0].text == "Bash"
+    assert agent._pending_ask is None
