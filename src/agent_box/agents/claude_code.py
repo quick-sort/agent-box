@@ -194,10 +194,18 @@ class ClaudeCodeAgent(BaseAgent):
     def _format_question(block: ToolUseBlock) -> str:
         """Render AskUserQuestion tool input as human-readable text."""
         inp = block.input or {}
-        question = inp.get("question", "")
+
+        # Try different field names for the question
+        question = inp.get("question") or inp.get("prompt") or inp.get("message") or ""
+
         if not question:
+            log.warning(
+                "AskUserQuestion with empty question, input=%s",
+                inp,
+            )
             question = "(agent requires your input)"
 
+        # Build options display
         options = inp.get("options")
         if options and isinstance(options, list):
             lines = [question, ""]
@@ -285,6 +293,12 @@ class ClaudeCodeAgent(BaseAgent):
                         isinstance(block, ToolUseBlock)
                         and block.name in _TOOLS_REQUIRING_USER_INPUT
                     ):
+                        # Log the full input for debugging
+                        log.info(
+                            "AskUserQuestion detected, tool_use_id=%s, input=%s",
+                            block.id,
+                            block.input,
+                        )
                         question_text = self._format_question(block)
                         yield OutgoingMessage(
                             text=question_text,
@@ -297,8 +311,9 @@ class ClaudeCodeAgent(BaseAgent):
                         }
                         log.info(
                             "AskUserQuestion intercepted, pausing run() "
-                            "tool_use_id=%s",
+                            "tool_use_id=%s, question_text=%s",
                             block.id,
+                            question_text,
                         )
                         return  # Stop yielding; next run() will resume
 

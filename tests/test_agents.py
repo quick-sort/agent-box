@@ -279,6 +279,69 @@ async def test_ask_user_question_no_options(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
+async def test_ask_user_question_with_prompt_field(sample_project: ProjectInfo):
+    """AskUserQuestion using 'prompt' field instead of 'question' should still work."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_prompt",
+                    name="AskUserQuestion",
+                    input={"prompt": "What file should I edit?"},
+                )
+            ],
+            model="test",
+            session_id="sess-prompt",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("edit something")]
+
+    assert len(msgs) == 1
+    assert "What file should I edit?" in msgs[0].text
+
+
+@pytest.mark.anyio
+async def test_ask_user_question_empty_input(sample_project: ProjectInfo):
+    """AskUserQuestion with empty input should show default message."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_empty",
+                    name="AskUserQuestion",
+                    input={},
+                )
+            ],
+            model="test",
+            session_id="sess-empty",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("do something")]
+
+    assert len(msgs) == 1
+    # Should show default message instead of empty
+    assert "(agent requires your input)" in msgs[0].text or msgs[0].text == ""
+
+
+@pytest.mark.anyio
 async def test_close_clears_pending_ask(sample_project: ProjectInfo):
     """close() should clear any pending ask state."""
     mock_client = AsyncMock()
@@ -507,6 +570,50 @@ def test_format_tool_summary_edit_with_download_prefix():
     )
     result = _format_tool_summary(block, prefixes=(dl,))
     assert result == "✏️ report.pdf"
+
+
+# ── _format_question tests ──
+
+
+def test_format_question_with_question_field():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t1",
+        name="AskUserQuestion",
+        input={"question": "Which file?", "options": [{"label": "A"}, {"label": "B"}]},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "Which file?\n\n  1. A\n  2. B"
+
+
+def test_format_question_with_prompt_field():
+    """Should support 'prompt' as alternative to 'question'."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t2",
+        name="AskUserQuestion",
+        input={"prompt": "Select a mode"},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "Select a mode"
+
+
+def test_format_question_empty_returns_default():
+    """Empty input should return default message."""
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import ClaudeCodeAgent
+
+    block = ToolUseBlock(
+        id="t3",
+        name="AskUserQuestion",
+        input={},
+    )
+    result = ClaudeCodeAgent._format_question(block)
+    assert result == "(agent requires your input)"
 
 
 @pytest.mark.anyio
