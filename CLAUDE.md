@@ -102,3 +102,21 @@ docker run -v weixin-state:/root/.openclaw-weixin-python \
 1. Create `src/agent_box/agents/my_agent.py` extending `BaseAgent`
 2. Implement `run(prompt) -> str`
 3. Swap in `main.py` `_get_or_create_agent()`
+
+## Pull Request Guidelines
+
+When creating a PR to fix an issue, include `Closes #<issue_number>` in the PR description to automatically close the issue when the PR is merged:
+
+```markdown
+## Summary
+
+Fix the reported bug.
+
+## Test Plan
+
+- [x] Tests pass
+
+Closes #123
+```
+
+This is especially important when the PR title doesn't explicitly mention the issue number.
