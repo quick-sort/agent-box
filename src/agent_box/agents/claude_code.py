@@ -62,6 +62,22 @@ def _shorten_path(path: str, prefixes: tuple[str, ...]) -> str:
     return path
 
 
+def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
+    """Replace known path prefixes inside a shell command string.
+
+    Handles both plain paths and shell-escaped paths (backslash-space).
+    Replaces the project path with ``.`` since that's the cwd.
+    """
+    for p in prefixes:
+        # Shell-escaped variant: "agent box" → "agent\\ box"
+        escaped = p.replace(" ", "\\ ")
+        if escaped in cmd:
+            cmd = cmd.replace(escaped, ".")
+        elif p in cmd:
+            cmd = cmd.replace(p, ".")
+    return cmd
+
+
 def _format_tool_summary(block: ToolUseBlock, *, prefixes: tuple[str, ...] = ()) -> str:
     """Return a one-line status for a tool call — just enough to signal
     *activity*, not enough to overwhelm the IM channel."""
@@ -70,7 +86,7 @@ def _format_tool_summary(block: ToolUseBlock, *, prefixes: tuple[str, ...] = ())
     _s = lambda p: _shorten_path(p, prefixes)
 
     if name == "Bash":
-        cmd = inp.get("command", "")
+        cmd = _shorten_paths_in_cmd(inp.get("command", ""), prefixes)
         if len(cmd) > 60:
             cmd = cmd[:57] + "..."
         return f"🔧 {cmd}"

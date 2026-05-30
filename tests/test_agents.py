@@ -334,6 +334,59 @@ def test_format_tool_summary_bash():
     assert _format_tool_summary(block) == "🔧 npm test"
 
 
+def test_format_tool_summary_bash_shortens_project_path():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(
+        id="t1", name="Bash",
+        input={"command": "cd /home/user/workspace/proj && npm test"},
+    )
+    result = _format_tool_summary(block, prefixes=("/home/user/workspace/proj",))
+    assert result == "🔧 cd . && npm test"
+
+
+def test_format_tool_summary_bash_shortens_escaped_spaces():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(
+        id="t1", name="Bash",
+        input={"command": "ls /home/user/agent\\ box/proj/src"},
+    )
+    result = _format_tool_summary(
+        block, prefixes=("/home/user/agent box/proj",),
+    )
+    assert result == "🔧 ls ./src"
+
+
+def test_shorten_paths_in_cmd():
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "cd /home/user/proj && npm test",
+        ("/home/user/proj",),
+    ) == "cd . && npm test"
+
+
+def test_shorten_paths_in_cmd_escaped():
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "cd /home/user/my\\ project && ls",
+        ("/home/user/my project",),
+    ) == "cd . && ls"
+
+
+def test_shorten_paths_in_cmd_no_match():
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "ls /tmp/other",
+        ("/home/user/proj",),
+    ) == "ls /tmp/other"
+
+
 def test_format_tool_summary_bash_long_command():
     from claude_agent_sdk import ToolUseBlock
     from agent_box.agents.claude_code import _format_tool_summary
