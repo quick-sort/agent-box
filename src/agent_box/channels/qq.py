@@ -325,8 +325,51 @@ class QQChannel(BaseChannel):
 
     # ── Attachment extraction ─────────────────────────────────────────────────
 
+    def _extract_all_atts(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return all attachment entries from the event's attachments list."""
+        return [
+            a for a in (data.get("attachments") or [])
+            if isinstance(a, dict)
+        ]
+
+    def _att_label(self, att: dict[str, Any]) -> str:
+        """Human-readable label for an attachment."""
+        ct = (att.get("content_type") or "").split(";")[0].strip()
+        if ct.startswith("image/"):
+            return "图片"
+        if ct.startswith("video/"):
+            return "视频"
+        if ct.startswith("audio/"):
+            return "语音"
+        return "文件"
+
+    async def _download_atts(
+        self, atts: list[dict[str, Any]]
+    ) -> list[tuple[str, str]]:
+        """Download each attachment. Returns list of (label, local_path)."""
+        results: list[tuple[str, str]] = []
+        for att in atts:
+            url = _normalize_url(att.get("url") or "")
+            label = self._att_label(att)
+            if url:
+                local = await self._download_image(url, att.get("filename"))
+                results.append((label, local or ""))
+            else:
+                results.append((label, ""))
+        return results
+
+    def _atts_text(self, atts_info: list[tuple[str, str]]) -> str:
+        """Build text description lines for all attachments."""
+        parts: list[str] = []
+        for label, path in atts_info:
+            if path:
+                parts.append(f"用户发送了一个{label}，文件路径: {path}")
+            else:
+                parts.append(f"用户发送了一个{label}，文件路径: (下载失败)")
+        return "\n".join(parts)
+
+    # Keep old methods as thin wrappers for backward compatibility
     def _extract_image_atts(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return image-type entries from the event's attachments list."""
         return [
             a for a in (data.get("attachments") or [])
             if isinstance(a, dict) and (a.get("content_type") or "").startswith("image/")
@@ -335,10 +378,6 @@ class QQChannel(BaseChannel):
     async def _download_image_atts(
         self, image_atts: list[dict[str, Any]]
     ) -> tuple[list[str], list[str]]:
-        """
-        Download each image attachment sequentially.
-        Returns (local_paths, urls); local_paths[i] is "" if download failed.
-        """
         urls: list[str] = []
         local_paths: list[str] = []
         for att in image_atts:
@@ -351,15 +390,6 @@ class QQChannel(BaseChannel):
                 local_paths.append("")
         return local_paths, urls
 
-    def _image_att_text(self, image_atts: list[dict[str, Any]], local_paths: list[str]) -> str:
-        """Build text description lines for image attachments."""
-        parts: list[str] = []
-        for i, att in enumerate(image_atts):
-            local = local_paths[i] if i < len(local_paths) else ""
-            label = local or _normalize_url(att.get("url") or "")
-            parts.append(f"[图片: {label}]")
-        return "\n".join(parts)
-
     # ── Inbound message handlers ──────────────────────────────────────────────
 
     async def _handle_c2c(self, data: dict[str, Any]) -> None:
@@ -370,14 +400,11 @@ class QQChannel(BaseChannel):
         if not openid:
             return
 
-        image_atts = self._extract_image_atts(data)
-        local_paths: list[str] = []
-        urls: list[str] = []
-
-        if image_atts:
-            local_paths, urls = await self._download_image_atts(image_atts)
-            img_text = self._image_att_text(image_atts, local_paths)
-            text = f"{text}\n{img_text}".strip() if text else img_text
+        all_atts = self._extract_all_atts(data)
+        if all_atts:
+            atts_info = await self._download_atts(all_atts)
+            att_text = self._atts_text(atts_info)
+            text = f"{text}\n{att_text}".strip() if text else att_text
 
         if not text:
             return
@@ -393,8 +420,6 @@ class QQChannel(BaseChannel):
                 "type": "c2c",
                 "target_id": openid,
                 "msg_id": msg_id,
-                "image_paths": local_paths,
-                "image_urls": urls,
             },
         ))
 
@@ -405,14 +430,11 @@ class QQChannel(BaseChannel):
         if not group_openid:
             return
 
-        image_atts = self._extract_image_atts(data)
-        local_paths: list[str] = []
-        urls: list[str] = []
-
-        if image_atts:
-            local_paths, urls = await self._download_image_atts(image_atts)
-            img_text = self._image_att_text(image_atts, local_paths)
-            text = f"{text}\n{img_text}".strip() if text else img_text
+        all_atts = self._extract_all_atts(data)
+        if all_atts:
+            atts_info = await self._download_atts(all_atts)
+            att_text = self._atts_text(atts_info)
+            text = f"{text}\n{att_text}".strip() if text else att_text
 
         if not text:
             return
@@ -428,8 +450,6 @@ class QQChannel(BaseChannel):
                 "type": "group",
                 "target_id": group_openid,
                 "msg_id": msg_id,
-                "image_paths": local_paths,
-                "image_urls": urls,
             },
         ))
 
