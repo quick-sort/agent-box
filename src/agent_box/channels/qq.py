@@ -21,6 +21,7 @@ Attachment handling:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -59,10 +60,30 @@ _MENTION_RE = re.compile(r"<@!?\w+>\s*")
 
 RECONNECT_DELAY = 5.0  # seconds between reconnect attempts
 
-# QQ Bot media file_type value for images (API enum: 1=image 2=video 3=voice 4=file)
+# QQ Bot media file_type values (API enum: 1=image 2=video 3=voice 4=file)
 _FILE_TYPE_IMAGE = 1
+_FILE_TYPE_VIDEO = 2
+_FILE_TYPE_VOICE = 3
+_FILE_TYPE_FILE = 4
+
+# Upload size limits per type (matching official TS SDK)
+_UPLOAD_SIZE_LIMITS: dict[int, int] = {
+    _FILE_TYPE_IMAGE: 30 * 1024 * 1024,   # 30MB
+    _FILE_TYPE_VIDEO: 100 * 1024 * 1024,  # 100MB
+    _FILE_TYPE_VOICE: 20 * 1024 * 1024,   # 20MB
+    _FILE_TYPE_FILE: 100 * 1024 * 1024,   # 100MB
+}
+
+# File extension → media type mapping
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"})
+_AUDIO_EXTS = frozenset({".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".silk"})
+
+# MD5_10M: hash of the first 10_002_432 bytes (QQ protocol requirement)
+_MD5_10M_SIZE = 10_002_432
 
 _DOWNLOAD_TIMEOUT_S = 60.0
+_PUT_CHUNK_TIMEOUT_S = 300.0  # 5 min per part upload
 
 
 def _next_msg_seq() -> int:
@@ -73,6 +94,27 @@ def _normalize_url(url: str) -> str:
     if url.startswith("//"):
         return f"https:{url}"
     return url
+
+
+def _detect_file_type(file_path: str) -> int:
+    """Detect QQ API file_type from file extension."""
+    ext = Path(file_path).suffix.lower()
+    if ext in _IMAGE_EXTS:
+        return _FILE_TYPE_IMAGE
+    if ext in _VIDEO_EXTS:
+        return _FILE_TYPE_VIDEO
+    if ext in _AUDIO_EXTS:
+        return _FILE_TYPE_VOICE
+    return _FILE_TYPE_FILE
+
+
+def _format_size(n: int) -> str:
+    """Human-readable file size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n}B"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f}TB"
 
 
 class QQChannel(BaseChannel):
@@ -131,6 +173,201 @@ class QQChannel(BaseChannel):
         if not resp.is_success:
             log.error("QQ API %s → %s: %s", path, resp.status_code, resp.text[:300])
         return resp.json() if resp.content else {}
+
+    # ── Chunked upload helpers ──────────────────────────────────────────────
+
+    async def _compute_file_hashes(self, file_path: str) -> dict[str, str]:
+        """Compute md5, sha1, md5_10m hashes for a file (in thread)."""
+
+        def _hash() -> dict[str, str]:
+            md5 = hashlib.md5()
+            sha1 = hashlib.sha1()
+            md5_10m = hashlib.md5()
+            size = Path(file_path).stat().st_size
+            need_10m = size > _MD5_10M_SIZE
+            read_10m = 0
+            with open(file_path, "rb") as f:
+                while chunk := f.read(65536):
+                    md5.update(chunk)
+                    sha1.update(chunk)
+                    if need_10m and read_10m < _MD5_10M_SIZE:
+                        take = min(len(chunk), _MD5_10M_SIZE - read_10m)
+                        md5_10m.update(chunk[:take])
+                        read_10m += take
+            return {
+                "md5": md5.hexdigest(),
+                "sha1": sha1.hexdigest(),
+                "md5_10m": md5_10m.hexdigest() if need_10m else md5.hexdigest(),
+            }
+
+        return await anyio.to_thread.run_sync(_hash)
+
+    async def _read_chunk_and_hash(
+        self, file_path: str, offset: int, length: int
+    ) -> tuple[bytes, str]:
+        """Read a chunk of a file and compute its MD5 (in thread)."""
+
+        def _read() -> tuple[bytes, str]:
+            with open(file_path, "rb") as f:
+                f.seek(offset)
+                data = f.read(length)
+            return data, hashlib.md5(data).hexdigest()
+
+        return await anyio.to_thread.run_sync(_read)
+
+    async def _put_chunk(self, url: str, data: bytes) -> bool:
+        """PUT bytes to a presigned COS URL. Returns True on success."""
+        try:
+            async with httpx.AsyncClient(timeout=_PUT_CHUNK_TIMEOUT_S) as client:
+                resp = await client.put(url, content=data)
+            if resp.is_success:
+                return True
+            log.error("QQ PUT chunk failed: %s %s", resp.status_code, resp.text[:200])
+            return False
+        except Exception:
+            log.exception("QQ PUT chunk exception")
+            return False
+
+    async def _chunked_upload(
+        self,
+        target_id: str,
+        target_type: str,
+        file_path: str,
+        file_type: int,
+    ) -> str | None:
+        """Upload a file using QQ's chunked upload protocol.
+
+        Returns file_info string on success, None on failure.
+
+        Protocol (matching official TS SDK):
+        1. upload_prepare → upload_id, block_size, parts with presigned URLs
+        2. For each part: read chunk → PUT to presigned URL → upload_part_finish
+        3. complete_upload → file_info
+        """
+        p = Path(file_path)
+        if not p.is_file():
+            log.error("chunked_upload: file not found: %s", file_path)
+            return None
+        file_size = p.stat().st_size
+        if file_size == 0:
+            log.error("chunked_upload: file is empty: %s", file_path)
+            return None
+        max_size = _UPLOAD_SIZE_LIMITS.get(file_type, 100 * 1024 * 1024)
+        if file_size > max_size:
+            log.error(
+                "chunked_upload: file too large (%s > %s)",
+                _format_size(file_size), _format_size(max_size),
+            )
+            return None
+
+        file_name = p.name
+        prefix = "c2c" if target_type == "c2c" else "group"
+
+        # 1. Compute hashes
+        hashes = await self._compute_file_hashes(file_path)
+        log.info(
+            "QQ chunked upload [%s]: %s (%s, type=%d) hashes computed",
+            prefix, file_name, _format_size(file_size), file_type,
+        )
+
+        # 2. upload_prepare
+        prepare_path = (
+            f"/v2/users/{target_id}/upload_prepare"
+            if target_type == "c2c"
+            else f"/v2/groups/{target_id}/upload_prepare"
+        )
+        prepare_resp = await self._api_post(prepare_path, {
+            "file_type": file_type,
+            "file_name": file_name,
+            "file_size": file_size,
+            **hashes,
+        })
+        upload_id: str | None = prepare_resp.get("upload_id")
+        block_size_raw = prepare_resp.get("block_size", 0)
+        parts: list[dict[str, Any]] = prepare_resp.get("parts") or []
+        if not upload_id or not parts:
+            log.error("chunked_upload: prepare failed: %s", prepare_resp)
+            return None
+        block_size = int(block_size_raw)
+        log.info(
+            "QQ chunked upload [%s]: prepared upload_id=%s block_size=%s parts=%d",
+            prefix, upload_id, _format_size(block_size), len(parts),
+        )
+
+        # 3. Upload each part
+        finish_path = (
+            f"/v2/users/{target_id}/upload_part_finish"
+            if target_type == "c2c"
+            else f"/v2/groups/{target_id}/upload_part_finish"
+        )
+        for i, part in enumerate(parts, 1):
+            idx: int = part["index"]
+            url: str = part["presigned_url"]
+            offset = (idx - 1) * block_size
+            length = min(block_size, file_size - offset)
+
+            chunk_data, part_md5 = await self._read_chunk_and_hash(file_path, offset, length)
+
+            ok = await self._put_chunk(url, chunk_data)
+            if not ok:
+                log.error("chunked_upload: PUT part %d/%d failed", i, len(parts))
+                return None
+
+            await self._api_post(finish_path, {
+                "upload_id": upload_id,
+                "part_index": idx,
+                "block_size": length,
+                "md5": part_md5,
+            })
+            log.debug("chunked_upload: part %d/%d done", i, len(parts))
+
+        # 4. Complete upload
+        complete_path = (
+            f"/v2/users/{target_id}/files"
+            if target_type == "c2c"
+            else f"/v2/groups/{target_id}/files"
+        )
+        result = await self._api_post(complete_path, {"upload_id": upload_id})
+        file_info = result.get("file_info")
+        if not file_info:
+            log.error("chunked_upload: complete failed: %s", result)
+            return None
+        log.info("QQ chunked upload [%s]: complete, file_info received", prefix)
+        return file_info
+
+    async def _send_media(
+        self,
+        target_id: str,
+        target_type: str,
+        file_path: str,
+        *,
+        msg_id: str | None = None,
+    ) -> None:
+        """Upload a file (any type) and send as QQ media message."""
+        file_type = _detect_file_type(file_path)
+        file_info = await self._chunked_upload(target_id, target_type, file_path, file_type)
+        if not file_info:
+            log.error("QQ: media upload failed for %s, skipping send", file_path)
+            return
+
+        body: dict[str, Any] = {
+            "msg_type": 7,
+            "media": {"file_info": file_info},
+            "msg_seq": _next_msg_seq(),
+        }
+        if msg_id:
+            body["msg_id"] = msg_id
+
+        endpoint = (
+            f"/v2/users/{target_id}/messages"
+            if target_type == "c2c"
+            else f"/v2/groups/{target_id}/messages"
+        )
+        try:
+            await self._api_post(endpoint, body)
+            log.info("QQ: sent media message (type=%d) to %s:%s", file_type, target_type, target_id)
+        except Exception:
+            log.exception("QQ: failed to send media message")
 
     # ── Media helpers ─────────────────────────────────────────────────────────
 
@@ -465,10 +702,17 @@ class QQChannel(BaseChannel):
         msg_type, target_id = msg.user_id.split(":", 1)
         msg_id = self._last_msg_id.get(msg.user_id)
 
-        # Image sending: caller puts image info in msg.data
-        image_data = msg.data or {}
-        image_url: str | None = image_data.get("image_url")
-        image_path: str | None = image_data.get("image_path")
+        data = msg.data or {}
+
+        # Generic file/media sending via chunked upload
+        file_path: str | None = data.get("file_path")
+        if file_path and msg_type in ("c2c", "group"):
+            await self._send_media(target_id, msg_type, file_path, msg_id=msg_id)
+            return
+
+        # Legacy image sending (backward compatible)
+        image_url: str | None = data.get("image_url")
+        image_path: str | None = data.get("image_path")
         if image_url or image_path:
             if msg_type in ("c2c", "group"):
                 await self._send_image(
