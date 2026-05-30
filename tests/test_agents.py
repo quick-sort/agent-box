@@ -385,6 +385,57 @@ def test_format_tool_summary_unknown():
     assert _format_tool_summary(block) == "⚙️ CustomTool"
 
 
+def test_shorten_path_strips_project():
+    from agent_box.agents.claude_code import _shorten_path
+
+    assert _shorten_path("/home/user/workspace/proj/src/main.py", ("/home/user/workspace/proj",)) == "src/main.py"
+
+
+def test_shorten_path_strips_download_dir():
+    from agent_box.agents.claude_code import _shorten_path
+
+    dl = "/home/user/.agent-box/channels/weixin/downloads"
+    assert _shorten_path(f"{dl}/image-123.jpg", (dl,)) == "image-123.jpg"
+
+
+def test_shorten_path_no_match():
+    from agent_box.agents.claude_code import _shorten_path
+
+    assert _shorten_path("/tmp/other/file.txt", ("/home/user/proj",)) == "/tmp/other/file.txt"
+
+
+def test_shorten_path_exact_match_no_trailing_slash():
+    from agent_box.agents.claude_code import _shorten_path
+
+    # If path == prefix exactly, return as-is (nothing to show after strip)
+    assert _shorten_path("/home/user/proj", ("/home/user/proj",)) == "/home/user/proj"
+
+
+def test_format_tool_summary_with_prefixes():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    block = ToolUseBlock(
+        id="t1", name="Read",
+        input={"file_path": "/home/user/workspace/proj/src/main.py"},
+    )
+    result = _format_tool_summary(block, prefixes=("/home/user/workspace/proj",))
+    assert result == "📖 src/main.py"
+
+
+def test_format_tool_summary_edit_with_download_prefix():
+    from claude_agent_sdk import ToolUseBlock
+    from agent_box.agents.claude_code import _format_tool_summary
+
+    dl = "/home/user/.agent-box/channels/qq/downloads"
+    block = ToolUseBlock(
+        id="t2", name="Edit",
+        input={"file_path": f"{dl}/report.pdf"},
+    )
+    result = _format_tool_summary(block, prefixes=(dl,))
+    assert result == "✏️ report.pdf"
+
+
 @pytest.mark.anyio
 async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
     """Multiple tool calls should each yield a brief text line."""
