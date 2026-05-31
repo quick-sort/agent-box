@@ -125,7 +125,7 @@ class App:
                 async for msg in recv_in:
                     tg.start_soon(self.handle_message, msg, send_out.clone())
         except Exception:
-            pass
+            log.exception("handle_message failed")
         finally:
             await send_out.aclose()
 
