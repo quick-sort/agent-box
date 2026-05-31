@@ -470,6 +470,48 @@ def test_shorten_paths_in_cmd_no_match():
     ) == "ls /tmp/other"
 
 
+def test_shorten_paths_in_cmd_workspace_root():
+    """Commands referencing the workspace root (not the project) should be shortened."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "find /home/user/.agent-box/workspace/ -maxdepth 3 -name '*.py'",
+        ("/home/user/.agent-box/workspace/my-project", "/home/user/.agent-box/workspace"),
+    ) == "find ./ -maxdepth 3 -name '*.py'"
+
+
+def test_shorten_paths_in_cmd_other_project():
+    """Commands referencing another project directory should be shortened via workspace root."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "ls -la /home/user/.agent-box/workspace/other-project",
+        ("/home/user/.agent-box/workspace/my-project", "/home/user/.agent-box/workspace"),
+    ) == "ls -la ./other-project"
+
+
+def test_shorten_paths_in_cmd_no_partial_match():
+    """Should NOT match /workspace/project inside /workspace/project-other."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    assert _shorten_paths_in_cmd(
+        "ls /home/user/workspace/project-other/file.txt",
+        ("/home/user/workspace/project",),
+    ) == "ls /home/user/workspace/project-other/file.txt"
+
+
+def test_shorten_paths_in_cmd_workspace_before_channel_dirs():
+    """Project path matches first, then workspace root for non-project paths."""
+    from agent_box.agents.claude_code import _shorten_paths_in_cmd
+
+    prefixes = ("/home/user/workspace/proj", "/home/user/workspace")
+
+    # Project path matches first
+    assert _shorten_paths_in_cmd("cd /home/user/workspace/proj && ls", prefixes) == "cd . && ls"
+    # Workspace root matches for other dirs
+    assert _shorten_paths_in_cmd("ls /home/user/workspace/other", prefixes) == "ls ./other"
+
+
 def test_format_tool_summary_bash_long_command():
     from claude_agent_sdk import ToolUseBlock
     from agent_box.agents.claude_code import _format_tool_summary

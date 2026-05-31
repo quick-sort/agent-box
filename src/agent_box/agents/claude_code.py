@@ -66,15 +66,21 @@ def _parse_send_file_markers(text: str) -> tuple[str, list[str]]:
 def _build_path_prefixes(project_path: str) -> tuple[str, ...]:
     """Collect directory prefixes to strip from file paths in tool summaries.
 
-    Two categories:
+    Three categories:
     1. Project workspace — so ``/home/.../project/src/main.py`` → ``src/main.py``
-    2. Channel download dirs — so ``~/.agent-box/channels/weixin/downloads/img.jpg`` → ``img.jpg``
+    2. Workspace root — covers commands referencing other projects or the workspace itself
+    3. Channel download dirs — so ``~/.agent-box/channels/weixin/downloads/img.jpg`` → ``img.jpg``
     """
     prefixes: list[str] = []
-    # Project path
+    # Project path (most specific — checked first)
     pp = project_path.rstrip("/")
     if pp:
         prefixes.append(pp)
+    # Workspace root — so commands referencing other projects or the workspace
+    # dir itself are also shortened (e.g. find /home/.../workspace/ → find .)
+    ws = str(settings.workspace_dir.resolve()).rstrip("/")
+    if ws and ws != pp:
+        prefixes.append(ws)
     # Channel download dirs (WeChat + QQ)
     for ch in ("weixin", "qq"):
         d = str((settings.config_dir / "channels" / ch / "downloads").resolve())
@@ -106,12 +112,20 @@ def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
     - Shell-escaped paths: /home/.../workspace/project\\ box → .
     - Quoted paths: /home/.../workspace/"project name"/subdir → .
     Replaces the project path with ``.`` since that's the cwd.
+
+    Uses ``(?=[/'" ]|$)`` lookahead to avoid matching inside longer path
+    components (e.g. ``/workspace/project`` should NOT match ``/workspace/project-other``).
     """
     for p in prefixes:
         # Shell-escaped variant: "agent box" → "agent\\ box"
         escaped = p.replace(" ", "\\ ")
-        if escaped in cmd:
-            cmd = cmd.replace(escaped, ".")
+        escaped_pattern = re.escape(escaped) + r"""(?=[/'" ]|$)"""
+        try:
+            new_cmd = re.sub(escaped_pattern, ".", cmd, count=1)
+        except re.error:
+            new_cmd = cmd
+        if new_cmd != cmd:
+            cmd = new_cmd
             continue
 
         # Use regex to handle quoted path components with spaces
@@ -129,9 +143,8 @@ def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
             else:
                 pattern_parts.append(escaped_part)
 
-        pattern = "/" + "/".join(pattern_parts) + "(?=/?)"
+        pattern = "/" + "/".join(pattern_parts) + r"""(?=[/'" ]|$)"""
         try:
-            # Replace matched prefix with "."
             new_cmd = re.sub(pattern, ".", cmd, count=1)
             if new_cmd != cmd:
                 cmd = new_cmd
@@ -151,9 +164,15 @@ def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
         elif f"'{p}/" in cmd:
             cmd = cmd.replace(f"'{p}/", "'.")
 
-        # Plain path
-        if p in cmd:
-            cmd = cmd.replace(p, ".")
+        # Plain path — use regex to avoid matching inside longer path components
+        plain_pattern = re.escape(p) + r"""(?=[/'" ]|$)"""
+        try:
+            new_cmd = re.sub(plain_pattern, ".", cmd, count=1)
+            if new_cmd != cmd:
+                cmd = new_cmd
+        except re.error:
+            pass
+
     return cmd
 
 
