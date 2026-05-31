@@ -8,14 +8,18 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+import anyio
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+    SessionMessage,
     SystemMessage,
     TextBlock,
     ToolUseBlock,
+    get_session_messages,
 )
 
 from ..config import settings
@@ -183,6 +187,70 @@ def _format_tool_summary(block: ToolUseBlock, *, prefixes: tuple[str, ...] = ())
     if name == "WebFetch":
         return f"🌐 {inp.get('url', '')}"
     return f"⚙️ {name}"
+
+
+# ── Context window limit recovery ──
+
+
+def _is_context_limit_error(msg: ResultMessage) -> bool:
+    """Return True if the ResultMessage indicates a context window overflow."""
+    if not msg.is_error:
+        return False
+    error_text = " ".join(msg.errors or []) + " " + (msg.result or "")
+    return "context window" in error_text.lower()
+
+
+def _extract_text_from_content(content: Any) -> str:
+    """Extract readable text from a message content list."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        elif isinstance(block, TextBlock):
+            parts.append(block.text)
+    return "\n".join(parts).strip()
+
+
+def _format_recent_rounds(messages: list[SessionMessage], n: int = 2) -> str:
+    """Format the last *n* user-assistant rounds as readable context.
+
+    Returns a formatted string preserving recent conversation so the agent
+    can continue after compaction.
+    """
+    # Collect user/assistant pairs from the end
+    rounds: list[tuple[str, str]] = []
+    msgs = list(reversed(messages))
+    it = iter(msgs)
+    for m in it:
+        if m.type == "assistant":
+            assistant_text = _extract_text_from_content(m.message.get("content", []))
+            # Find the preceding user message
+            user_text = ""
+            for um in it:
+                if um.type == "user":
+                    user_text = _extract_text_from_content(um.message.get("content", []))
+                    break
+            rounds.append((user_text, assistant_text))
+            if len(rounds) >= n:
+                break
+
+    rounds.reverse()
+    if not rounds:
+        return ""
+
+    lines: list[str] = ["[自动恢复上下文 — 最近对话摘要]"]
+    for i, (user, assistant) in enumerate(rounds, 1):
+        lines.append(f"\n=== 第 {i} 轮 ===")
+        if user:
+            lines.append(f"用户：{user[:500]}")
+        if assistant:
+            lines.append(f"助手：{assistant[:1000]}")
+    return "\n".join(lines)
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -436,7 +504,100 @@ class ClaudeCodeAgent(BaseAgent):
                     data=msg.data,
                 )
             elif isinstance(msg, ResultMessage):
+                # --- Context window limit recovery ---
+                if _is_context_limit_error(msg):
+                    log.warning(
+                        "context window limit hit for project %s, session %s",
+                        self.project.name, msg.session_id,
+                    )
+                    async for out_msg in self._recover_from_context_limit(
+                        client, prompt, user_id, channel, msg.session_id,
+                    ):
+                        yield out_msg
+                    return
+
                 if msg.session_id and msg.session_id != self.project.session_id:
+                    self.project.session_id = msg.session_id
+                yield OutgoingMessage(
+                    text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
+                    data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
+                )
+
+    async def _recover_from_context_limit(
+        self,
+        client: ClaudeSDKClient,
+        prompt: str,
+        user_id: str,
+        channel: str,
+        session_id: str,
+    ) -> AsyncIterator[OutgoingMessage]:
+        """Compact the session and replay recent context + original prompt."""
+        yield OutgoingMessage(
+            text="⚠️ 会话上下文已满，正在自动压缩并恢复...",
+            user_id=user_id, channel=channel, type=MessageType.text,
+        )
+
+        # 1. Get recent conversation from session history
+        recent_context = ""
+        try:
+            messages = await anyio.to_thread.run_sync(
+                lambda: get_session_messages(
+                    session_id, directory=self.project.path, limit=10,
+                )
+            )
+            recent_context = _format_recent_rounds(messages, n=2)
+            log.info("recovered %d session messages for context replay", len(messages))
+        except Exception:
+            log.warning("failed to read session messages for context replay", exc_info=True)
+
+        # 2. Send /compact
+        log.info("sending /compact to project %s", self.project.name)
+        await client.query("/compact")
+        async for msg in client.receive_response():
+            if isinstance(msg, ResultMessage):
+                if msg.session_id:
+                    self.project.session_id = msg.session_id
+                if msg.is_error:
+                    yield OutgoingMessage(
+                        text="❌ 自动压缩失败，请手动发送 /compact",
+                        user_id=user_id, channel=channel, type=MessageType.text,
+                    )
+                    return
+                break
+
+        # 3. Re-send context + original prompt
+        replay = recent_context + "\n\n" + prompt if recent_context else prompt
+        log.info("re-playing prompt after compact (context=%d chars)", len(recent_context))
+        await client.query(replay)
+        _path_prefixes = _build_path_prefixes(self.project.path)
+
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        cleaned = block.text.strip()
+                        if cleaned:
+                            text, file_paths = _parse_send_file_markers(cleaned)
+                            if text:
+                                yield OutgoingMessage(text=text, user_id=user_id, channel=channel, type=MessageType.text)
+                            for fp in file_paths:
+                                yield OutgoingMessage(
+                                    text="", user_id=user_id, channel=channel, type=MessageType.text,
+                                    data={"file_path": fp},
+                                )
+                    elif isinstance(block, ToolUseBlock):
+                        summary = _format_tool_summary(block, prefixes=_path_prefixes)
+                        yield OutgoingMessage(
+                            text=summary, user_id=user_id, channel=channel, type=MessageType.text,
+                            data={"id": block.id, "name": block.name, "input": block.input},
+                        )
+            elif isinstance(msg, SystemMessage):
+                yield OutgoingMessage(
+                    text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
+                    data=msg.data,
+                )
+            elif isinstance(msg, ResultMessage):
+                if msg.session_id:
                     self.project.session_id = msg.session_id
                 yield OutgoingMessage(
                     text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,

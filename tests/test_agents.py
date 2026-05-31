@@ -794,3 +794,183 @@ def test_build_options_includes_system_prompt(sample_project: ProjectInfo):
     assert opts.system_prompt["preset"] == "claude_code"
     assert "append" in opts.system_prompt
     assert "SEND_FILE" in opts.system_prompt["append"]
+
+
+# ── Context window limit recovery ──
+
+
+def test_is_context_limit_error_true():
+    from claude_agent_sdk import ResultMessage
+    from agent_box.agents.claude_code import _is_context_limit_error
+
+    msg = ResultMessage(
+        subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+        num_turns=1, session_id="s1",
+        errors=["API Error: The model has reached its context window limit."],
+    )
+    assert _is_context_limit_error(msg) is True
+
+
+def test_is_context_limit_error_true_in_result():
+    from claude_agent_sdk import ResultMessage
+    from agent_box.agents.claude_code import _is_context_limit_error
+
+    msg = ResultMessage(
+        subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+        num_turns=1, session_id="s1",
+        result="context window limit exceeded",
+    )
+    assert _is_context_limit_error(msg) is True
+
+
+def test_is_context_limit_error_false_not_error():
+    from claude_agent_sdk import ResultMessage
+    from agent_box.agents.claude_code import _is_context_limit_error
+
+    msg = ResultMessage(
+        subtype="success", is_error=False, duration_ms=0, duration_api_ms=0,
+        num_turns=1, session_id="s1",
+    )
+    assert _is_context_limit_error(msg) is False
+
+
+def test_is_context_limit_error_false_other_error():
+    from claude_agent_sdk import ResultMessage
+    from agent_box.agents.claude_code import _is_context_limit_error
+
+    msg = ResultMessage(
+        subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+        num_turns=1, session_id="s1",
+        errors=["API Error: Rate limit exceeded"],
+    )
+    assert _is_context_limit_error(msg) is False
+
+
+def test_format_recent_rounds():
+    from claude_agent_sdk import SessionMessage
+    from agent_box.agents.claude_code import _format_recent_rounds
+
+    messages = [
+        SessionMessage(
+            type="user", uuid="u1", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "create a FastAPI project"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a1", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "Created main.py with FastAPI app"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="user", uuid="u2", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "add a /health endpoint"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a2", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "Added /health endpoint"}]},
+            parent_tool_use_id=None,
+        ),
+    ]
+
+    result = _format_recent_rounds(messages, n=2)
+    assert "add a /health endpoint" in result
+    assert "Added /health endpoint" in result
+    assert "create a FastAPI project" in result
+    assert "自动恢复上下文" in result
+
+
+def test_format_recent_rounds_empty():
+    from agent_box.agents.claude_code import _format_recent_rounds
+
+    assert _format_recent_rounds([], n=2) == ""
+
+
+@pytest.mark.anyio
+async def test_run_triggers_context_limit_recovery(sample_project: ProjectInfo):
+    """When ResultMessage has context window limit error, recovery should trigger."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    call_count = {"queries": 0, "receives": 0}
+
+    async def fake_receive():
+        call_count["receives"] += 1
+        if call_count["receives"] == 1:
+            # First call: context limit error
+            yield ResultMessage(
+                subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+                num_turns=1, session_id="sess-ctx",
+                errors=["The model has reached its context window limit."],
+            )
+        elif call_count["receives"] == 2:
+            # Second call (compact result): success
+            yield ResultMessage(
+                subtype="success", is_error=False, duration_ms=500, duration_api_ms=400,
+                num_turns=1, session_id="sess-ctx", total_cost_usd=0.01, usage=None,
+            )
+        else:
+            # Third call (re-played prompt): success with response
+            yield AssistantMessage(content=[TextBlock(text="Recovered response")], model="test")
+            yield ResultMessage(
+                subtype="success", is_error=False, duration_ms=1000, duration_api_ms=900,
+                num_turns=2, session_id="sess-ctx", total_cost_usd=0.02, usage=None,
+            )
+
+    mock_client.receive_response = fake_receive
+
+    with patch("agent_box.agents.claude_code.get_session_messages", return_value=[]):
+        agent = ClaudeCodeAgent(sample_project)
+        agent._client = mock_client
+        msgs = [m async for m in agent.run("continue the task")]
+
+    # Should have: recovery notice + response text + result
+    texts = [m.text for m in msgs]
+    assert any("自动压缩" in t for t in texts)
+    assert any("Recovered response" in t for t in texts)
+
+    # Should have queried: original prompt, /compact, then the replay
+    assert mock_client.query.call_count == 3
+    calls = [c.args[0] for c in mock_client.query.call_args_list]
+    assert calls[0] == "continue the task"
+    assert calls[1] == "/compact"
+    assert "continue the task" in calls[2]
+
+
+@pytest.mark.anyio
+async def test_run_context_limit_compact_fails(sample_project: ProjectInfo):
+    """If /compact also fails, should report error to user."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    call_count = {"receives": 0}
+
+    async def fake_receive():
+        call_count["receives"] += 1
+        if call_count["receives"] == 1:
+            # First call: context limit error
+            yield ResultMessage(
+                subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+                num_turns=1, session_id="sess-ctx",
+                errors=["The model has reached its context window limit."],
+            )
+        else:
+            # Compact also fails
+            yield ResultMessage(
+                subtype="success", is_error=True, duration_ms=0, duration_api_ms=0,
+                num_turns=1, session_id="sess-ctx",
+                errors=["compact failed"],
+            )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("test")]
+
+    texts = [m.text for m in msgs]
+    assert any("自动压缩" in t for t in texts)
+    assert any("压缩失败" in t for t in texts)
+
