@@ -17,12 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh openssh-client \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 999 agent \
     && useradd --uid 1000 --gid 999 -m agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
-    && npm install -g @anthropic-ai/claude-code@2.1.110 \
+    && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright agent-browser install --with-deps \
+    && chmod -R 755 /opt/playwright \
+    && npx skills add https://github.com/vercel-labs/skills --skill find-skills \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && npm cache clean --force
 
 
@@ -32,6 +35,7 @@ VOLUME ["/home/agent"]
 WORKDIR /app
 ENV UV_LINK_MODE=copy
 ENV HOME="/home/agent"
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 
 RUN --mount=type=cache,target=/root/.cache/uv \
