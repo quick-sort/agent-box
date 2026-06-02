@@ -56,6 +56,14 @@ class App:
         self.sessions.ensure_default()  # always available as a fallback
         agent = self._get_or_create_agent(project_name)
         async for out_msg in agent.run(msg.text, user_id=msg.user_id, channel=msg.channel):
+            if out_msg.text and out_msg.type.value == "text" and self.sessions.get_current() != project_name:
+                out_msg = OutgoingMessage(
+                    text=f"[{project_name}] {out_msg.text}",
+                    user_id=out_msg.user_id,
+                    channel=out_msg.channel,
+                    type=out_msg.type,
+                    data=out_msg.data,
+                )
             await reply.send(out_msg)
         self.sessions.update_session_id(project_name, agent.project.session_id or "")
 

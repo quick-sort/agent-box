@@ -84,6 +84,7 @@ async def test_handle_message_forwards_to_pinned(tmp_path: Path):
     """Forward to the project name returned by the router."""
     app = _make_app(tmp_path)
     app.sessions.create("web-app")
+    app.sessions.set_current("web-app")
     app.router.route = AsyncMock(return_value=RouteResult(project="web-app"))
 
     mock_agent = _async_iter_agent("done")
@@ -139,3 +140,45 @@ async def test_dispatch_loop_concurrent(tmp_path: Path):
 
     assert "start-a" in call_order
     assert "start-b" in call_order
+
+
+# ── Project tag when user switches away ──
+
+
+@pytest.mark.anyio
+async def test_handle_message_tags_when_project_switched(tmp_path: Path):
+    """When user has switched to another project, agent messages get tagged."""
+    app = _make_app(tmp_path)
+    app.sessions.create("proj-a")
+    app.sessions.set_current("proj-a")
+    app.router.route = AsyncMock(return_value=RouteResult(project="proj-a"))
+
+    mock_agent = _async_iter_agent("done")
+
+    with patch("agent_box.main.create_agent", return_value=mock_agent):
+        send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
+        # Simulate: user switched to proj-b while proj-a is still running
+        app.sessions.create("proj-b")
+        app.sessions.set_current("proj-b")
+        await app.handle_message(_msg("fix the bug"), send)
+
+    msg = recv.receive_nowait()
+    assert msg.text == "[proj-a] done"
+
+
+@pytest.mark.anyio
+async def test_handle_message_no_tag_when_same_project(tmp_path: Path):
+    """When current project matches, no tag is added."""
+    app = _make_app(tmp_path)
+    app.sessions.create("proj-a")
+    app.sessions.set_current("proj-a")
+    app.router.route = AsyncMock(return_value=RouteResult(project="proj-a"))
+
+    mock_agent = _async_iter_agent("done")
+
+    with patch("agent_box.main.create_agent", return_value=mock_agent):
+        send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
+        await app.handle_message(_msg("fix the bug"), send)
+
+    msg = recv.receive_nowait()
+    assert msg.text == "done"
