@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && /home/agent/.npm-global/bin/agent-browser install --with-deps \
     && chmod -R 755 /root/.agent-browser \
     && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add https://github.com/vercel-labs/skills --skill find-skills \
+    && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add vercel-labs/agent-browser \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
