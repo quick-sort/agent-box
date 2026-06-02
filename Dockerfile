@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
-    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright /home/agent/.npm-global/bin/agent-browser install --with-deps \
-    && chmod -R 755 /opt/playwright \
+    && /home/agent/.npm-global/bin/agent-browser install --with-deps \
+    && chmod -R 755 /root/.agent-browser \
     && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add https://github.com/vercel-labs/skills --skill find-skills \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -35,7 +35,6 @@ VOLUME ["/home/agent"]
 WORKDIR /app
 ENV UV_LINK_MODE=copy
 ENV HOME="/home/agent"
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 
 RUN --mount=type=cache,target=/root/.cache/uv \
