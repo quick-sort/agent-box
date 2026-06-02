@@ -24,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/github-cli-list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh openssh-client \
-    && groupadd --gid 999 agent \
-    && useradd --uid 1000 --gid 999 -m agent \
+    && groupadd agent \
+    && useradd --uid 1000 -g agent -m agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
