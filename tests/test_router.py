@@ -61,11 +61,13 @@ async def test_forwards_to_pinned_project(tmp_projects: SessionManager):
 
 @pytest.mark.anyio
 async def test_create_project_tool(tmp_projects: SessionManager):
+    """LLM-classified create_project (not matched by regex fast-path)."""
     router = _make_router(tmp_projects, tool_call=_tool("create_project", name="newp"))
-    result = await router.route(_msg("start a new project called newp"))
+    result = await router.route(_msg("make me a workspace for newp"))
     assert result.reply is not None and "newp" in result.reply
     assert tmp_projects.get("newp") is not None
     assert tmp_projects.get_current() == "newp"
+    router._client.messages.create.assert_awaited_once()
 
 
 @pytest.mark.anyio
@@ -150,3 +152,79 @@ async def test_list_projects_with_pinned(tmp_projects: SessionManager):
 def test_router_creates_dot_router_folder(tmp_projects: SessionManager):
     _make_router(tmp_projects)
     assert (tmp_projects.workspace / ".router").is_dir()
+
+
+# ── Regex fast-path ──
+
+
+def test_fast_classify_switch_to():
+    from agent_box.router.router import _fast_classify
+
+    assert _fast_classify("switchto my-project") == ("switch_project", "my-project")
+    assert _fast_classify("switchto default") == ("switch_project", "")
+
+
+def test_fast_classify_create_project():
+    from agent_box.router.router import _fast_classify
+
+    assert _fast_classify("newproject api-server") == ("create_project", "api-server")
+    assert _fast_classify("newproject webapp") == ("create_project", "webapp")
+
+
+def test_fast_classify_list_projects():
+    from agent_box.router.router import _fast_classify
+
+    assert _fast_classify("listprojects") == ("list_projects", "")
+
+
+def test_fast_classify_no_match():
+    from agent_box.router.router import _fast_classify
+
+    # Natural language — should NOT match (goes to LLM instead)
+    assert _fast_classify("switch to my-project") is None
+    assert _fast_classify("new project api-server") is None
+    assert _fast_classify("list projects") is None
+    assert _fast_classify("fix the bug in main.py") is None
+    assert _fast_classify("切换到 demo") is None
+    assert _fast_classify("hello") is None
+
+
+@pytest.mark.anyio
+async def test_route_uses_fast_path_switch(tmp_projects: SessionManager):
+    """Regex match should bypass LLM call entirely."""
+    tmp_projects.create("my-proj")
+    router = _make_router(tmp_projects, tool_call=None)
+
+    result = await router.route(_msg("switchto my-proj"))
+    assert result.reply is not None and "my-proj" in result.reply
+    assert tmp_projects.get_current() == "my-proj"
+    router._client.messages.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_route_uses_fast_path_create(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=None)
+
+    result = await router.route(_msg("newproject webapp"))
+    assert result.reply is not None and "webapp" in result.reply
+    assert tmp_projects.get("webapp") is not None
+    router._client.messages.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_route_uses_fast_path_list(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=None)
+
+    result = await router.route(_msg("listprojects"))
+    assert result.reply is not None
+    router._client.messages.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_route_falls_through_to_llm(tmp_projects: SessionManager):
+    """Natural language should still call the LLM."""
+    router = _make_router(tmp_projects, tool_call=None)
+
+    result = await router.route(_msg("switch to my-proj"))
+    assert result.project == "_default"
+    router._client.messages.create.assert_awaited_once()

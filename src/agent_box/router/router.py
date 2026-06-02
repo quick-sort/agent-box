@@ -10,12 +10,16 @@ Three tools are exposed to the model:
 If the model calls one, we execute it and reply with a confirmation /
 listing. Otherwise the message is forwarded to the currently pinned project
 (defaulting to ``_default``).
+
+A fast regex-based pre-check runs before the LLM call for common patterns
+like "switch to foo" or "list projects", saving latency and API cost.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 
 from anthropic import AsyncAnthropic
 from anthropic.types import ToolUseBlock
@@ -25,6 +29,34 @@ from ..session_manager import DEFAULT_PROJECT_NAME, SessionManager
 from .base import BaseRouter, RouteResult
 
 log = logging.getLogger(__name__)
+
+
+# ── Regex fast-path shortcuts ──
+# Compact keyword patterns (no spaces) that act as shortcuts.
+# Distinct from natural language so they never conflict with chat.
+# Usage: "switchto xxx", "newproject xxx", "listprojects"
+
+_FAST_PATTERNS: list[tuple[re.Pattern[str], str, int]] = [
+    (re.compile(r"^listprojects$", re.IGNORECASE), "list_projects", 0),
+    (re.compile(r"^newproject\s+(.+)$", re.IGNORECASE), "create_project", 1),
+    (re.compile(r"^switchto\s+default$", re.IGNORECASE), "switch_project", 0),
+    (re.compile(r"^switchto\s+(.+)$", re.IGNORECASE), "switch_project", 1),
+]
+
+
+def _fast_classify(text: str) -> tuple[str, str] | None:
+    """Try to match a project-management command via regex.
+
+    Returns ``(tool_name, extracted_arg)`` or ``None`` if no match.
+    For tools without args (like ``list_projects``), the arg is empty string.
+    """
+    t = text.strip()
+    for pattern, tool_name, group_idx in _FAST_PATTERNS:
+        m = pattern.search(t)
+        if m:
+            arg = m.group(group_idx).strip() if group_idx > 0 else ""
+            return (tool_name, arg)
+    return None
 
 
 _TOOLS = [
@@ -203,7 +235,24 @@ class Router(BaseRouter):
     # ── public API ──
 
     async def route(self, msg: IncomingMessage) -> RouteResult:
-        tool_call = await self._classify(msg.text.strip())
+        text = msg.text.strip()
+
+        # Fast regex path — skip LLM for common patterns
+        fast = _fast_classify(text)
+        if fast is not None:
+            tool_name, arg = fast
+            log.info("regex fast-path matched: %s(%s)", tool_name, arg)
+            if tool_name == "create_project":
+                return self._handle_create(arg)
+            if tool_name == "switch_project":
+                if not arg:
+                    return self._handle_switch(DEFAULT_PROJECT_NAME)
+                return self._handle_switch(arg)
+            if tool_name == "list_projects":
+                return self._handle_list()
+
+        # Fall through to LLM classification
+        tool_call = await self._classify(text)
         if tool_call is None:
             return RouteResult(project=self.sessions.get_current())
 
