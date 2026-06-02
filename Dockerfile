@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list \
+        > /etc/apt/sources.list.d/github-cli-list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh openssh-client \
     && groupadd --gid 999 agent \
@@ -22,11 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
-    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright agent-browser install --with-deps \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright /home/agent/.npm-global/bin/agent-browser install --with-deps \
     && chmod -R 755 /opt/playwright \
-    && npx skills add https://github.com/vercel-labs/skills --skill find-skills \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && npm cache clean --force
+    && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add https://github.com/vercel-labs/skills --skill find-skills \
+    && npm cache clean --force \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 
 # Persist weixin state and project data across restarts
