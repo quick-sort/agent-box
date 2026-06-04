@@ -236,39 +236,25 @@ def _extract_text_from_content(content: Any) -> str:
 
 
 def _format_recent_rounds(messages: list[SessionMessage], n: int = 2) -> str:
-    """Format the last *n* user-assistant rounds as readable context.
+    """Format messages from the last *n* user messages onwards.
 
-    Returns a formatted string preserving recent conversation so the agent
-    can continue after compaction.
+    Finds the Nth-to-last user message and formats everything from that point,
+    preserving all content types (text, tool_use, tool_result).
     """
-    # Collect user/assistant pairs from the end
-    rounds: list[tuple[str, str]] = []
-    msgs = list(reversed(messages))
-    it = iter(msgs)
-    for m in it:
-        if m.type == "assistant":
-            assistant_text = _extract_text_from_content(m.message.get("content", []))
-            # Find the preceding user message
-            user_text = ""
-            for um in it:
-                if um.type == "user":
-                    user_text = _extract_text_from_content(um.message.get("content", []))
-                    break
-            rounds.append((user_text, assistant_text))
-            if len(rounds) >= n:
-                break
-
-    rounds.reverse()
-    if not rounds:
+    # Find indices of user messages
+    user_indices = [i for i, m in enumerate(messages) if m.type == "user"]
+    if not user_indices:
         return ""
 
+    # Start from the Nth-to-last user message
+    start = user_indices[-n] if len(user_indices) >= n else user_indices[0]
+
     lines: list[str] = ["[自动恢复上下文 — 最近对话摘要]"]
-    for i, (user, assistant) in enumerate(rounds, 1):
-        lines.append(f"\n=== 第 {i} 轮 ===")
-        if user:
-            lines.append(f"用户：{user[:500]}")
-        if assistant:
-            lines.append(f"助手：{assistant[:1000]}")
+    for m in messages[start:]:
+        role = "用户" if m.type == "user" else "助手"
+        text = _extract_text_from_content(m.message.get("content", []))
+        if text:
+            lines.append(f"{role}：{text[:800]}")
     return "\n".join(lines)
 
 

@@ -928,6 +928,63 @@ def test_format_recent_rounds_empty():
     assert _format_recent_rounds([], n=2) == ""
 
 
+def test_format_recent_rounds_includes_tool_content():
+    """Tool messages between user messages should be preserved in context."""
+    from claude_agent_sdk import SessionMessage
+    from agent_box.agents.claude_code import _format_recent_rounds
+
+    messages = [
+        # Early user message — should NOT appear (only last 2 user messages)
+        SessionMessage(
+            type="user", uuid="u0", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "old message"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a0", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "old reply"}]},
+            parent_tool_use_id=None,
+        ),
+        # User message 1 (of the last 2)
+        SessionMessage(
+            type="user", uuid="u1", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "create a project"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a1", session_id="s1",
+            message={"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "text", "text": "Created the project"},
+            ]},
+            parent_tool_use_id=None,
+        ),
+        # User message 2 (tool_result — still counts as a user message)
+        SessionMessage(
+            type="user", uuid="u2", session_id="s1",
+            message={"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "file listing output"},
+                {"type": "text", "text": "fix the bug"},
+            ]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a2", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "Bug fixed"}]},
+            parent_tool_use_id=None,
+        ),
+    ]
+
+    result = _format_recent_rounds(messages, n=2)
+    # Should include the last 2 user messages onwards
+    assert "create a project" in result
+    assert "Created the project" in result
+    assert "fix the bug" in result
+    assert "Bug fixed" in result
+    # The early message should NOT be included
+    assert "old message" not in result
+
+
 @pytest.mark.anyio
 async def test_run_triggers_context_limit_recovery(sample_project: ProjectInfo):
     """When ResultMessage has context window limit error, recovery should trigger."""
