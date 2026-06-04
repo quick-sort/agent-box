@@ -28,8 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh openssh-client docker-ce-cli \
-    && groupadd agent \
-    && useradd --uid 1000 -g agent -m agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
@@ -59,9 +57,8 @@ COPY src /app/src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
-RUN chown -R agent:agent /app /home/agent 
+RUN chown -R root:root /app
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
-USER agent
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV PATH="/home/agent/.npm-global/bin:$PATH"
