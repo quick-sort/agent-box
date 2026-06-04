@@ -928,6 +928,68 @@ def test_format_recent_rounds_empty():
     assert _format_recent_rounds([], n=2) == ""
 
 
+def test_format_recent_rounds_skips_tool_only():
+    """Tool-use/tool-result-only rounds should be skipped."""
+    from claude_agent_sdk import SessionMessage
+    from agent_box.agents.claude_code import _format_recent_rounds
+
+    messages = [
+        # Real round 1
+        SessionMessage(
+            type="user", uuid="u1", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "create a project"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a1", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "Done creating"}]},
+            parent_tool_use_id=None,
+        ),
+        # Tool-only round (assistant has no text, only tool_use)
+        SessionMessage(
+            type="user", uuid="u2", session_id="s1",
+            message={"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "file listing"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a2", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "ls"}}]},
+            parent_tool_use_id=None,
+        ),
+        # Tool-only round 2 (user is tool_result, assistant is tool_use)
+        SessionMessage(
+            type="user", uuid="u3", session_id="s1",
+            message={"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "output..."}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a3", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "/tmp/x"}}]},
+            parent_tool_use_id=None,
+        ),
+        # Real round 2
+        SessionMessage(
+            type="user", uuid="u4", session_id="s1",
+            message={"role": "user", "content": [{"type": "text", "text": "fix the bug"}]},
+            parent_tool_use_id=None,
+        ),
+        SessionMessage(
+            type="assistant", uuid="a4", session_id="s1",
+            message={"role": "assistant", "content": [{"type": "text", "text": "Bug fixed"}]},
+            parent_tool_use_id=None,
+        ),
+    ]
+
+    result = _format_recent_rounds(messages, n=2)
+    assert "fix the bug" in result
+    assert "Bug fixed" in result
+    assert "create a project" in result
+    assert "Done creating" in result
+    # Tool-only content should not appear
+    assert "file listing" not in result
+    assert "output..." not in result
+
+
 @pytest.mark.anyio
 async def test_run_triggers_context_limit_recovery(sample_project: ProjectInfo):
     """When ResultMessage has context window limit error, recovery should trigger."""

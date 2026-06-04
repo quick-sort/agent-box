@@ -248,12 +248,16 @@ def _format_recent_rounds(messages: list[SessionMessage], n: int = 2) -> str:
     for m in it:
         if m.type == "assistant":
             assistant_text = _extract_text_from_content(m.message.get("content", []))
+            if not assistant_text:
+                continue
             # Find the preceding user message
             user_text = ""
             for um in it:
                 if um.type == "user":
                     user_text = _extract_text_from_content(um.message.get("content", []))
                     break
+            if not user_text:
+                continue
             rounds.append((user_text, assistant_text))
             if len(rounds) >= n:
                 break
