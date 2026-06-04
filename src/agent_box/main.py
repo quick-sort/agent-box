@@ -128,12 +128,26 @@ class App:
         recv_in: anyio.abc.ObjectReceiveStream[IncomingMessage],
         send_out: anyio.abc.ObjectSendStream[OutgoingMessage],
     ) -> None:
+        async def _safe_handle(msg: IncomingMessage, reply: anyio.abc.ObjectSendStream[OutgoingMessage]) -> None:
+            try:
+                await self.handle_message(msg, reply)
+            except Exception as exc:
+                log.exception("handle_message failed for user=%s channel=%s", msg.user_id, msg.channel)
+                try:
+                    await reply.send(OutgoingMessage(
+                        text=f"❌ 系统错误：{exc}",
+                        user_id=msg.user_id,
+                        channel=msg.channel,
+                    ))
+                except Exception:
+                    pass
+
         try:
             async with anyio.create_task_group() as tg:
                 async for msg in recv_in:
-                    tg.start_soon(self.handle_message, msg, send_out.clone())
+                    tg.start_soon(_safe_handle, msg, send_out.clone())
         except Exception:
-            log.exception("handle_message failed")
+            log.exception("dispatch loop crashed")
         finally:
             await send_out.aclose()
 

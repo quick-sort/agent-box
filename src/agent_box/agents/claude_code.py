@@ -524,6 +524,17 @@ class ClaudeCodeAgent(BaseAgent):
 
                 if msg.session_id and msg.session_id != self.project.session_id:
                     self.project.session_id = msg.session_id
+
+                if msg.is_error:
+                    error_detail = " ".join(msg.errors or []) or msg.result or "未知错误"
+                    log.error(
+                        "agent error for project %s: %s", self.project.name, error_detail,
+                    )
+                    yield OutgoingMessage(
+                        text=f"❌ Agent 错误：{error_detail}",
+                        user_id=user_id, channel=channel, type=MessageType.text,
+                    )
+
                 yield OutgoingMessage(
                     text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
                     data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
