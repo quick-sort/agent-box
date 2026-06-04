@@ -281,6 +281,7 @@ class ClaudeCodeAgent(BaseAgent):
                 "preset": "claude_code",
                 "append": _SEND_FILE_INSTRUCTION,
             },
+            stderr=lambda line: log.warning("claude stderr [%s]: %s", self.project.name, line.rstrip()),
         )
         if self.project.session_id:
             opts.resume = self.project.session_id
