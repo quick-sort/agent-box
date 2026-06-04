@@ -228,3 +228,53 @@ async def test_route_falls_through_to_llm(tmp_projects: SessionManager):
     result = await router.route(_msg("switch to my-proj"))
     assert result.project == "_default"
     router._client.messages.create.assert_awaited_once()
+
+
+# ── delete_project ──
+
+
+def test_fast_classify_delete_project():
+    from agent_box.router.router import _fast_classify
+
+    result = _fast_classify("rmproject foo")
+    assert result is not None
+    assert result[0] == "delete_project"
+    assert result[1] == "foo"
+
+
+@pytest.mark.anyio
+async def test_delete_project_fast_path(tmp_projects: SessionManager):
+    tmp_projects.create("to-delete")
+    router = _make_router(tmp_projects, tool_call=None)
+
+    result = await router.route(_msg("rmproject to-delete"))
+    assert result.reply is not None
+    assert "Deleted" in result.reply
+    assert tmp_projects.get("to-delete") is None
+    router._client.messages.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_delete_project_tool_call(tmp_projects: SessionManager):
+    tmp_projects.create("to-delete")
+    router = _make_router(tmp_projects, tool_call=_tool("delete_project", name="to-delete"))
+
+    result = await router.route(_msg("delete project to-delete"))
+    assert "Deleted" in result.reply
+    assert tmp_projects.get("to-delete") is None
+
+
+@pytest.mark.anyio
+async def test_delete_project_unknown(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("delete_project", name="nope"))
+
+    result = await router.route(_msg("delete project nope"))
+    assert "Unknown" in result.reply
+
+
+@pytest.mark.anyio
+async def test_delete_default_project_blocked(tmp_projects: SessionManager):
+    router = _make_router(tmp_projects, tool_call=_tool("delete_project", name="_default"))
+
+    result = await router.route(_msg("delete project _default"))
+    assert "Cannot delete" in result.reply
