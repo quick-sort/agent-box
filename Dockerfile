@@ -37,7 +37,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add https://github.com/vercel-labs/skills --skill find-skills \
     && PATH="/home/agent/.npm-global/bin:$PATH" npx skills add vercel-labs/agent-browser \
     && npm cache clean --force \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && useradd --no-create-home -d /home/agent -s /bin/bash agent
 
 
 # Persist weixin state and project data across restarts
@@ -58,10 +59,11 @@ COPY src /app/src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
-RUN chown -R root:root /app
+RUN chown -R agent /app /home/agent
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV PATH="/home/agent/.npm-global/bin:$PATH"
+USER agent
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uv", "run", "agent-box"]

@@ -2,8 +2,11 @@ services:
   agent-box:
     build: .
     env_file: .env
+    group_add:
+      - "${DOCKER_GID:-999}"
     volumes:
       - agent-data:/home/agent
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   agent-data:
