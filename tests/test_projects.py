@@ -48,8 +48,12 @@ def test_list_all(tmp_projects: SessionManager):
 
 def test_delete(tmp_projects: SessionManager):
     tmp_projects.create("x")
+    project = tmp_projects.get("x")
+    project_dir = Path(project.path)
+    assert project_dir.exists()
     assert tmp_projects.delete("x") is True
     assert tmp_projects.get("x") is None
+    assert not project_dir.exists()
     assert tmp_projects.delete("x") is False
 
 

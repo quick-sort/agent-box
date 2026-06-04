@@ -41,6 +41,7 @@ _FAST_PATTERNS: list[tuple[re.Pattern[str], str, int]] = [
     (re.compile(r"^newproject\s+(.+)$", re.IGNORECASE), "create_project", 1),
     (re.compile(r"^switchto\s+default$", re.IGNORECASE), "switch_project", 0),
     (re.compile(r"^switchto\s+(.+)$", re.IGNORECASE), "switch_project", 1),
+    (re.compile(r"^rmproject\s+(.+)$", re.IGNORECASE), "delete_project", 1),
 ]
 
 
@@ -116,6 +117,20 @@ _TOOLS = [
             "required": ["model"],
         },
     },
+    {
+        "name": "delete_project",
+        "description": "Delete a project and its folder permanently.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The project name to delete.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 _SYSTEM_TEMPLATE = """You are the project-management router for a coding assistant. Decide whether the user's message is a project-management command, and if so, call the matching tool. Otherwise reply with the single token: FORWARD.
@@ -171,6 +186,12 @@ MESSAGES THAT ARE PROJECT-MANAGEMENT COMMANDS (call a tool):
     - '换个模型'
     - '切换模型'
     - '换成 opus'\n\n"
+  delete_project — permanently delete a project and its folder:
+    - 'delete project foo'
+    - 'remove project foo'
+    - '删除项目 foo'
+    - '移除项目 foo'
+    - '删掉 foo 项目'\n\n"
 MESSAGES THAT ARE NOT PROJECT-MANAGEMENT (reply FORWARD, no tool):
   - 'fix the bug in main.py'
   - 'add a function called foo'      (function, not a project)
@@ -250,6 +271,8 @@ class Router(BaseRouter):
                 return self._handle_switch(arg)
             if tool_name == "list_projects":
                 return self._handle_list()
+            if tool_name == "delete_project":
+                return self._handle_delete(arg)
 
         # Fall through to LLM classification
         tool_call = await self._classify(text)
@@ -270,6 +293,8 @@ class Router(BaseRouter):
             return await self._handle_list_models()
         if tool_call.name == "switch_model":
             return await self._handle_switch_model(model)
+        if tool_call.name == "delete_project":
+            return self._handle_delete(name)
         return RouteResult(project=self.sessions.get_current())
 
     # ── helpers ──
@@ -338,6 +363,16 @@ class Router(BaseRouter):
             for p in projects
         ]
         return RouteResult(reply=f"Projects ({len(projects)}):\n" + "\n".join(lines))
+
+    def _handle_delete(self, name: str) -> RouteResult:
+        if not name:
+            return RouteResult(reply="❌ Project name required.")
+        if name == DEFAULT_PROJECT_NAME:
+            return RouteResult(reply="❌ Cannot delete the default project.")
+        if self.sessions.get(name) is None:
+            return RouteResult(reply=f"❌ Unknown project: {name}")
+        self.sessions.delete(name)
+        return RouteResult(reply=f"🗑️ Deleted project: {name}")
 
     async def _handle_list_models(self) -> RouteResult:
         models = await self._fetch_available_models()

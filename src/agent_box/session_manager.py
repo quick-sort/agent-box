@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 
 from .config import settings
@@ -77,13 +78,19 @@ class SessionManager:
         return list(self._projects.values())
 
     def delete(self, name: str) -> bool:
-        if name in self._projects:
-            del self._projects[name]
-            self._save()
-            if self.get_current() == name:
-                self.set_current(DEFAULT_PROJECT_NAME)
-            return True
-        return False
+        if name not in self._projects:
+            return False
+        project = self._projects[name]
+        del self._projects[name]
+        self._save()
+        if self.get_current() == name:
+            self.set_current(DEFAULT_PROJECT_NAME)
+        # Remove project folder
+        project_path = Path(project.path)
+        if project_path.exists() and project_path.is_dir():
+            shutil.rmtree(project_path)
+            log.info("deleted project folder: %s", project_path)
+        return True
 
     def update_session_id(self, name: str, session_id: str) -> None:
         project = self._projects.get(name)
