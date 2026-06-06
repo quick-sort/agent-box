@@ -9,6 +9,11 @@ from agent_box.models import IncomingMessage
 from agent_box.session_manager import SessionManager
 
 
+@pytest.fixture(autouse=True)
+def set_router_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_SMALL_FAST_MODEL", "claude-haiku")
+
+
 def _msg(text: str) -> IncomingMessage:
     return IncomingMessage(text=text, user_id="u1", channel="test")
 
