@@ -105,6 +105,13 @@ class SessionManager:
             project.model = model
             self._save()
 
+    def reset_model(self, name: str) -> None:
+        """Reset the model for a project back to None (SDK default)."""
+        project = self._projects.get(name)
+        if project:
+            project.model = None
+            self._save()
+
     def ensure_default(self) -> ProjectInfo:
         if DEFAULT_PROJECT_NAME not in self._projects:
             return self.create(DEFAULT_PROJECT_NAME)

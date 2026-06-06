@@ -42,6 +42,7 @@ _FAST_PATTERNS: list[tuple[re.Pattern[str], str, int]] = [
     (re.compile(r"^switchto\s+default$", re.IGNORECASE), "switch_project", 0),
     (re.compile(r"^switchto\s+(.+)$", re.IGNORECASE), "switch_project", 1),
     (re.compile(r"^rmproject\s+(.+)$", re.IGNORECASE), "delete_project", 1),
+    (re.compile(r"^switchmodel\s+(.+)$", re.IGNORECASE), "switch_model", 1),
 ]
 
 
@@ -273,6 +274,8 @@ class Router(BaseRouter):
                 return self._handle_list()
             if tool_name == "delete_project":
                 return self._handle_delete(arg)
+            if tool_name == "switch_model":
+                return await self._handle_switch_model(arg)
 
         # Fall through to LLM classification
         tool_call = await self._classify(text)
@@ -392,7 +395,11 @@ class Router(BaseRouter):
         current = self.sessions.get_current()
         project = self.sessions.get(current)
         if project is None:
-            return RouteResult(reply=f"❌ No current project.")
+            return RouteResult(reply="❌ No current project.")
+
+        if model.lower() == "default":
+            self.sessions.reset_model(current)
+            return RouteResult(reply=f"✅ Reset {current} to default model")
 
         # Validate model by testing with router's API key/URL
         test_client = AsyncAnthropic(
