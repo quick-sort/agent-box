@@ -278,3 +278,38 @@ async def test_delete_default_project_blocked(tmp_projects: SessionManager):
 
     result = await router.route(_msg("delete project _default"))
     assert "Cannot delete" in result.reply
+
+
+# ── switch_model ──
+
+
+def test_fast_classify_switch_model():
+    from agent_box.router.router import _fast_classify
+
+    result = _fast_classify("switchmodel claude-sonnet-4-6")
+    assert result is not None
+    assert result[0] == "switch_model"
+    assert result[1] == "claude-sonnet-4-6"
+
+
+@pytest.mark.anyio
+async def test_switch_model_default_resets_to_none(tmp_projects: SessionManager):
+    tmp_projects.ensure_default()
+    tmp_projects.set_model("_default", "some-model")
+    assert tmp_projects.get("_default").model == "some-model"
+
+    router = _make_router(tmp_projects, tool_call=None)
+    result = await router.route(_msg("switchmodel default"))
+    assert "Reset" in result.reply
+    assert tmp_projects.get("_default").model is None
+    router._client.messages.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_switch_model_default_via_llm(tmp_projects: SessionManager):
+    tmp_projects.set_model("_default", "some-model")
+    router = _make_router(tmp_projects, tool_call=_tool("switch_model", model="default"))
+
+    result = await router.route(_msg("reset model to default"))
+    assert "Reset" in result.reply
+    assert tmp_projects.get("_default").model is None
