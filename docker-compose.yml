@@ -1,12 +1,40 @@
+volumes:
+  agent_data:
+    name: agent_box
+  tmp_data:
+
 services:
   agent-box:
-    build: .
-    env_file: .env
+    image: ghcr.io/quick-sort/agent-box
+    restart: unless-stopped
+    privileged: true
     group_add:
       - "${DOCKER_GID:-999}"
     volumes:
-      - agent-data:/home/agent
+      - agent_data:/home/agent
+      - tmp_data:/tmp
       - /var/run/docker.sock:/var/run/docker.sock
+    command: ["uv", "run", "agent-box", "--qq"]
+    env_file:
+      - .env
+    environment:
+      # Anthropic API
+      ANTHROPIC_SMALL_FAST_MODEL: claude-haiku
+      ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet
+      ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-haiku
 
-volumes:
-  agent-data:
+      # API 超时 (ms)
+      API_TIMEOUT_MS: 3000000
+
+      # Claude Code 设置
+      # ENABLE_TOOL_SEARCH: 0
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: 1
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: 1
+      # Agent 设置
+      AGENT_PERMISSION_MODE: bypassPermissions
+
+      # Python 镜像
+      UV_INDEX: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
+      PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
