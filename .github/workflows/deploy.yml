@@ -1,17 +1,18 @@
 name: Deploy
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["Build & Push Docker Image"]
+    types: [completed]
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.event.repository.full_name }}
 
 jobs:
   deploy:
     runs-on: self-hosted
-    needs: docker
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Deploy container
         run: |
