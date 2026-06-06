@@ -19,6 +19,7 @@ class RouteResult:
 
     project: str | None = None
     reply: str | None = None
+    reset_agent: bool = False
 
 
 class BaseRouter(ABC):
