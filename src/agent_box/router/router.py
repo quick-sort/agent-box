@@ -399,7 +399,7 @@ class Router(BaseRouter):
 
         if model.lower() == "default":
             self.sessions.reset_model(current)
-            return RouteResult(reply=f"✅ Reset {current} to default model")
+            return RouteResult(reply=f"✅ Reset {current} to default model", reset_agent=True)
 
         # Validate model by testing with router's API key/URL
         test_client = AsyncAnthropic(
@@ -417,4 +417,4 @@ class Router(BaseRouter):
             return RouteResult(reply=f"❌ Model '{model}' not available: {e}")
 
         self.sessions.set_model(current, model)
-        return RouteResult(reply=f"✅ Switched {current} to {model}")
+        return RouteResult(reply=f"✅ Switched {current} to {model}", reset_agent=True)

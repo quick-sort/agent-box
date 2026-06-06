@@ -50,6 +50,11 @@ class App:
 
         if result.reply is not None:
             await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
+            if result.reset_agent:
+                current = self.sessions.get_current()
+                if current in self.agents:
+                    await self.agents[current].close()
+                    del self.agents[current]
             return
 
         project_name = result.project or self.sessions.get_current()
