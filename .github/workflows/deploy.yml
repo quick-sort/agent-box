@@ -14,7 +14,7 @@ jobs:
     runs-on: self-hosted
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Deploy container
         run: |

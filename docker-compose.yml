@@ -1,6 +1,5 @@
 volumes:
-  agent_data:
-    name: agent_box
+  data:
   tmp_data:
 
 services:
@@ -11,7 +10,7 @@ services:
     group_add:
       - "${DOCKER_GID:-999}"
     volumes:
-      - agent_data:/home/agent
+      - data:/home/agent
       - tmp_data:/tmp
       - /var/run/docker.sock:/var/run/docker.sock
     command: ["uv", "run", "agent-box", "--qq"]
