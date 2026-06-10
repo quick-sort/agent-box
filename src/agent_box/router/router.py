@@ -362,7 +362,7 @@ class Router(BaseRouter):
         if not projects:
             return RouteResult(reply="No projects yet.")
         lines = [
-            f"{'★ ' if p.name == current else '• '}{p.name} ({p.agent_type})"
+            f"{'★ ' if p.name == current else '• '}{p.name}" + (f" ({p.model})" if p.model else "")
             for p in projects
         ]
         return RouteResult(reply=f"Projects ({len(projects)}):\n" + "\n".join(lines))
