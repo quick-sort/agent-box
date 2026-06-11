@@ -63,5 +63,7 @@ COPY --chmod=755 entrypoint.sh /entrypoint.sh
 ENV UV_CACHE_DIR="/home/agent/.cache/uv"
 ENV PATH="/home/agent/.npm-global/bin:$PATH"
 USER agent
+RUN npx skills add https://github.com/vercel-labs/skills --skill find-skills -y -g -a claude-code \
+    && npx skills add vercel-labs/agent-browser -y -g -a claude-code
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uv", "run", "agent-box"]
