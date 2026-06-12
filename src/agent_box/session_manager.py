@@ -60,6 +60,7 @@ class SessionManager:
 
         project_path = self.workspace / name
         project_path.mkdir(parents=True, exist_ok=True)
+        self._init_claude_md(project_path, name)
 
         info = ProjectInfo(
             name=name,
@@ -73,6 +74,17 @@ class SessionManager:
 
     def get(self, name: str) -> ProjectInfo | None:
         return self._projects.get(name)
+
+    def _init_claude_md(self, project_path: Path, name: str) -> None:
+        target = project_path / "CLAUDE.md"
+        if target.exists():
+            return
+        template_path = settings.default_claude_md_path
+        if not template_path.is_file():
+            return
+        content = template_path.read_text().replace("{project_name}", name)
+        target.write_text(content)
+        log.info("initialized CLAUDE.md for project %s", name)
 
     def list_all(self) -> list[ProjectInfo]:
         return list(self._projects.values())

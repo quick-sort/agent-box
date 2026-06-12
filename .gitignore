@@ -3,7 +3,8 @@ __pycache__/
 .claude/
 *.py[cod]
 *$py.class
-data/
+data/*
+!data/default_claude_md
 
 .env
 .env.*
