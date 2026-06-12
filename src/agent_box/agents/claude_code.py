@@ -407,8 +407,8 @@ class ClaudeCodeAgent(BaseAgent):
                     }
                 ],
             },
-            "parent_tool_use_id": tool_use_id,
-            "session_id": session_id or "default",
+            "parent_tool_use_id": None,
+            "session_id": session_id or "",
         }
         # Use the transport directly — ``client.query()`` only sends plain
         # text user messages, but we need to attach a tool_result payload.
@@ -439,7 +439,7 @@ class ClaudeCodeAgent(BaseAgent):
                 client,
                 tool_use_id=ask["tool_use_id"],
                 answer=prompt,
-                session_id=ask.get("session_id", ""),
+                session_id=ask.get("session_id") or "",
             )
         else:
             await client.query(prompt)
