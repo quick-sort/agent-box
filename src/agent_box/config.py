@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     agent_permission_mode: str = "bypassPermissions"
     agent_max_turns: int | None = None
 
+    # Default CLAUDE.md template for new projects
+    default_claude_md_path: Path = Path(__file__).resolve().parent.parent.parent / "data" / "default_claude_md"
+
 
 
 settings = Settings()

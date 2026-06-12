@@ -1,0 +1,6 @@
+# {project_name}
+
+## Guidelines
+
+- Before starting any large or complex task, present a plan to the user and wait for approval before proceeding. Do not begin implementation until the user confirms.
+- Persist important context, decisions, and project knowledge in this CLAUDE.md file rather than relying solely on session-based memory.
