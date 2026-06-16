@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections.abc import AsyncIterator
 from typing import Any
 
 import anyio
+from anthropic import AsyncAnthropic
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -99,9 +101,6 @@ def _shorten_path(path: str, prefixes: tuple[str, ...]) -> str:
         if path.startswith(p) and len(path) > len(p):
             return path[len(p):].lstrip("/")
     return path
-
-
-import re
 
 
 def _shorten_paths_in_cmd(cmd: str, prefixes: tuple[str, ...]) -> str:
@@ -256,6 +255,57 @@ def _format_recent_rounds(messages: list[SessionMessage], n: int = 2) -> str:
         if text:
             lines.append(f"{role}：{text[:800]}")
     return "\n".join(lines)
+
+
+# ── AskUserQuestion answer parser ──
+
+_answer_client: AsyncAnthropic | None = None
+
+
+def _get_answer_client() -> AsyncAnthropic:
+    global _answer_client
+    if _answer_client is None:
+        _answer_client = AsyncAnthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
+        )
+    return _answer_client
+
+
+async def _parse_user_answer(questions: list[dict], user_reply: str) -> dict:
+    """Map free-text user reply to structured AskUserQuestion answers via LLM.
+
+    Returns ``{"answers": {"<question>": "<label or free text>"}}`` on success.
+    Raises on JSON parse failure so callers can fall back to the ``response`` field.
+    """
+    model = (
+        os.environ.get("ANTHROPIC_SMALL_FAST_MODEL")
+        or os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+        or "claude-haiku-4-5-20251001"
+    )
+    q_json = json.dumps(questions, ensure_ascii=False, indent=2)
+    prompt = (
+        "将用户回复映射为每个问题的答案。\n\n"
+        f"问题列表（JSON）：\n{q_json}\n\n"
+        f"用户回复：{user_reply}\n\n"
+        "rules:\n"
+        "- key 为问题的 question 字段\n"
+        "- value 为用户选择的 option label（字符串）\n"
+        "- multiSelect 题的 value 为 label 数组\n"
+        "- 若回复无法对应任何选项，直接用用户原文作为 value\n"
+        "只返回 JSON，不加代码块：\n"
+        '{"answers": {"<question>": "<label or user text>"}}'
+    )
+    resp = await _get_answer_client().messages.create(
+        model=model,
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = resp.content[0].text.strip()
+    # Strip optional markdown fences
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -431,14 +481,32 @@ class ClaudeCodeAgent(BaseAgent):
         if self._pending_ask is not None:
             ask = self._pending_ask
             self._pending_ask = None
+            questions = ask.get("questions", [])
             log.info(
                 "resuming pending AskUserQuestion tool_use_id=%s",
                 ask["tool_use_id"],
             )
+            try:
+                parsed = await _parse_user_answer(questions, prompt)
+                content = json.dumps({
+                    "questions": questions,
+                    "answers": parsed["answers"],
+                })
+                log.info("parsed AskUserQuestion answers: %s", parsed["answers"])
+            except Exception:
+                log.warning(
+                    "failed to parse AskUserQuestion answer with LLM, "
+                    "falling back to response field",
+                    exc_info=True,
+                )
+                content = json.dumps({
+                    "questions": questions,
+                    "response": prompt,
+                })
             await self._send_tool_result(
                 client,
                 tool_use_id=ask["tool_use_id"],
-                answer=prompt,
+                answer=content,
                 session_id=ask.get("session_id") or "",
             )
         else:
@@ -473,6 +541,7 @@ class ClaudeCodeAgent(BaseAgent):
                         self._pending_ask = {
                             "tool_use_id": block.id,
                             "session_id": msg.session_id,
+                            "questions": block.input.get("questions", []) if block.input else [],
                         }
                         log.info(
                             "AskUserQuestion intercepted, pausing run() "
