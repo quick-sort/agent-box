@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     qqbot_app_id: str = ""
     qqbot_client_secret: str = ""
 
+    # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
+    glm_api_key: str = ""
+    glm_asr_model: str = "glm-asr-2512"
+
     # Config & workspace directories
     config_dir: Path = Path.home() / ".agent-box"
     workspace_dir: Path = Path.home() / ".agent-box" / "workspace"

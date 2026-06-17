@@ -34,6 +34,7 @@ from typing import Any
 import anyio
 import httpx
 
+from ..asr.glm import GlmASR
 from ..config import settings
 from ..models import IncomingMessage, MessageType, OutgoingMessage
 from .base import BaseChannel
@@ -131,6 +132,11 @@ class QQChannel(BaseChannel):
         # Latest msg_id per user_id; used as passive-reply anchor
         self._last_msg_id: dict[str, str] = {}
         self._download_dir: Path = settings.config_dir / "channels" / "qq" / "downloads"
+        # Voice transcription; None when GLM API key is not configured (skip feature)
+        self._asr: GlmASR | None = (
+            GlmASR(settings.glm_api_key, settings.glm_asr_model)
+            if settings.glm_api_key else None
+        )
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -582,24 +588,33 @@ class QQChannel(BaseChannel):
 
     async def _download_atts(
         self, atts: list[dict[str, Any]]
-    ) -> list[tuple[str, str]]:
-        """Download each attachment. Returns list of (label, local_path)."""
-        results: list[tuple[str, str]] = []
+    ) -> list[tuple[str, str, str | None]]:
+        """Download each attachment. Returns list of (label, local_path, transcription).
+
+        transcription is populated for audio attachments when ASR is configured
+        and succeeds; otherwise None.
+        """
+        results: list[tuple[str, str, str | None]] = []
         for att in atts:
             url = _normalize_url(att.get("url") or "")
             label = self._att_label(att)
+            local = ""
+            transcription: str | None = None
             if url:
-                local = await self._download_image(url, att.get("filename"))
-                results.append((label, local or ""))
-            else:
-                results.append((label, ""))
+                local = await self._download_image(url, att.get("filename")) or ""
+                # Transcribe voice attachments when ASR is available
+                if label == "语音" and local and self._asr is not None:
+                    transcription = await self._asr.transcribe(local)
+            results.append((label, local, transcription))
         return results
 
-    def _atts_text(self, atts_info: list[tuple[str, str]]) -> str:
+    def _atts_text(self, atts_info: list[tuple[str, str, str | None]]) -> str:
         """Build text description lines for all attachments."""
         parts: list[str] = []
-        for label, path in atts_info:
-            if path:
+        for label, path, transcription in atts_info:
+            if label == "语音" and transcription:
+                parts.append(f"用户发送了一段语音，内容: {transcription}")
+            elif path:
                 parts.append(f"用户发送了一个{label}，文件路径: {path}")
             else:
                 parts.append(f"用户发送了一个{label}，文件路径: (下载失败)")
