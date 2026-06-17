@@ -386,6 +386,115 @@ async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
     assert agent._pending_ask is None
 
 
+# ── ExitPlanMode plan surfacing ──
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_surfaces_plan(sample_project: ProjectInfo):
+    """ExitPlanMode with a `plan` field should yield the plan text to the channel."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    plan_body = "# My Plan\n\n## Steps\n1. Do thing A\n2. Do thing B"
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_plan",
+                    name="ExitPlanMode",
+                    input={"plan": plan_body},
+                ),
+            ],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("implement feature")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert any("My Plan" in t and "Do thing A" in t for t in texts)
+    # Should not fall back to the generic tool summary
+    assert not any(t == "⚙️ ExitPlanMode" for t in texts)
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_without_plan_falls_back_to_summary(sample_project: ProjectInfo):
+    """ExitPlanMode without a plan field should yield the generic tool summary."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_plan2",
+                    name="ExitPlanMode",
+                    input={"allowedPrompts": [{"tool": "Bash", "prompt": "run tests"}]},
+                ),
+            ],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s2",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("implement feature")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert "⚙️ ExitPlanMode" in texts
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_empty_plan_falls_back_to_summary(sample_project: ProjectInfo):
+    """ExitPlanMode with an empty/whitespace plan should fall back to summary."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_plan3",
+                    name="ExitPlanMode",
+                    input={"plan": "   "},
+                ),
+            ],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s3",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("implement feature")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert "⚙️ ExitPlanMode" in texts
+
+
 # ── Tool summary formatting ──
 
 
