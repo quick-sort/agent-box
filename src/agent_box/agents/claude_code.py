@@ -582,6 +582,18 @@ class ClaudeCodeAgent(BaseAgent):
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
+                        # ExitPlanMode carries the plan text in its input — surface
+                        # the full plan so the user can review it on the IM channel,
+                        # instead of the generic "⚙️ ExitPlanMode" one-liner.
+                        if block.name == "ExitPlanMode":
+                            plan = (block.input or {}).get("plan")
+                            if isinstance(plan, str) and plan.strip():
+                                yield OutgoingMessage(
+                                    text=plan.strip(), user_id=user_id, channel=channel,
+                                    type=MessageType.text,
+                                    data={"id": block.id, "name": block.name, "input": block.input},
+                                )
+                                continue
                         # Brief one-liner so the user knows something is happening.
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
@@ -689,6 +701,15 @@ class ClaudeCodeAgent(BaseAgent):
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
+                        if block.name == "ExitPlanMode":
+                            plan = (block.input or {}).get("plan")
+                            if isinstance(plan, str) and plan.strip():
+                                yield OutgoingMessage(
+                                    text=plan.strip(), user_id=user_id, channel=channel,
+                                    type=MessageType.text,
+                                    data={"id": block.id, "name": block.name, "input": block.input},
+                                )
+                                continue
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
                             text=summary, user_id=user_id, channel=channel, type=MessageType.text,
