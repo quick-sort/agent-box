@@ -547,3 +547,166 @@ async def test_send_reply_with_image_path_fallback():
 
     assert called_with["target_id"] == "user-1"
     assert called_with["image_path"] == "/tmp/photo.jpg"
+
+
+# ── QQ Channel voice transcription (GLM ASR) ──
+
+
+@pytest.mark.anyio
+async def test_atts_text_with_voice_transcription():
+    """A transcribed voice attachment renders its content instead of the file path."""
+    from agent_box.channels.qq import QQChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+
+    text = channel._atts_text([("语音", "/path/voice.wav", "你好世界")])
+    assert text == "用户发送了一段语音，内容: 你好世界"
+
+
+@pytest.mark.anyio
+async def test_atts_text_voice_without_transcription_falls_back_to_path():
+    """When transcription is None, voice shows the file path (current behavior)."""
+    from agent_box.channels.qq import QQChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+
+    text = channel._atts_text([("语音", "/path/voice.wav", None)])
+    assert text == "用户发送了一个语音，文件路径: /path/voice.wav"
+
+
+@pytest.mark.anyio
+async def test_atts_text_mixed_image_and_voice():
+    """Non-audio attachments keep the path format; voice uses transcription."""
+    from agent_box.channels.qq import QQChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+
+    text = channel._atts_text([
+        ("图片", "/path/img.jpg", None),
+        ("语音", "/path/voice.wav", "转写文本"),
+    ])
+    assert "用户发送了一个图片，文件路径: /path/img.jpg" in text
+    assert "用户发送了一段语音，内容: 转写文本" in text
+
+
+@pytest.mark.anyio
+async def test_download_atts_transcribes_audio_when_asr_configured(tmp_path):
+    """Audio attachments get transcribed when self._asr is set."""
+    from agent_box.channels.qq import QQChannel
+
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"audio")
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+    channel._download_dir = tmp_path
+
+    channel._asr = MagicMock()
+    channel._asr.transcribe = AsyncMock(return_value="识别出的文字")
+
+    channel._download_image = AsyncMock(return_value=str(audio_path))
+
+    atts = [{"content_type": "audio/wav", "url": "https://x/voice.wav", "filename": "voice.wav"}]
+    results = await channel._download_atts(atts)
+
+    assert results == [("语音", str(audio_path), "识别出的文字")]
+    channel._asr.transcribe.assert_awaited_once_with(str(audio_path))
+
+
+@pytest.mark.anyio
+async def test_download_atts_skips_transcription_when_asr_none(tmp_path):
+    """When ASR is not configured, transcription stays None."""
+    from agent_box.channels.qq import QQChannel
+
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"audio")
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+    channel._download_dir = tmp_path
+    channel._asr = None
+    channel._download_image = AsyncMock(return_value=str(audio_path))
+
+    atts = [{"content_type": "audio/wav", "url": "https://x/voice.wav", "filename": "voice.wav"}]
+    results = await channel._download_atts(atts)
+
+    assert results == [("语音", str(audio_path), None)]
+
+
+@pytest.mark.anyio
+async def test_download_atts_transcription_failure_falls_back(tmp_path):
+    """When transcription returns None, the tuple keeps None (renders as path)."""
+    from agent_box.channels.qq import QQChannel
+
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"audio")
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+    channel._download_dir = tmp_path
+
+    channel._asr = MagicMock()
+    channel._asr.transcribe = AsyncMock(return_value=None)
+    channel._download_image = AsyncMock(return_value=str(audio_path))
+
+    atts = [{"content_type": "audio/wav", "url": "https://x/voice.wav", "filename": "voice.wav"}]
+    results = await channel._download_atts(atts)
+
+    assert results == [("语音", str(audio_path), None)]
+
+
+@pytest.mark.anyio
+async def test_download_atts_non_audio_not_transcribed(tmp_path):
+    """Image/video attachments never trigger transcription."""
+    from agent_box.channels.qq import QQChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = QQChannel.__new__(QQChannel)
+    channel.send_stream = send
+    channel._download_dir = tmp_path
+
+    channel._asr = MagicMock()
+    channel._asr.transcribe = AsyncMock(return_value="should-not-be-called")
+    channel._download_image = AsyncMock(return_value=str(tmp_path / "img.jpg"))
+
+    atts = [{"content_type": "image/jpeg", "url": "https://x/img.jpg", "filename": "img.jpg"}]
+    results = await channel._download_atts(atts)
+
+    assert results == [("图片", str(tmp_path / "img.jpg"), None)]
+    channel._asr.transcribe.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_qqchannel_asr_disabled_when_no_key():
+    """QQChannel._asr is None when glm_api_key is empty."""
+    from agent_box.channels.qq import QQChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.qq.settings") as mock_settings:
+        mock_settings.glm_api_key = ""
+        mock_settings.glm_asr_model = "glm-asr-2512"
+        channel = QQChannel(send)
+    assert channel._asr is None
+
+
+@pytest.mark.anyio
+async def test_qqchannel_asr_enabled_when_key_set():
+    """QQChannel._asr is a GlmASR instance when glm_api_key is set."""
+    from agent_box.channels.qq import QQChannel
+    from agent_box.asr.glm import GlmASR
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.qq.settings") as mock_settings:
+        mock_settings.glm_api_key = "key-abc"
+        mock_settings.glm_asr_model = "glm-asr-2512"
+        channel = QQChannel(send)
+    assert isinstance(channel._asr, GlmASR)
