@@ -308,6 +308,25 @@ async def _parse_user_answer(questions: list[dict], user_reply: str) -> dict:
     return json.loads(text)
 
 
+def _format_answers_for_tool_result(answers: dict) -> str:
+    """Render answers as the natural-language string Claude Code expects.
+
+    Matches the CLI's own format:
+    ``User has answered your questions: "<q>"="<a>", ... You can now
+    continue with the user's answers in mind.``
+    """
+    pairs = []
+    for question, answer in answers.items():
+        if isinstance(answer, list):
+            answer = ", ".join(str(a) for a in answer)
+        pairs.append(f'"{question}"="{answer}"')
+    return (
+        "User has answered your questions: "
+        + ", ".join(pairs)
+        + ". You can now continue with the user's answers in mind."
+    )
+
+
 class ClaudeCodeAgent(BaseAgent):
     """Each project gets one ClaudeSDKClient. Session id is tracked externally."""
 
@@ -488,21 +507,19 @@ class ClaudeCodeAgent(BaseAgent):
             )
             try:
                 parsed = await _parse_user_answer(questions, prompt)
-                content = json.dumps({
-                    "questions": questions,
-                    "answers": parsed["answers"],
-                })
+                content = _format_answers_for_tool_result(parsed["answers"])
                 log.info("parsed AskUserQuestion answers: %s", parsed["answers"])
             except Exception:
                 log.warning(
                     "failed to parse AskUserQuestion answer with LLM, "
-                    "falling back to response field",
+                    "falling back to raw user reply",
                     exc_info=True,
                 )
-                content = json.dumps({
-                    "questions": questions,
-                    "response": prompt,
-                })
+                content = (
+                    "User has answered your questions: "
+                    f"{prompt}. You can now continue with the user's "
+                    "answers in mind."
+                )
             await self._send_tool_result(
                 client,
                 tool_use_id=ask["tool_use_id"],
