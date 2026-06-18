@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 \
         libxrender1 libxss1 libxtst6 \
         libnss3 libnspr4 libpango-1.0-0 libcairo2 \
-        libdbus-1-3 libfontconfig1 fonts-liberation libasound2 \
+        libdbus-1-3 libfontconfig1 fonts-liberation fonts-wqy-zenhei libasound2 \
     && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
     && fnm install 24 \
     && fnm default 24 \
