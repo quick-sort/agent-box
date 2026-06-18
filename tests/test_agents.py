@@ -390,8 +390,8 @@ async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
-async def test_exit_plan_mode_surfaces_plan(sample_project: ProjectInfo):
-    """ExitPlanMode with a `plan` field should yield the plan text to the channel."""
+async def test_exit_plan_mode_surfaces_plan_with_hint(sample_project: ProjectInfo):
+    """ExitPlanMode with a plan should yield the plan + approval hint and pause."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
 
     mock_client = AsyncMock()
@@ -409,7 +409,10 @@ async def test_exit_plan_mode_surfaces_plan(sample_project: ProjectInfo):
                 ),
             ],
             model="test",
+            session_id="sess-plan",
         )
+        # Real CLI blocks here waiting for tool_result — generator should
+        # return before reaching this.
         yield ResultMessage(
             subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
             num_turns=1, total_cost_usd=0.01, usage=None, session_id="s1",
@@ -421,16 +424,24 @@ async def test_exit_plan_mode_surfaces_plan(sample_project: ProjectInfo):
     agent._client = mock_client
     msgs = [m async for m in agent.run("implement feature")]
 
-    texts = [m.text for m in msgs if m.type.value == "text"]
-    assert any("My Plan" in t and "Do thing A" in t for t in texts)
-    # Should not fall back to the generic tool summary
-    assert not any(t == "⚙️ ExitPlanMode" for t in texts)
+    # Plan is surfaced exactly once (single text msg), with the hint appended
+    text_msgs = [m for m in msgs if m.type.value == "text"]
+    assert len(text_msgs) == 1
+    assert "My Plan" in text_msgs[0].text
+    assert "Do thing A" in text_msgs[0].text
+    assert "Yes" in text_msgs[0].text and "No" in text_msgs[0].text
+
+    # Pending state set so next run() can resolve the approval
+    assert agent._pending_ask is not None
+    assert agent._pending_ask["kind"] == "exit_plan_mode"
+    assert agent._pending_ask["tool_use_id"] == "toolu_plan"
+    assert agent._pending_ask["session_id"] == "sess-plan"
 
 
 @pytest.mark.anyio
-async def test_exit_plan_mode_without_plan_falls_back_to_summary(sample_project: ProjectInfo):
-    """ExitPlanMode without a plan field should yield the generic tool summary."""
-    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+async def test_exit_plan_mode_without_plan_still_intercepts(sample_project: ProjectInfo):
+    """ExitPlanMode without a plan field should still pause for approval."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
 
     mock_client = AsyncMock()
     mock_client.query = AsyncMock()
@@ -445,10 +456,7 @@ async def test_exit_plan_mode_without_plan_falls_back_to_summary(sample_project:
                 ),
             ],
             model="test",
-        )
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s2",
+            session_id="s2",
         )
 
     mock_client.receive_response = fake_receive
@@ -457,14 +465,18 @@ async def test_exit_plan_mode_without_plan_falls_back_to_summary(sample_project:
     agent._client = mock_client
     msgs = [m async for m in agent.run("implement feature")]
 
-    texts = [m.text for m in msgs if m.type.value == "text"]
-    assert "⚙️ ExitPlanMode" in texts
+    text_msgs = [m for m in msgs if m.type.value == "text"]
+    assert len(text_msgs) == 1
+    # Generic placeholder used when the agent didn't supply a plan body
+    assert "plan 模式" in text_msgs[0].text
+    assert "Yes" in text_msgs[0].text
+    assert agent._pending_ask["kind"] == "exit_plan_mode"
 
 
 @pytest.mark.anyio
-async def test_exit_plan_mode_empty_plan_falls_back_to_summary(sample_project: ProjectInfo):
-    """ExitPlanMode with an empty/whitespace plan should fall back to summary."""
-    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+async def test_exit_plan_mode_empty_plan_still_intercepts(sample_project: ProjectInfo):
+    """ExitPlanMode with empty/whitespace plan should still pause for approval."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
 
     mock_client = AsyncMock()
     mock_client.query = AsyncMock()
@@ -479,10 +491,7 @@ async def test_exit_plan_mode_empty_plan_falls_back_to_summary(sample_project: P
                 ),
             ],
             model="test",
-        )
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s3",
+            session_id="s3",
         )
 
     mock_client.receive_response = fake_receive
@@ -491,8 +500,195 @@ async def test_exit_plan_mode_empty_plan_falls_back_to_summary(sample_project: P
     agent._client = mock_client
     msgs = [m async for m in agent.run("implement feature")]
 
-    texts = [m.text for m in msgs if m.type.value == "text"]
-    assert "⚙️ ExitPlanMode" in texts
+    text_msgs = [m for m in msgs if m.type.value == "text"]
+    assert len(text_msgs) == 1
+    assert "plan 模式" in text_msgs[0].text
+    assert agent._pending_ask["kind"] == "exit_plan_mode"
+
+
+# ── ExitPlanMode Yes/No reply parsing ──
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_resume_yes_approves(sample_project: ProjectInfo):
+    """Reply starting with Yes should send an approval tool_result."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    mock_client = AsyncMock()
+    mock_client._transport = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(content=[TextBlock(text="Starting coding")], model="test")
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {
+        "tool_use_id": "toolu_plan",
+        "session_id": "s-plan",
+        "kind": "exit_plan_mode",
+    }
+
+    msgs = [m async for m in agent.run("Yes")]
+
+    # Should NOT query — sends tool_result via transport instead
+    mock_client.query.assert_not_awaited()
+    mock_client._transport.write.assert_awaited_once()
+    written = mock_client._transport.write.call_args[0][0]
+    assert "tool_result" in written
+    assert "toolu_plan" in written
+    assert "approved" in written
+    assert agent._pending_ask is None
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_resume_no_with_feedback(sample_project: ProjectInfo):
+    """Reply starting with No should send rejection + feedback as tool_result."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client._transport = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {
+        "tool_use_id": "toolu_plan",
+        "session_id": "s-plan",
+        "kind": "exit_plan_mode",
+    }
+
+    await agent.run("No step 2 should use Postgres not MySQL").__anext__()
+
+    mock_client.query.assert_not_awaited()
+    mock_client._transport.write.assert_awaited_once()
+    written = mock_client._transport.write.call_args[0][0]
+    assert "tool_result" in written
+    assert "rejected" in written
+    assert "Postgres" in written and "MySQL" in written
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_resume_chinese_yes(sample_project: ProjectInfo):
+    """Chinese approval words (好的/可以/同意) should also approve."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client._transport = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {
+        "tool_use_id": "toolu_plan",
+        "session_id": "s-plan",
+        "kind": "exit_plan_mode",
+    }
+
+    await agent.run("好的").__anext__()
+
+    mock_client._transport.write.assert_awaited_once()
+    written = mock_client._transport.write.call_args[0][0]
+    assert "approved" in written
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_resume_chinese_no_with_feedback(sample_project: ProjectInfo):
+    """Chinese rejection (不要...) should send feedback."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client._transport = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    agent._pending_ask = {
+        "tool_use_id": "toolu_plan",
+        "session_id": "s-plan",
+        "kind": "exit_plan_mode",
+    }
+
+    await agent.run("不要用 Postgres，换 MySQL").__anext__()
+
+    written = mock_client._transport.write.call_args[0][0]
+    assert "rejected" in written
+    assert "Postgres" in written and "MySQL" in written
+
+
+# ── _build_plan_approval_result unit tests ──
+
+
+def test_build_plan_approval_yes():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    assert "approved" in _build_plan_approval_result("Yes")
+    assert "approved" in _build_plan_approval_result("yes, please")
+    assert "approved" in _build_plan_approval_result("Y")
+
+
+def test_build_plan_approval_no_with_feedback():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    r = _build_plan_approval_result("No change step 2")
+    assert "rejected" in r
+    assert "change step 2" in r
+
+
+def test_build_plan_approval_no_without_feedback():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    r = _build_plan_approval_result("No")
+    assert "rejected" in r
+
+
+def test_build_plan_approval_chinese_approve_words():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    for w in ("好的", "可以", "同意", "批准", "是", "行"):
+        assert "approved" in _build_plan_approval_result(w), w
+
+
+def test_build_plan_approval_chinese_reject_words():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    for w in ("否", "不", "不要", "不行", "拒绝"):
+        r = _build_plan_approval_result(w + " 改一下")
+        assert "rejected" in r, w
+        assert "改一下" in r, w
+
+
+def test_build_plan_approval_ambiguous_defaults_to_reject():
+    from agent_box.agents.claude_code import _build_plan_approval_result
+    # Doesn't start with Yes/No — defaults to rejection, keeps the text as feedback
+    r = _build_plan_approval_result("看起来不错，但是 step 3 能省就省")
+    assert "rejected" in r
+    assert "step 3" in r
 
 
 # ── Tool summary formatting ──
