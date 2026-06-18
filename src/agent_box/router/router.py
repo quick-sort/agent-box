@@ -151,17 +151,16 @@ MESSAGES THAT ARE PROJECT-MANAGEMENT COMMANDS (call a tool):
     - '开个 foo 项目'
     - '搞个新项目叫 foo'
     - '加一个项目叫 foo'\n\n"
-  switch_project — change which existing project is the active one:
+  switch_project — change which existing project is the active one.
+  ONLY trigger when the message EXPLICITLY pairs a switch/change word (切换 / 切到 /
+  switch to / change project to) with a project name. Bare 用(use) / 打开(open) /
+  换(change) + a noun is NOT a switch on its own; if the noun is followed by a real
+  task it is FORWARD:
     - 'switch to foo'
-    - 'use foo project'
-    - 'change to foo'
-    - 'open foo project'
-    - 'activate foo'
+    - 'change project to foo'
     - '切换到 foo'
     - '切到 foo 项目'
-    - '换到 foo'
-    - '用 foo 项目'
-    - '打开 foo 项目'
+    - '切换项目到 foo'
     - '回到默认项目'  (→ name='_default')\n\n"
   list_projects — see what projects exist or which one is current:
     - 'list projects'
@@ -204,7 +203,10 @@ MESSAGES THAT ARE NOT PROJECT-MANAGEMENT (reply FORWARD, no tool):
   - '新建一个文件 foo.py'             (文件, 不是项目)
   - '加一个 foo 函数'                (函数, 不是项目)
   - '解释一下这段代码'
-  - '运行测试'\n\n"
+  - '运行测试'
+  - '用 pandas 处理这个数据'          (用 + 任务, 不是切项目)
+  - '打开这个文件看一下'              (打开 + 文件, 不是切项目)
+  - '换个写法'                       (换 + 写法, 不是切项目)\n\n"
 When the user names a project that is not in the active list, STILL call the matching tool with that exact name — do not silently substitute a different existing project, and do not fall back to FORWARD just because the name is unknown.
 """
 

@@ -1,5 +1,6 @@
 """Tests for agent_box.router."""
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
@@ -192,6 +193,11 @@ def test_fast_classify_no_match():
     assert _fast_classify("fix the bug in main.py") is None
     assert _fast_classify("切换到 demo") is None
     assert _fast_classify("hello") is None
+    # Work instructions containing generic verbs (用/打开/换) must NOT match
+    # the compact regex fast-path — they belong to the LLM classifier.
+    assert _fast_classify("用 pandas 处理这个数据") is None
+    assert _fast_classify("打开这个文件看一下") is None
+    assert _fast_classify("换个写法") is None
 
 
 @pytest.mark.anyio
@@ -318,3 +324,58 @@ async def test_switch_model_default_via_llm(tmp_projects: SessionManager):
     result = await router.route(_msg("reset model to default"))
     assert "Reset" in result.reply
     assert tmp_projects.get("_default").model is None
+
+
+# ── Live prompt classification (exercises the real router LLM) ──
+#
+# These cases validate the system prompt itself: that work instructions are
+# classified as FORWARD and explicit project-switch phrases as switch_project.
+# Skipped unless ANTHROPIC_API_KEY is set, so normal test runs are unaffected.
+
+_live = pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"),
+    reason="needs ANTHROPIC_API_KEY for live router classification",
+)
+
+
+@_live
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "text,expect_tool",
+    [
+        # FORWARD — generic verbs (用/打开/换) in a work context must NOT switch
+        ("用 pandas 处理这个数据", None),
+        ("打开这个文件看一下", None),
+        ("换个写法重写这段代码", None),
+        ("用这个库做数据分析", None),
+        ("打开浏览器看看效果", None),
+        # switch_project — explicit switch word + project name
+        ("切换到 demo 项目", "switch_project"),
+        ("切到 foo 项目", "switch_project"),
+        ("switch to bar", "switch_project"),
+        ("change project to baz", "switch_project"),
+    ],
+)
+async def test_router_live_prompt_classification(
+    tmp_projects: SessionManager, text: str, expect_tool: str | None
+):
+    from agent_box.router.router import Router
+
+    router = Router(tmp_projects)
+    try:
+        tool = await router._classify(text)
+    finally:
+        # Close the httpx-backed client inside the live loop so its connection
+        # pool isn't GC'd after the loop closes ("Event loop is closed").
+        await router._client.close()
+
+    if expect_tool is None:
+        assert tool is None, (
+            f"expected FORWARD for {text!r}, but classifier called "
+            f"{getattr(tool, 'name', tool)!r}"
+        )
+    else:
+        got = getattr(tool, "name", None)
+        assert got == expect_tool, (
+            f"expected {expect_tool} for {text!r}, but classifier returned {got!r}"
+        )
