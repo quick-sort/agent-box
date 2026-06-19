@@ -34,7 +34,16 @@ log = logging.getLogger(__name__)
 # we forward the question to the user via the IM channel and pause the
 # generator until the user replies. The next ``run()`` call sends the
 # reply back as a ``tool_result`` so the CLI can continue.
-_TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion"})
+#
+# ExitPlanMode is included because Claude Code's CLI treats it as
+# ``requiresUserInteraction()`` — it blocks waiting for an approval
+# tool_result. Without feeding one back, the next user message would
+# re-enter the blocked CLI and the plan would be re-emitted in a loop.
+_TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+# Hint appended to surfaced plans so the user knows how to respond.
+# Reply "Yes" to approve, or "No <feedback>" to send feedback to the agent.
+_PLAN_APPROVAL_HINT = "\n\n— 回复 Yes 批准 / No <修改意见> 退回修改"
 
 # Regex to match [SEND_FILE:/path/to/file] markers in agent text output.
 _SEND_FILE_RE = re.compile(r"\[SEND_FILE:([^\]]+)\]")
@@ -327,6 +336,60 @@ def _format_answers_for_tool_result(answers: dict) -> str:
     )
 
 
+# ── ExitPlanMode approval parser ──
+
+# Words that count as approval / rejection when the user replies to a plan.
+# Matched as a prefix on the reply (case-insensitive) so Chinese phrases
+# without word boundaries (不要用 / 不行,) work just as well as English
+# ("Yes, please", "No, change step 2"). Anything that doesn't match either
+# defaults to approval so the conversation doesn't stall — the plan is
+# already visible to the user.
+_PLAN_APPROVE_WORDS = (
+    "yes", "y", "ok", "okay", "approve", "approved", "lgtm",
+    "是", "好的", "好", "可以", "同意", "批准", "行",
+)
+_PLAN_REJECT_WORDS = (
+    "no", "n", "reject", "rejected", "deny", "denied", "cancel",
+    "否", "不要", "不行", "拒绝", "别", "不",
+)
+
+
+def _build_plan_approval_result(user_reply: str) -> str:
+    """Translate the user's Yes/No reply into the tool_result for ExitPlanMode.
+
+    - Approval word prefix → "User has approved your plan..."
+    - Rejection word prefix + following text → rejection with the rest as feedback
+    - Anything else → rejection with the reply as feedback (don't run a plan
+      the user didn't explicitly approve)
+    """
+    reply = (user_reply or "").strip()
+    reply_lower = reply.lower()
+
+    # Reject: longest prefix match wins (so "不要用" matches "不要" before "不")
+    reject_match = max(
+        (w for w in _PLAN_REJECT_WORDS if reply_lower.startswith(w.lower())),
+        key=len, default=None,
+    )
+    if reject_match:
+        feedback = reply[len(reject_match):].lstrip(" :：,，、").strip()
+        if feedback:
+            return (
+                f"User rejected the plan. Feedback: {feedback}. "
+                "Please revise the plan based on this feedback and try again."
+            )
+        return "User rejected the plan. Please revise and try again."
+
+    if any(reply_lower.startswith(w.lower()) for w in _PLAN_APPROVE_WORDS):
+        return "User has approved your plan. You can now start coding."
+
+    # Ambiguous — default to rejection so the agent doesn't run with a plan
+    # the user didn't explicitly approve. The reply is attached as feedback.
+    return (
+        f"User rejected the plan. Feedback: {reply}. "
+        "Please revise the plan based on this feedback and try again."
+    )
+
+
 class ClaudeCodeAgent(BaseAgent):
     """Each project gets one ClaudeSDKClient. Session id is tracked externally."""
 
@@ -495,31 +558,38 @@ class ClaudeCodeAgent(BaseAgent):
     async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
         client = await self._ensure_client()
 
-        # If a previous run() paused with a pending AskUserQuestion, the
-        # current prompt is the user's answer — send it as tool_result.
+        # If a previous run() paused with a pending AskUserQuestion or
+        # ExitPlanMode, the current prompt is the user's answer — send it
+        # as a tool_result so the blocked CLI can continue.
         if self._pending_ask is not None:
             ask = self._pending_ask
             self._pending_ask = None
-            questions = ask.get("questions", [])
+            kind = ask.get("kind", "question")
             log.info(
-                "resuming pending AskUserQuestion tool_use_id=%s",
-                ask["tool_use_id"],
+                "resuming pending %s tool_use_id=%s",
+                kind, ask["tool_use_id"],
             )
-            try:
-                parsed = await _parse_user_answer(questions, prompt)
-                content = _format_answers_for_tool_result(parsed["answers"])
-                log.info("parsed AskUserQuestion answers: %s", parsed["answers"])
-            except Exception:
-                log.warning(
-                    "failed to parse AskUserQuestion answer with LLM, "
-                    "falling back to raw user reply",
-                    exc_info=True,
-                )
-                content = (
-                    "User has answered your questions: "
-                    f"{prompt}. You can now continue with the user's "
-                    "answers in mind."
-                )
+
+            if kind == "exit_plan_mode":
+                content = _build_plan_approval_result(prompt)
+                log.info("ExitPlanMode reply parsed: %s", content)
+            else:
+                questions = ask.get("questions", [])
+                try:
+                    parsed = await _parse_user_answer(questions, prompt)
+                    content = _format_answers_for_tool_result(parsed["answers"])
+                    log.info("parsed AskUserQuestion answers: %s", parsed["answers"])
+                except Exception:
+                    log.warning(
+                        "failed to parse AskUserQuestion answer with LLM, "
+                        "falling back to raw user reply",
+                        exc_info=True,
+                    )
+                    content = (
+                        "User has answered your questions: "
+                        f"{prompt}. You can now continue with the user's "
+                        "answers in mind."
+                    )
             await self._send_tool_result(
                 client,
                 tool_use_id=ask["tool_use_id"],
@@ -537,12 +607,41 @@ class ClaudeCodeAgent(BaseAgent):
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
-                    # --- AskUserQuestion interception ---
+                    # --- Tools that require user interaction ---
+                    # Both AskUserQuestion and ExitPlanMode block the CLI
+                    # waiting for a tool_result, so we surface their content
+                    # to the IM channel, set _pending_ask, and return. The
+                    # next run() with the user's reply feeds back the
+                    # tool_result so the CLI can continue.
                     if (
                         isinstance(block, ToolUseBlock)
                         and block.name in _TOOLS_REQUIRING_USER_INPUT
                     ):
-                        # Log the full input for debugging
+                        if block.name == "ExitPlanMode":
+                            plan = (block.input or {}).get("plan")
+                            body = plan.strip() if isinstance(plan, str) else ""
+                            if not body:
+                                body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
+                            text = body + _PLAN_APPROVAL_HINT
+                            log.info(
+                                "ExitPlanMode detected, tool_use_id=%s",
+                                block.id,
+                            )
+                            yield OutgoingMessage(
+                                text=text,
+                                user_id=user_id,
+                                channel=channel,
+                                type=MessageType.text,
+                                data={"id": block.id, "name": block.name, "input": block.input},
+                            )
+                            self._pending_ask = {
+                                "tool_use_id": block.id,
+                                "session_id": msg.session_id,
+                                "kind": "exit_plan_mode",
+                            }
+                            return  # Stop yielding; next run() will resume
+
+                        # AskUserQuestion
                         log.info(
                             "AskUserQuestion detected, tool_use_id=%s, input=%s",
                             block.id,
@@ -559,6 +658,7 @@ class ClaudeCodeAgent(BaseAgent):
                             "tool_use_id": block.id,
                             "session_id": msg.session_id,
                             "questions": block.input.get("questions", []) if block.input else [],
+                            "kind": "question",
                         }
                         log.info(
                             "AskUserQuestion intercepted, pausing run() "
@@ -582,18 +682,6 @@ class ClaudeCodeAgent(BaseAgent):
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
-                        # ExitPlanMode carries the plan text in its input — surface
-                        # the full plan so the user can review it on the IM channel,
-                        # instead of the generic "⚙️ ExitPlanMode" one-liner.
-                        if block.name == "ExitPlanMode":
-                            plan = (block.input or {}).get("plan")
-                            if isinstance(plan, str) and plan.strip():
-                                yield OutgoingMessage(
-                                    text=plan.strip(), user_id=user_id, channel=channel,
-                                    type=MessageType.text,
-                                    data={"id": block.id, "name": block.name, "input": block.input},
-                                )
-                                continue
                         # Brief one-liner so the user knows something is happening.
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
@@ -689,6 +777,28 @@ class ClaudeCodeAgent(BaseAgent):
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
+                    # ExitPlanMode blocks the CLI waiting for approval —
+                    # surface plan + hint, set pending state, and pause so
+                    # the next run() can feed back the user's Yes/No reply.
+                    if (
+                        isinstance(block, ToolUseBlock)
+                        and block.name == "ExitPlanMode"
+                    ):
+                        plan = (block.input or {}).get("plan")
+                        body = plan.strip() if isinstance(plan, str) else ""
+                        if not body:
+                            body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
+                        yield OutgoingMessage(
+                            text=body + _PLAN_APPROVAL_HINT,
+                            user_id=user_id, channel=channel, type=MessageType.text,
+                            data={"id": block.id, "name": block.name, "input": block.input},
+                        )
+                        self._pending_ask = {
+                            "tool_use_id": block.id,
+                            "session_id": msg.session_id,
+                            "kind": "exit_plan_mode",
+                        }
+                        return
                     if isinstance(block, TextBlock):
                         cleaned = block.text.strip()
                         if cleaned:
@@ -701,15 +811,6 @@ class ClaudeCodeAgent(BaseAgent):
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
-                        if block.name == "ExitPlanMode":
-                            plan = (block.input or {}).get("plan")
-                            if isinstance(plan, str) and plan.strip():
-                                yield OutgoingMessage(
-                                    text=plan.strip(), user_id=user_id, channel=channel,
-                                    type=MessageType.text,
-                                    data={"id": block.id, "name": block.name, "input": block.input},
-                                )
-                                continue
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
                             text=summary, user_id=user_id, channel=channel, type=MessageType.text,
