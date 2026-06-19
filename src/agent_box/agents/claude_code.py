@@ -544,7 +544,13 @@ class ClaudeCodeAgent(BaseAgent):
         }
         # Use the transport directly — ``client.query()`` only sends plain
         # text user messages, but we need to attach a tool_result payload.
-        await client._transport.write(json.dumps(message) + "\n")
+        payload = json.dumps(message) + "\n"
+        log.info(
+            "sending tool_result to CLI: tool_use_id=%s session_id=%s content_preview=%r",
+            tool_use_id, session_id or "(none)", answer[:200],
+        )
+        await client._transport.write(payload)
+        log.info("tool_result written to CLI stdin for tool_use_id=%s", tool_use_id)
 
     @property
     def has_pending_question(self) -> bool:
@@ -558,6 +564,15 @@ class ClaudeCodeAgent(BaseAgent):
     async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
         client = await self._ensure_client()
 
+        # Diagnostic: trace every run() entry — what prompt, what pending state.
+        pending_kind = self._pending_ask.get("kind") if self._pending_ask else None
+        pending_tool = self._pending_ask.get("tool_use_id") if self._pending_ask else None
+        log.info(
+            "run() entry: project=%s user=%s channel=%s prompt_preview=%r pending_kind=%s pending_tool_use_id=%s",
+            self.project.name, user_id, channel,
+            (prompt or "")[:200], pending_kind, pending_tool,
+        )
+
         # If a previous run() paused with a pending AskUserQuestion or
         # ExitPlanMode, the current prompt is the user's answer — send it
         # as a tool_result so the blocked CLI can continue.
@@ -566,13 +581,14 @@ class ClaudeCodeAgent(BaseAgent):
             self._pending_ask = None
             kind = ask.get("kind", "question")
             log.info(
-                "resuming pending %s tool_use_id=%s",
-                kind, ask["tool_use_id"],
+                "consuming pending ask: kind=%s tool_use_id=%s session_id=%s user_reply_preview=%r",
+                kind, ask["tool_use_id"], ask.get("session_id") or "(none)",
+                (prompt or "")[:200],
             )
 
             if kind == "exit_plan_mode":
                 content = _build_plan_approval_result(prompt)
-                log.info("ExitPlanMode reply parsed: %s", content)
+                log.info("ExitPlanMode reply parsed → tool_result content: %r", content[:200])
             else:
                 questions = ask.get("questions", [])
                 try:
@@ -597,6 +613,7 @@ class ClaudeCodeAgent(BaseAgent):
                 session_id=ask.get("session_id") or "",
             )
         else:
+            log.info("no pending ask — sending prompt as fresh query to CLI")
             await client.query(prompt)
 
         # Build prefixes to strip from file paths in tool summaries.
@@ -624,8 +641,9 @@ class ClaudeCodeAgent(BaseAgent):
                                 body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
                             text = body + _PLAN_APPROVAL_HINT
                             log.info(
-                                "ExitPlanMode detected, tool_use_id=%s",
-                                block.id,
+                                "ExitPlanMode detected — setting pending ask: "
+                                "tool_use_id=%s session_id=%s",
+                                block.id, msg.session_id,
                             )
                             yield OutgoingMessage(
                                 text=text,
@@ -639,13 +657,17 @@ class ClaudeCodeAgent(BaseAgent):
                                 "session_id": msg.session_id,
                                 "kind": "exit_plan_mode",
                             }
+                            log.info(
+                                "ExitPlanMode pending ask saved, returning from run() — "
+                                "waiting for user reply to approve/reject"
+                            )
                             return  # Stop yielding; next run() will resume
 
                         # AskUserQuestion
                         log.info(
-                            "AskUserQuestion detected, tool_use_id=%s, input=%s",
-                            block.id,
-                            block.input,
+                            "AskUserQuestion detected — setting pending ask: "
+                            "tool_use_id=%s session_id=%s input=%s",
+                            block.id, msg.session_id, block.input,
                         )
                         question_text = self._format_question(block)
                         yield OutgoingMessage(
@@ -661,10 +683,9 @@ class ClaudeCodeAgent(BaseAgent):
                             "kind": "question",
                         }
                         log.info(
-                            "AskUserQuestion intercepted, pausing run() "
-                            "tool_use_id=%s, question_text=%s",
-                            block.id,
-                            question_text,
+                            "AskUserQuestion pending ask saved, returning from run() — "
+                            "waiting for user reply (question_preview=%r)",
+                            question_text[:200],
                         )
                         return  # Stop yielding; next run() will resume
 

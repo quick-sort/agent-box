@@ -46,9 +46,14 @@ class App:
     async def handle_message(
         self, msg: IncomingMessage, reply: anyio.abc.ObjectSendStream[OutgoingMessage]
     ) -> None:
+        log.info(
+            "handle_message entry: user=%s channel=%s text_preview=%r",
+            msg.user_id, msg.channel, (msg.text or "")[:200],
+        )
         result = await self.router.route(msg)
 
         if result.reply is not None:
+            log.info("router replied directly (no agent call): %r", (result.reply or "")[:200])
             await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
             if result.reset_agent:
                 current = self.sessions.get_current()
@@ -60,6 +65,14 @@ class App:
         project_name = result.project or self.sessions.get_current()
         self.sessions.ensure_default()  # always available as a fallback
         agent = self._get_or_create_agent(project_name)
+        # Surface pending-question state so we can see whether the user's
+        # reply is about to be consumed as a tool_result or treated as a
+        # fresh query.
+        has_pending = getattr(agent, "has_pending_question", False)
+        log.info(
+            "dispatching to agent: project=%s agent_type=%s has_pending_question=%s",
+            project_name, type(agent).__name__, has_pending,
+        )
         async for out_msg in agent.run(msg.text, user_id=msg.user_id, channel=msg.channel):
             if out_msg.text and out_msg.type.value == "text" and self.sessions.get_current() != project_name:
                 out_msg = OutgoingMessage(
@@ -71,6 +84,7 @@ class App:
                 )
             await reply.send(out_msg)
         self.sessions.update_session_id(project_name, agent.project.session_id or "")
+        log.info("handle_message done: project=%s", project_name)
 
     async def run(self, channel_types: list[str] | None = None) -> None:
         """Run the app with one or more channels simultaneously.
@@ -150,6 +164,10 @@ class App:
         try:
             async with anyio.create_task_group() as tg:
                 async for msg in recv_in:
+                    log.info(
+                        "dispatch_loop received message: user=%s channel=%s text_preview=%r",
+                        msg.user_id, msg.channel, (msg.text or "")[:200],
+                    )
                     tg.start_soon(_safe_handle, msg, send_out.clone())
         except Exception:
             log.exception("dispatch loop crashed")
