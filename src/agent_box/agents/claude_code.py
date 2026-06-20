@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import os
 import re
@@ -16,10 +16,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SessionMessage,
     SystemMessage,
     TextBlock,
+    ToolPermissionContext,
     ToolUseBlock,
     get_session_messages,
 )
@@ -317,33 +320,14 @@ async def _parse_user_answer(questions: list[dict], user_reply: str) -> dict:
     return json.loads(text)
 
 
-def _format_answers_for_tool_result(answers: dict) -> str:
-    """Render answers as the natural-language string Claude Code expects.
-
-    Matches the CLI's own format:
-    ``User has answered your questions: "<q>"="<a>", ... You can now
-    continue with the user's answers in mind.``
-    """
-    pairs = []
-    for question, answer in answers.items():
-        if isinstance(answer, list):
-            answer = ", ".join(str(a) for a in answer)
-        pairs.append(f'"{question}"="{answer}"')
-    return (
-        "User has answered your questions: "
-        + ", ".join(pairs)
-        + ". You can now continue with the user's answers in mind."
-    )
-
-
 # ── ExitPlanMode approval parser ──
 
 # Words that count as approval / rejection when the user replies to a plan.
 # Matched as a prefix on the reply (case-insensitive) so Chinese phrases
 # without word boundaries (不要用 / 不行,) work just as well as English
 # ("Yes, please", "No, change step 2"). Anything that doesn't match either
-# defaults to approval so the conversation doesn't stall — the plan is
-# already visible to the user.
+# defaults to rejection so the agent never runs a plan the user didn't
+# explicitly approve.
 _PLAN_APPROVE_WORDS = (
     "yes", "y", "ok", "okay", "approve", "approved", "lgtm",
     "是", "好的", "好", "可以", "同意", "批准", "行",
@@ -354,13 +338,16 @@ _PLAN_REJECT_WORDS = (
 )
 
 
-def _build_plan_approval_result(user_reply: str) -> str:
-    """Translate the user's Yes/No reply into the tool_result for ExitPlanMode.
+def _build_exit_plan_permission(
+    user_reply: str,
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Translate the user's Yes/No reply into a permission decision for
+    ExitPlanMode.
 
-    - Approval word prefix → "User has approved your plan..."
-    - Rejection word prefix + following text → rejection with the rest as feedback
-    - Anything else → rejection with the reply as feedback (don't run a plan
-      the user didn't explicitly approve)
+    Returning ``allow`` lets the CLI run the tool, which exits plan mode and
+    emits ``"User has approved your plan..."``. Returning ``deny`` with a
+    message makes that message the ``is_error`` tool_result the LLM sees, so
+    it reads as rejection feedback.
     """
     reply = (user_reply or "").strip()
     reply_lower = reply.lower()
@@ -372,21 +359,24 @@ def _build_plan_approval_result(user_reply: str) -> str:
     )
     if reject_match:
         feedback = reply[len(reject_match):].lstrip(" :：,，、").strip()
-        if feedback:
-            return (
-                f"User rejected the plan. Feedback: {feedback}. "
-                "Please revise the plan based on this feedback and try again."
-            )
-        return "User rejected the plan. Please revise and try again."
+        message = (
+            f"User rejected the plan. Feedback: {feedback}. "
+            "Please revise the plan based on this feedback and try again."
+            if feedback
+            else "User rejected the plan. Please revise and try again."
+        )
+        return PermissionResultDeny(behavior="deny", message=message)
 
     if any(reply_lower.startswith(w.lower()) for w in _PLAN_APPROVE_WORDS):
-        return "User has approved your plan. You can now start coding."
+        return PermissionResultAllow(behavior="allow")
 
-    # Ambiguous — default to rejection so the agent doesn't run with a plan
-    # the user didn't explicitly approve. The reply is attached as feedback.
-    return (
-        f"User rejected the plan. Feedback: {reply}. "
-        "Please revise the plan based on this feedback and try again."
+    # Ambiguous — default to rejection with the reply as feedback.
+    return PermissionResultDeny(
+        behavior="deny",
+        message=(
+            f"User rejected the plan. Feedback: {reply}. "
+            "Please revise the plan based on this feedback and try again."
+        ),
     )
 
 
@@ -396,10 +386,12 @@ class ClaudeCodeAgent(BaseAgent):
     def __init__(self, project: ProjectInfo) -> None:
         super().__init__(project)
         self._client: ClaudeSDKClient | None = None
-        # When the agent calls AskUserQuestion (or similar), we store the
-        # tool_use_id here. The *next* ``run()`` call sends the user's
-        # message as a ``tool_result`` instead of a fresh query.
-        self._pending_ask: dict[str, Any] | None = None
+        # When the agent calls AskUserQuestion / ExitPlanMode, the
+        # ``can_use_tool`` callback parks here on an ``asyncio.Future``.
+        # ``run()`` surfaces the question to the IM channel and returns;
+        # the next ``run()`` call resolves the future with the user's reply,
+        # unblocking the callback so it can return the PermissionResult.
+        self._pending_permission: dict[str, Any] | None = None
 
     def _build_options(self) -> ClaudeAgentOptions:
         opts = ClaudeAgentOptions(
@@ -413,6 +405,7 @@ class ClaudeCodeAgent(BaseAgent):
                 "preset": "claude_code",
                 "append": _SEND_FILE_INSTRUCTION,
             },
+            can_use_tool=self._can_use_tool,
             stderr=lambda line: log.warning("claude stderr [%s]: %s", self.project.name, line.rstrip()),
         )
         if self.project.session_id:
@@ -519,43 +512,109 @@ class ClaudeCodeAgent(BaseAgent):
 
         return question
 
-    async def _send_tool_result(
+    # ------------------------------------------------------------------
+    # Permission callback (can_use_tool)
+    # ------------------------------------------------------------------
+
+    def _get_or_create_permission_future(
         self,
-        client: ClaudeSDKClient,
+        tool_name: str,
         tool_use_id: str,
-        answer: str,
-        session_id: str,
-    ) -> None:
-        """Write a ``tool_result`` message to CLI stdin so it can continue."""
-        message = {
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": answer,
-                    }
-                ],
-            },
-            "parent_tool_use_id": None,
-            "session_id": session_id or "",
-        }
-        # Use the transport directly — ``client.query()`` only sends plain
-        # text user messages, but we need to attach a tool_result payload.
-        payload = json.dumps(message) + "\n"
-        log.info(
-            "sending tool_result to CLI: tool_use_id=%s session_id=%s content_preview=%r",
-            tool_use_id, session_id or "(none)", answer[:200],
+        input: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the pending-permission entry for *tool_use_id*, creating
+        it if neither ``run()`` nor the callback has yet.
+
+        Both the block detection in ``run()`` (which sees the AssistantMessage
+        first) and the ``can_use_tool`` callback (which the CLI fires right
+        after) can win the race; whichever fires first creates the entry and
+        the other reuses it, so there is exactly one shared future.
+        """
+        existing = self._pending_permission
+        if existing is not None and existing.get("tool_use_id") == tool_use_id:
+            return existing
+        questions = (
+            input.get("questions", []) if tool_name == "AskUserQuestion" else []
         )
-        await client._transport.write(payload)
-        log.info("tool_result written to CLI stdin for tool_use_id=%s", tool_use_id)
+        self._pending_permission = {
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "input": input,
+            "questions": questions,
+            "future": asyncio.get_running_loop().create_future(),
+        }
+        return self._pending_permission
+
+    async def _can_use_tool(
+        self,
+        tool_name: str,
+        input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Permission callback wired into ``ClaudeAgentOptions``.
+
+        Normal tools are allowed unconditionally (the agent runs in
+        ``bypassPermissions``). The user-interaction tools — AskUserQuestion
+        and ExitPlanMode — still trigger a ``can_use_tool`` request from the
+        CLI even in bypass mode, so we intercept them here: park on a future
+        until the user's reply arrives via the next ``run()`` call, then
+        return the matching permission decision.
+        """
+        if tool_name not in _TOOLS_REQUIRING_USER_INPUT:
+            return PermissionResultAllow(behavior="allow")
+
+        pending = self._get_or_create_permission_future(
+            tool_name, context.tool_use_id, input,
+        )
+        future: asyncio.Future = pending["future"]
+        log.info(
+            "can_use_tool: awaiting user reply for %s tool_use_id=%s",
+            tool_name, context.tool_use_id,
+        )
+        try:
+            reply = await future
+        except asyncio.CancelledError:
+            # Agent shutting down — deny so the CLI unblocks cleanly.
+            self._pending_permission = None
+            return PermissionResultDeny(
+                behavior="deny", message="Agent shutting down",
+            )
+        self._pending_permission = None
+        log.info(
+            "can_use_tool: got user reply (%d chars) for %s, building result",
+            len(reply or ""), tool_name,
+        )
+
+        if tool_name == "ExitPlanMode":
+            return _build_exit_plan_permission(reply)
+
+        # AskUserQuestion — map free-text reply to structured answers via the
+        # small model, then inject them as ``updatedInput.answers``. The CLI's
+        # tool execution formats them into the tool_result the LLM sees.
+        questions = pending.get("questions", [])
+        try:
+            parsed = await _parse_user_answer(questions, reply)
+            answers = parsed.get("answers", {})
+        except Exception:
+            log.warning(
+                "failed to parse AskUserQuestion answer with LLM, "
+                "falling back to raw user reply",
+                exc_info=True,
+            )
+            answers = (
+                {q.get("question", f"question_{i}"): reply
+                 for i, q in enumerate(questions) if isinstance(q, dict)}
+                or {"question": reply}
+            )
+        log.info("can_use_tool: parsed AskUserQuestion answers: %s", answers)
+        return PermissionResultAllow(
+            behavior="allow", updated_input={**input, "answers": answers},
+        )
 
     @property
     def has_pending_question(self) -> bool:
         """True when the agent asked a question and is waiting for user reply."""
-        return self._pending_ask is not None
+        return self._pending_permission is not None
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -565,55 +624,34 @@ class ClaudeCodeAgent(BaseAgent):
         client = await self._ensure_client()
 
         # Diagnostic: trace every run() entry — what prompt, what pending state.
-        pending_kind = self._pending_ask.get("kind") if self._pending_ask else None
-        pending_tool = self._pending_ask.get("tool_use_id") if self._pending_ask else None
+        pending_tool = (
+            self._pending_permission.get("tool_name")
+            if self._pending_permission else None
+        )
         log.info(
-            "run() entry: project=%s user=%s channel=%s prompt_preview=%r pending_kind=%s pending_tool_use_id=%s",
+            "run() entry: project=%s user=%s channel=%s prompt_preview=%r pending_permission=%s",
             self.project.name, user_id, channel,
-            (prompt or "")[:200], pending_kind, pending_tool,
+            (prompt or "")[:200], pending_tool,
         )
 
-        # If a previous run() paused with a pending AskUserQuestion or
-        # ExitPlanMode, the current prompt is the user's answer — send it
-        # as a tool_result so the blocked CLI can continue.
-        if self._pending_ask is not None:
-            ask = self._pending_ask
-            self._pending_ask = None
-            kind = ask.get("kind", "question")
+        if self._pending_permission is not None:
+            # Resume: the prompt is the user's reply to a pending permission.
+            # Resolve the future so the ``can_use_tool`` callback can return
+            # its PermissionResult and unblock the CLI. Do NOT send a fresh
+            # query — the CLI is mid-turn, still waiting on the permission
+            # response.
+            pending = self._pending_permission
             log.info(
-                "consuming pending ask: kind=%s tool_use_id=%s session_id=%s user_reply_preview=%r",
-                kind, ask["tool_use_id"], ask.get("session_id") or "(none)",
+                "run(): resolving pending permission future with user reply "
+                "(tool=%s tool_use_id=%s reply_preview=%r)",
+                pending["tool_name"], pending["tool_use_id"],
                 (prompt or "")[:200],
             )
-
-            if kind == "exit_plan_mode":
-                content = _build_plan_approval_result(prompt)
-                log.info("ExitPlanMode reply parsed → tool_result content: %r", content[:200])
-            else:
-                questions = ask.get("questions", [])
-                try:
-                    parsed = await _parse_user_answer(questions, prompt)
-                    content = _format_answers_for_tool_result(parsed["answers"])
-                    log.info("parsed AskUserQuestion answers: %s", parsed["answers"])
-                except Exception:
-                    log.warning(
-                        "failed to parse AskUserQuestion answer with LLM, "
-                        "falling back to raw user reply",
-                        exc_info=True,
-                    )
-                    content = (
-                        "User has answered your questions: "
-                        f"{prompt}. You can now continue with the user's "
-                        "answers in mind."
-                    )
-            await self._send_tool_result(
-                client,
-                tool_use_id=ask["tool_use_id"],
-                answer=content,
-                session_id=ask.get("session_id") or "",
-            )
+            future: asyncio.Future = pending["future"]
+            if not future.done():
+                future.set_result(prompt)
         else:
-            log.info("no pending ask — sending prompt as fresh query to CLI")
+            log.info("run(): no pending permission — sending prompt as fresh query")
             await client.query(prompt)
 
         # Build prefixes to strip from file paths in tool summaries.
@@ -625,11 +663,13 @@ class ClaudeCodeAgent(BaseAgent):
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     # --- Tools that require user interaction ---
-                    # Both AskUserQuestion and ExitPlanMode block the CLI
-                    # waiting for a tool_result, so we surface their content
-                    # to the IM channel, set _pending_ask, and return. The
-                    # next run() with the user's reply feeds back the
-                    # tool_result so the CLI can continue.
+                    # AskUserQuestion and ExitPlanMode trigger a ``can_use_tool``
+                    # request from the CLI even in bypassPermissions mode (they
+                    # are ``requiresUserInteraction`` tools). We surface the
+                    # question/plan to the IM channel, ensure a pending future
+                    # exists (shared with the callback), and return so the user
+                    # can reply. The next run() resolves the future; the
+                    # ``_can_use_tool`` callback then returns the PermissionResult.
                     if (
                         isinstance(block, ToolUseBlock)
                         and block.name in _TOOLS_REQUIRING_USER_INPUT
@@ -641,9 +681,9 @@ class ClaudeCodeAgent(BaseAgent):
                                 body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
                             text = body + _PLAN_APPROVAL_HINT
                             log.info(
-                                "ExitPlanMode detected — setting pending ask: "
-                                "tool_use_id=%s session_id=%s",
-                                block.id, msg.session_id,
+                                "ExitPlanMode detected — surfacing plan, "
+                                "tool_use_id=%s",
+                                block.id,
                             )
                             yield OutgoingMessage(
                                 text=text,
@@ -652,22 +692,20 @@ class ClaudeCodeAgent(BaseAgent):
                                 type=MessageType.text,
                                 data={"id": block.id, "name": block.name, "input": block.input},
                             )
-                            self._pending_ask = {
-                                "tool_use_id": block.id,
-                                "session_id": msg.session_id,
-                                "kind": "exit_plan_mode",
-                            }
+                            self._get_or_create_permission_future(
+                                "ExitPlanMode", block.id, block.input or {},
+                            )
                             log.info(
-                                "ExitPlanMode pending ask saved, returning from run() — "
+                                "ExitPlanMode pending permission saved, returning from run() — "
                                 "waiting for user reply to approve/reject"
                             )
                             return  # Stop yielding; next run() will resume
 
                         # AskUserQuestion
                         log.info(
-                            "AskUserQuestion detected — setting pending ask: "
-                            "tool_use_id=%s session_id=%s input=%s",
-                            block.id, msg.session_id, block.input,
+                            "AskUserQuestion detected — surfacing question, "
+                            "tool_use_id=%s input=%s",
+                            block.id, block.input,
                         )
                         question_text = self._format_question(block)
                         yield OutgoingMessage(
@@ -676,14 +714,11 @@ class ClaudeCodeAgent(BaseAgent):
                             channel=channel,
                             type=MessageType.text,
                         )
-                        self._pending_ask = {
-                            "tool_use_id": block.id,
-                            "session_id": msg.session_id,
-                            "questions": block.input.get("questions", []) if block.input else [],
-                            "kind": "question",
-                        }
+                        self._get_or_create_permission_future(
+                            "AskUserQuestion", block.id, block.input or {},
+                        )
                         log.info(
-                            "AskUserQuestion pending ask saved, returning from run() — "
+                            "AskUserQuestion pending permission saved, returning from run() — "
                             "waiting for user reply (question_preview=%r)",
                             question_text[:200],
                         )
@@ -798,9 +833,9 @@ class ClaudeCodeAgent(BaseAgent):
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
-                    # ExitPlanMode blocks the CLI waiting for approval —
-                    # surface plan + hint, set pending state, and pause so
-                    # the next run() can feed back the user's Yes/No reply.
+                    # ExitPlanMode triggers a ``can_use_tool`` request —
+                    # surface plan + hint, ensure a pending future, and pause
+                    # so the next run() can resolve it with the user's reply.
                     if (
                         isinstance(block, ToolUseBlock)
                         and block.name == "ExitPlanMode"
@@ -814,11 +849,9 @@ class ClaudeCodeAgent(BaseAgent):
                             user_id=user_id, channel=channel, type=MessageType.text,
                             data={"id": block.id, "name": block.name, "input": block.input},
                         )
-                        self._pending_ask = {
-                            "tool_use_id": block.id,
-                            "session_id": msg.session_id,
-                            "kind": "exit_plan_mode",
-                        }
+                        self._get_or_create_permission_future(
+                            "ExitPlanMode", block.id, block.input or {},
+                        )
                         return
                     if isinstance(block, TextBlock):
                         cleaned = block.text.strip()
@@ -851,7 +884,14 @@ class ClaudeCodeAgent(BaseAgent):
                 )
 
     async def close(self) -> None:
-        self._pending_ask = None
+        # Cancel any pending permission future so the ``can_use_tool`` callback
+        # (awaiting in a background task) unblocks and returns a deny instead
+        # of hanging on a client that's about to disconnect.
+        if self._pending_permission is not None:
+            future: asyncio.Future = self._pending_permission["future"]
+            if not future.done():
+                future.cancel()
+            self._pending_permission = None
         if self._client:
             await self._client.disconnect()
             self._client = None

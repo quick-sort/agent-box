@@ -58,6 +58,9 @@ def test_build_options(sample_project: ProjectInfo):
     assert opts.cwd == sample_project.path
     assert opts.continue_conversation is True
     assert opts.permission_mode == "bypassPermissions"
+    # The can_use_tool callback is what intercepts AskUserQuestion/ExitPlanMode
+    # — without it the SDK throws on the permission request.
+    assert opts.can_use_tool is not None
 
 
 def test_initial_client_is_none(sample_project: ProjectInfo):
@@ -195,20 +198,23 @@ async def test_ask_user_question_intercepted(sample_project: ProjectInfo):
     assert "Which file?" in msgs[0].text
     assert "main.py" in msgs[0].text
 
-    # Pending state should be saved
-    assert agent._pending_ask is not None
-    assert agent._pending_ask["tool_use_id"] == "toolu_123"
-    assert agent._pending_ask["session_id"] == "sess-ask"
+    # Pending permission state should be saved (shared with the can_use_tool
+    # callback via _get_or_create_permission_future).
+    assert agent._pending_permission is not None
+    assert agent._pending_permission["tool_use_id"] == "toolu_123"
+    assert agent._pending_permission["tool_name"] == "AskUserQuestion"
+    assert agent._pending_permission["future"] is not None
+    assert not agent._pending_permission["future"].done()
     assert agent.has_pending_question is True
 
 
 @pytest.mark.anyio
 async def test_ask_user_question_resume(sample_project: ProjectInfo):
-    """Second run() with a pending ask should send tool_result, not a new query."""
+    """Second run() with a pending permission resolves the future (so the
+    can_use_tool callback can return) and does NOT send a fresh query."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
     mock_client = AsyncMock()
-    mock_client._transport = AsyncMock()
     mock_client.query = AsyncMock()
 
     async def fake_receive():
@@ -222,26 +228,21 @@ async def test_ask_user_question_resume(sample_project: ProjectInfo):
 
     agent = ClaudeCodeAgent(sample_project)
     agent._client = mock_client
-    agent._pending_ask = {
-        "tool_use_id": "toolu_123",
-        "session_id": "sess-ask",
-    }
+    pending = agent._get_or_create_permission_future(
+        "AskUserQuestion", "toolu_123", {"questions": [{"question": "Which file?"}]},
+    )
+    future = pending["future"]
 
     msgs = [m async for m in agent.run("main.py")]
 
-    # Should NOT have called query() — instead sends tool_result via transport
+    # Should NOT have queried — the CLI is mid-turn, waiting on the permission
+    # response. run() only resolves the future so the callback can return.
     mock_client.query.assert_not_awaited()
-    mock_client._transport.write.assert_awaited_once()
-    written = mock_client._transport.write.call_args[0][0]
-    assert "tool_result" in written
-    assert "toolu_123" in written
-    assert "main.py" in written
+    assert future.done()
+    assert future.result() == "main.py"
 
-    # Pending ask should be cleared
-    assert agent._pending_ask is None
-    assert agent.has_pending_question is False
-
-    # Should have yielded the assistant response and result
+    # Should have yielded the continuation messages that arrived after the
+    # callback unblocked the CLI.
     texts = [m.text for m in msgs if m.type.value == "text"]
     assert any("OK, editing main.py" in t for t in texts)
 
@@ -275,7 +276,7 @@ async def test_ask_user_question_no_options(sample_project: ProjectInfo):
 
     assert len(msgs) == 1
     assert "What is your name?" in msgs[0].text
-    assert agent._pending_ask["tool_use_id"] == "toolu_456"
+    assert agent._pending_permission["tool_use_id"] == "toolu_456"
 
 
 @pytest.mark.anyio
@@ -342,16 +343,23 @@ async def test_ask_user_question_empty_input(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
-async def test_close_clears_pending_ask(sample_project: ProjectInfo):
-    """close() should clear any pending ask state."""
+async def test_close_cancels_pending_permission(sample_project: ProjectInfo):
+    """close() cancels a pending permission future so the can_use_tool
+    callback unblocks (returns deny) instead of hanging on disconnect."""
+    import asyncio
+
     mock_client = AsyncMock()
     agent = ClaudeCodeAgent(sample_project)
     agent._client = mock_client
-    agent._pending_ask = {"tool_use_id": "toolu_789", "session_id": "s"}
+    pending = agent._get_or_create_permission_future(
+        "AskUserQuestion", "toolu_789", {"questions": [{"question": "q"}]},
+    )
+    future: asyncio.Future = pending["future"]
 
     await agent.close()
-    assert agent._pending_ask is None
+    assert agent._pending_permission is None
     assert agent._client is None
+    assert future.cancelled()
 
 
 @pytest.mark.anyio
@@ -383,7 +391,7 @@ async def test_normal_tool_use_not_intercepted(sample_project: ProjectInfo):
     # Tool should be yielded as text (not tool_use) so IM channels can send it
     texts = [m for m in msgs if m.type.value == "text"]
     assert any("ls -la" in m.text for m in texts)
-    assert agent._pending_ask is None
+    assert agent._pending_permission is None
 
 
 # ── ExitPlanMode plan surfacing ──
@@ -431,11 +439,11 @@ async def test_exit_plan_mode_surfaces_plan_with_hint(sample_project: ProjectInf
     assert "Do thing A" in text_msgs[0].text
     assert "Yes" in text_msgs[0].text and "No" in text_msgs[0].text
 
-    # Pending state set so next run() can resolve the approval
-    assert agent._pending_ask is not None
-    assert agent._pending_ask["kind"] == "exit_plan_mode"
-    assert agent._pending_ask["tool_use_id"] == "toolu_plan"
-    assert agent._pending_ask["session_id"] == "sess-plan"
+    # Pending permission set so next run() can resolve the approval
+    assert agent._pending_permission is not None
+    assert agent._pending_permission["tool_name"] == "ExitPlanMode"
+    assert agent._pending_permission["tool_use_id"] == "toolu_plan"
+    assert agent._pending_permission["future"] is not None
 
 
 @pytest.mark.anyio
@@ -470,7 +478,7 @@ async def test_exit_plan_mode_without_plan_still_intercepts(sample_project: Proj
     # Generic placeholder used when the agent didn't supply a plan body
     assert "plan 模式" in text_msgs[0].text
     assert "Yes" in text_msgs[0].text
-    assert agent._pending_ask["kind"] == "exit_plan_mode"
+    assert agent._pending_permission["tool_name"] == "ExitPlanMode"
 
 
 @pytest.mark.anyio
@@ -503,192 +511,179 @@ async def test_exit_plan_mode_empty_plan_still_intercepts(sample_project: Projec
     text_msgs = [m for m in msgs if m.type.value == "text"]
     assert len(text_msgs) == 1
     assert "plan 模式" in text_msgs[0].text
-    assert agent._pending_ask["kind"] == "exit_plan_mode"
+    assert agent._pending_permission["tool_name"] == "ExitPlanMode"
 
 
-# ── ExitPlanMode Yes/No reply parsing ──
+# ── _build_exit_plan_permission (Yes/No → PermissionResult) ──
 
 
-@pytest.mark.anyio
-async def test_exit_plan_mode_resume_yes_approves(sample_project: ProjectInfo):
-    """Reply starting with Yes should send an approval tool_result."""
-    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
-
-    mock_client = AsyncMock()
-    mock_client._transport = AsyncMock()
-    mock_client.query = AsyncMock()
-
-    async def fake_receive():
-        yield AssistantMessage(content=[TextBlock(text="Starting coding")], model="test")
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
-        )
-
-    mock_client.receive_response = fake_receive
-
-    agent = ClaudeCodeAgent(sample_project)
-    agent._client = mock_client
-    agent._pending_ask = {
-        "tool_use_id": "toolu_plan",
-        "session_id": "s-plan",
-        "kind": "exit_plan_mode",
-    }
-
-    msgs = [m async for m in agent.run("Yes")]
-
-    # Should NOT query — sends tool_result via transport instead
-    mock_client.query.assert_not_awaited()
-    mock_client._transport.write.assert_awaited_once()
-    written = mock_client._transport.write.call_args[0][0]
-    assert "tool_result" in written
-    assert "toolu_plan" in written
-    assert "approved" in written
-    assert agent._pending_ask is None
+def test_build_exit_plan_permission_yes_allows():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
+    assert _build_exit_plan_permission("Yes").behavior == "allow"
+    assert _build_exit_plan_permission("yes, please").behavior == "allow"
+    assert _build_exit_plan_permission("Y").behavior == "allow"
 
 
-@pytest.mark.anyio
-async def test_exit_plan_mode_resume_no_with_feedback(sample_project: ProjectInfo):
-    """Reply starting with No should send rejection + feedback as tool_result."""
-    from claude_agent_sdk import ResultMessage
-
-    mock_client = AsyncMock()
-    mock_client._transport = AsyncMock()
-    mock_client.query = AsyncMock()
-
-    async def fake_receive():
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
-        )
-
-    mock_client.receive_response = fake_receive
-
-    agent = ClaudeCodeAgent(sample_project)
-    agent._client = mock_client
-    agent._pending_ask = {
-        "tool_use_id": "toolu_plan",
-        "session_id": "s-plan",
-        "kind": "exit_plan_mode",
-    }
-
-    await agent.run("No step 2 should use Postgres not MySQL").__anext__()
-
-    mock_client.query.assert_not_awaited()
-    mock_client._transport.write.assert_awaited_once()
-    written = mock_client._transport.write.call_args[0][0]
-    assert "tool_result" in written
-    assert "rejected" in written
-    assert "Postgres" in written and "MySQL" in written
+def test_build_exit_plan_permission_no_with_feedback_denies():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
+    r = _build_exit_plan_permission("No change step 2")
+    assert r.behavior == "deny"
+    assert "change step 2" in r.message
 
 
-@pytest.mark.anyio
-async def test_exit_plan_mode_resume_chinese_yes(sample_project: ProjectInfo):
-    """Chinese approval words (好的/可以/同意) should also approve."""
-    from claude_agent_sdk import ResultMessage
-
-    mock_client = AsyncMock()
-    mock_client._transport = AsyncMock()
-    mock_client.query = AsyncMock()
-
-    async def fake_receive():
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
-        )
-
-    mock_client.receive_response = fake_receive
-
-    agent = ClaudeCodeAgent(sample_project)
-    agent._client = mock_client
-    agent._pending_ask = {
-        "tool_use_id": "toolu_plan",
-        "session_id": "s-plan",
-        "kind": "exit_plan_mode",
-    }
-
-    await agent.run("好的").__anext__()
-
-    mock_client._transport.write.assert_awaited_once()
-    written = mock_client._transport.write.call_args[0][0]
-    assert "approved" in written
+def test_build_exit_plan_permission_no_without_feedback_denies():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
+    r = _build_exit_plan_permission("No")
+    assert r.behavior == "deny"
 
 
-@pytest.mark.anyio
-async def test_exit_plan_mode_resume_chinese_no_with_feedback(sample_project: ProjectInfo):
-    """Chinese rejection (不要...) should send feedback."""
-    from claude_agent_sdk import ResultMessage
-
-    mock_client = AsyncMock()
-    mock_client._transport = AsyncMock()
-    mock_client.query = AsyncMock()
-
-    async def fake_receive():
-        yield ResultMessage(
-            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
-            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
-        )
-
-    mock_client.receive_response = fake_receive
-
-    agent = ClaudeCodeAgent(sample_project)
-    agent._client = mock_client
-    agent._pending_ask = {
-        "tool_use_id": "toolu_plan",
-        "session_id": "s-plan",
-        "kind": "exit_plan_mode",
-    }
-
-    await agent.run("不要用 Postgres，换 MySQL").__anext__()
-
-    written = mock_client._transport.write.call_args[0][0]
-    assert "rejected" in written
-    assert "Postgres" in written and "MySQL" in written
-
-
-# ── _build_plan_approval_result unit tests ──
-
-
-def test_build_plan_approval_yes():
-    from agent_box.agents.claude_code import _build_plan_approval_result
-    assert "approved" in _build_plan_approval_result("Yes")
-    assert "approved" in _build_plan_approval_result("yes, please")
-    assert "approved" in _build_plan_approval_result("Y")
-
-
-def test_build_plan_approval_no_with_feedback():
-    from agent_box.agents.claude_code import _build_plan_approval_result
-    r = _build_plan_approval_result("No change step 2")
-    assert "rejected" in r
-    assert "change step 2" in r
-
-
-def test_build_plan_approval_no_without_feedback():
-    from agent_box.agents.claude_code import _build_plan_approval_result
-    r = _build_plan_approval_result("No")
-    assert "rejected" in r
-
-
-def test_build_plan_approval_chinese_approve_words():
-    from agent_box.agents.claude_code import _build_plan_approval_result
+def test_build_exit_plan_permission_chinese_approve_words():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
     for w in ("好的", "可以", "同意", "批准", "是", "行"):
-        assert "approved" in _build_plan_approval_result(w), w
+        assert _build_exit_plan_permission(w).behavior == "allow", w
 
 
-def test_build_plan_approval_chinese_reject_words():
-    from agent_box.agents.claude_code import _build_plan_approval_result
+def test_build_exit_plan_permission_chinese_reject_words():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
     for w in ("否", "不", "不要", "不行", "拒绝"):
-        r = _build_plan_approval_result(w + " 改一下")
-        assert "rejected" in r, w
-        assert "改一下" in r, w
+        r = _build_exit_plan_permission(w + " 改一下")
+        assert r.behavior == "deny", w
+        assert "改一下" in r.message, w
 
 
-def test_build_plan_approval_ambiguous_defaults_to_reject():
-    from agent_box.agents.claude_code import _build_plan_approval_result
-    # Doesn't start with Yes/No — defaults to rejection, keeps the text as feedback
-    r = _build_plan_approval_result("看起来不错，但是 step 3 能省就省")
-    assert "rejected" in r
-    assert "step 3" in r
+def test_build_exit_plan_permission_ambiguous_defaults_to_deny():
+    from agent_box.agents.claude_code import _build_exit_plan_permission
+    # Doesn't start with Yes/No — defaults to deny, keeps the text as feedback
+    r = _build_exit_plan_permission("看起来不错，但是 step 3 能省就省")
+    assert r.behavior == "deny"
+    assert "step 3" in r.message
+
+
+# ── _can_use_tool callback ──
+
+
+@pytest.mark.anyio
+async def test_can_use_tool_normal_tool_is_bypassed(sample_project: ProjectInfo):
+    """Tools that don't require user interaction are allowed unconditionally."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    agent = ClaudeCodeAgent(sample_project)
+    ctx = ToolPermissionContext(tool_use_id="t_bash")
+    result = await agent._can_use_tool("Bash", {"command": "rm -rf /"}, ctx)
+    assert result.behavior == "allow"
+    assert agent._pending_permission is None  # no pending state created
+
+
+@pytest.mark.anyio
+async def test_can_use_tool_exit_plan_mode_allow(sample_project: ProjectInfo):
+    """can_use_tool for ExitPlanMode returns the parsed approval decision."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    agent = ClaudeCodeAgent(sample_project)
+    # Pre-seed a resolved future so the callback doesn't block on a real user.
+    pending = agent._get_or_create_permission_future(
+        "ExitPlanMode", "toolu_plan", {"plan": "..."},
+    )
+    pending["future"].set_result("Yes")
+
+    ctx = ToolPermissionContext(tool_use_id="toolu_plan")
+    result = await agent._can_use_tool("ExitPlanMode", {"plan": "..."}, ctx)
+    assert result.behavior == "allow"
+    assert agent._pending_permission is None  # cleared after resolving
+
+
+@pytest.mark.anyio
+async def test_can_use_tool_exit_plan_mode_deny_with_feedback(sample_project: ProjectInfo):
+    from claude_agent_sdk import ToolPermissionContext
+
+    agent = ClaudeCodeAgent(sample_project)
+    pending = agent._get_or_create_permission_future(
+        "ExitPlanMode", "toolu_plan", {"plan": "..."},
+    )
+    pending["future"].set_result("No use Postgres not MySQL")
+
+    ctx = ToolPermissionContext(tool_use_id="toolu_plan")
+    result = await agent._can_use_tool("ExitPlanMode", {"plan": "..."}, ctx)
+    assert result.behavior == "deny"
+    assert "Postgres" in result.message and "MySQL" in result.message
+
+
+@pytest.mark.anyio
+async def test_can_use_tool_ask_user_question_injects_answers(sample_project: ProjectInfo):
+    """can_use_tool for AskUserQuestion injects parsed answers into updated_input."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    questions = [{"question": "Which file?", "options": [{"label": "main.py"}, {"label": "utils.py"}]}]
+    inp = {"questions": questions}
+
+    agent = ClaudeCodeAgent(sample_project)
+    pending = agent._get_or_create_permission_future("AskUserQuestion", "toolu_a", inp)
+    pending["future"].set_result("main.py please")
+
+    with patch(
+        "agent_box.agents.claude_code._parse_user_answer",
+        new=AsyncMock(return_value={"answers": {"Which file?": "main.py"}}),
+    ):
+        ctx = ToolPermissionContext(tool_use_id="toolu_a")
+        result = await agent._can_use_tool("AskUserQuestion", inp, ctx)
+
+    assert result.behavior == "allow"
+    assert result.updated_input["answers"] == {"Which file?": "main.py"}
+    # original question structure preserved alongside injected answers
+    assert result.updated_input["questions"] == questions
+
+
+@pytest.mark.anyio
+async def test_can_use_tool_ask_user_question_parse_fallback(sample_project: ProjectInfo):
+    """If the LLM answer-parser fails, the raw reply is used as each answer."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    questions = [{"question": "Which file?"}]
+    inp = {"questions": questions}
+
+    agent = ClaudeCodeAgent(sample_project)
+    pending = agent._get_or_create_permission_future("AskUserQuestion", "toolu_a", inp)
+    pending["future"].set_result("just main.py")
+
+    def _boom(*a, **k):
+        raise RuntimeError("LLM down")
+
+    with patch("agent_box.agents.claude_code._parse_user_answer", side_effect=_boom):
+        ctx = ToolPermissionContext(tool_use_id="toolu_a")
+        result = await agent._can_use_tool("AskUserQuestion", inp, ctx)
+
+    assert result.behavior == "allow"
+    assert result.updated_input["answers"] == {"Which file?": "just main.py"}
+
+
+@pytest.mark.anyio
+async def test_exit_plan_mode_resume_resolves_future(sample_project: ProjectInfo):
+    """Resuming an ExitPlanMode pause resolves the future (no fresh query)."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s-plan",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    pending = agent._get_or_create_permission_future(
+        "ExitPlanMode", "toolu_plan", {"plan": "..."},
+    )
+    future = pending["future"]
+
+    await agent.run("Yes").__anext__()
+
+    mock_client.query.assert_not_awaited()
+    assert future.done()
+    assert future.result() == "Yes"
 
 
 # ── Tool summary formatting ──
