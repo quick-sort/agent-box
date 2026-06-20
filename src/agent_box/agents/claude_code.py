@@ -515,6 +515,56 @@ class ClaudeCodeAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Permission callback (can_use_tool)
     # ------------------------------------------------------------------
+    #
+    # Why AskUserQuestion / ExitPlanMode need a callback (problem writeup)
+    # ───────────────────────────────────────────────────────────────────
+    #
+    # SYMPTOM
+    #   The user's reply to an AskUserQuestion (and the Yes/No on an
+    #   ExitPlanMode plan) was silently ignored: the question reached the IM
+    #   channel, the user answered, yet the LLM proceeded with the default
+    #   option exactly as if the user had cancelled.
+    #
+    # ROOT CAUSE
+    #   The agent runs in ``bypassPermissions``, but that mode does NOT
+    #   bypass tools flagged ``requiresUserInteraction()``. In the CLI's
+    #   permission check the requiresUserInteraction short-circuit (the "1e"
+    #   step in utils/permissions/permissions.ts) runs *before* the bypass
+    #   check, so AskUserQuestion and ExitPlanMode still emit a
+    #   ``can_use_tool`` request. With no callback registered, the SDK
+    #   raised "canUseTool callback is not provided"
+    #   (claude_agent_sdk/_internal/query.py), the CLI read that error as a
+    #   user cancellation, and handed the LLM a cancelled tool_result —
+    #   hence "user cancelled, use defaults".
+    #
+    # FIX — a two-phase handshake bridging the CLI permission request to the
+    # IM channel, via an asyncio.Future keyed by tool_use_id:
+    #
+    #   1. The CLI streams the AssistantMessage carrying the tool_use block,
+    #      then sends ``can_use_tool``. Either ``run()`` (seeing the block)
+    #      or the callback (receiving the request) fires first;
+    #      ``_get_or_create_permission_future`` guarantees exactly one shared
+    #      future regardless of who wins the race.
+    #   2. ``run()`` surfaces the question/plan to the IM channel and
+    #      returns, so the channel can deliver it and the user can reply.
+    #      Meanwhile the callback awaits the future, holding the CLI's
+    #      permission request open (the CLI blocks until we answer).
+    #   3. The user's reply arrives as the next ``run()`` call. ``run()``
+    #      resolves the future with the reply text *instead of* issuing a
+    #      fresh query (the CLI is mid-turn). The callback wakes and returns
+    #      the decision:
+    #        - AskUserQuestion → allow, with the parsed answers injected into
+    #          ``updated_input.answers``. The CLI's tool execution formats
+    #          those into the tool_result the LLM sees — this is the
+    #          supported injection channel (the interactive UI uses it too).
+    #        - ExitPlanMode → allow on approval (the CLI runs call() and
+    #          exits plan mode), or deny with feedback whose message becomes
+    #          the is_error tool_result.
+    #
+    #   The previous approach wrote a raw tool_result to stdin directly,
+    #   bypassing the control protocol — flaky and ignored once the CLI had
+    #   already moved past the (errored) permission request. Going through
+    #   the callback is what makes the reply actually take effect.
 
     def _get_or_create_permission_future(
         self,
