@@ -9,11 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git git-lfs wget unzip \
         libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
         libdrm2 libgbm1 libgtk-3-0 libxkbcommon0 libxshmfence1 \
-        libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 \
+        libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxcomposite1 libxcursor1 \
         libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 \
         libxrender1 libxss1 libxtst6 \
-        libnss3 libnspr4 libpango-1.0-0 libcairo2 \
-        libdbus-1-3 libfontconfig1 fonts-liberation fonts-wqy-zenhei libasound2 \
+        libnss3 libnspr4 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libcairo-gobject2 \
+        libdbus-1-3 libfontconfig1 libfreetype6 libgdk-pixbuf-2.0-0 libatspi2.0-0 \
+        fonts-liberation fonts-wqy-zenhei fonts-noto-color-emoji fonts-noto-cjk fonts-freefont-ttf libasound2 \
     && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
     && fnm install 24 \
     && fnm default 24 \
@@ -33,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
     && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
-    && /home/agent/.npm-global/bin/agent-browser install --with-deps \
+    && /home/agent/.npm-global/bin/agent-browser install \
     && chmod -R 755 /root/.agent-browser \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
