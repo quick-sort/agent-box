@@ -6,7 +6,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ENV FNM_DIR="/opt/fnm"
 ENV PATH="/opt/fnm/aliases/default/bin:$PATH"
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates git wget unzip \
+        curl ca-certificates git git-lfs wget unzip \
         libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
         libdrm2 libgbm1 libgtk-3-0 libxkbcommon0 libxshmfence1 \
         libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 \
@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh openssh-client docker-ce-cli \
+    && git lfs install --system \
     && mkdir -p /home/agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
