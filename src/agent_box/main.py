@@ -39,6 +39,9 @@ class App:
         elif channel_type == "qq":
             from .channels.qq import QQChannel
             return QQChannel(send_in)
+        elif channel_type == "wecom":
+            from .channels.wecom import WecomChannel
+            return WecomChannel(send_in)
         else:
             from .channels.weixin import WeixinChannel
             return WeixinChannel(send_in)
@@ -245,12 +248,14 @@ def main() -> None:
             pass
         return
 
-    # Parse channel flags: --qq --weixin --tui
+    # Parse channel flags: --qq --weixin --tui --wecom
     channel_types: list[str] = []
     if "--qq" in sys.argv:
         channel_types.append("qq")
     if "--tui" in sys.argv:
         channel_types.append("tui")
+    if "--wecom" in sys.argv:
+        channel_types.append("wecom")
     if "--weixin" in sys.argv or not channel_types:
         channel_types.append("weixin")
 
