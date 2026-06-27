@@ -591,8 +591,9 @@ class QQChannel(BaseChannel):
     ) -> list[tuple[str, str, str | None]]:
         """Download each attachment. Returns list of (label, local_path, transcription).
 
-        transcription is populated for audio attachments when ASR is configured
-        and succeeds; otherwise None.
+        Voice attachments prefer the platform-provided ``asr_refer_text`` (QQ's
+        own ASR result) — when present, no download or transcoding is needed.
+        Falls back to downloading the audio and running GLM ASR.
         """
         results: list[tuple[str, str, str | None]] = []
         for att in atts:
@@ -600,9 +601,26 @@ class QQChannel(BaseChannel):
             label = self._att_label(att)
             local = ""
             transcription: str | None = None
-            if url:
+
+            # Voice: prefer QQ platform ASR text (no download/transcode needed)
+            if label == "语音":
+                asr_text = (att.get("asr_refer_text") or "").strip()
+                if asr_text:
+                    transcription = asr_text
+                    log.info(
+                        "QQ voice: using platform asr_refer_text (%d chars)",
+                        len(asr_text),
+                    )
+                else:
+                    log.debug(
+                        "QQ voice attachment has no asr_refer_text; keys=%s",
+                        list(att.keys()),
+                    )
+
+            # Download when no platform transcription (voice fallback or non-voice)
+            if url and transcription is None:
                 local = await self._download_image(url, att.get("filename")) or ""
-                # Transcribe voice attachments when ASR is available
+                # Fall back to GLM ASR for voice when platform text unavailable
                 if label == "语音" and local and self._asr is not None:
                     transcription = await self._asr.transcribe(local)
             results.append((label, local, transcription))
