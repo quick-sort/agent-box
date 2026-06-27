@@ -70,7 +70,7 @@ src/agent_box/
 - `WEIXIN_ACCOUNT_ID` — weixin_sdk account id (from login)
 - `QQBOT_APP_ID` — QQ Bot application ID
 - `QQBOT_CLIENT_SECRET` — QQ Bot client secret
-- `GLM_API_KEY` — ZhipuAI (GLM) API key for voice-to-text. Empty skips QQ voice transcription (falls back to file path only).
+- `GLM_API_KEY` — ZhipuAI (GLM) API key for voice-to-text (fallback). QQ voice messages prefer the platform-provided `asr_refer_text`; this key is used only when that field is absent.
 - `GLM_ASR_MODEL` — GLM ASR model id (default: `glm-asr-2512`)
 - `PROJECTS_DIR` — where project folders live (default: `data/projects`)
 - `ROUTER_MODEL` — model override for router (optional)
