@@ -575,6 +575,22 @@ class QQChannel(BaseChannel):
             if isinstance(a, dict)
         ]
 
+    def _is_voice(self, att: dict[str, Any]) -> bool:
+        """Whether an attachment is a QQ voice message.
+
+        QQ Bot API tags voice with the literal content_type "voice" rather
+        than a standard audio/* MIME, so a single content_type check misses
+        real voice messages. Falls back to the platform-provided asr_refer_text
+        and common voice file extensions.
+        """
+        ct = (att.get("content_type") or "").split(";")[0].strip()
+        if ct == "voice" or ct.startswith("audio/"):
+            return True
+        if (att.get("asr_refer_text") or "").strip():
+            return True
+        ext = Path(att.get("filename") or "").suffix.lower()
+        return ext in (".amr", ".silk", ".slk", ".slac")
+
     def _att_label(self, att: dict[str, Any]) -> str:
         """Human-readable label for an attachment."""
         ct = (att.get("content_type") or "").split(";")[0].strip()
@@ -582,7 +598,7 @@ class QQChannel(BaseChannel):
             return "图片"
         if ct.startswith("video/"):
             return "视频"
-        if ct.startswith("audio/"):
+        if self._is_voice(att):
             return "语音"
         return "文件"
 
@@ -599,11 +615,12 @@ class QQChannel(BaseChannel):
         for att in atts:
             url = _normalize_url(att.get("url") or "")
             label = self._att_label(att)
+            is_voice = self._is_voice(att)
             local = ""
             transcription: str | None = None
 
             # Voice: prefer QQ platform ASR text (no download/transcode needed)
-            if label == "语音":
+            if is_voice:
                 asr_text = (att.get("asr_refer_text") or "").strip()
                 if asr_text:
                     transcription = asr_text
@@ -621,7 +638,7 @@ class QQChannel(BaseChannel):
             if url and transcription is None:
                 local = await self._download_image(url, att.get("filename")) or ""
                 # Fall back to GLM ASR for voice when platform text unavailable
-                if label == "语音" and local and self._asr is not None:
+                if is_voice and local and self._asr is not None:
                     transcription = await self._asr.transcribe(local)
             results.append((label, local, transcription))
         return results
