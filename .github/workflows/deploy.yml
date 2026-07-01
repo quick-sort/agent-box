@@ -18,6 +18,7 @@ jobs:
 
       - name: Deploy container
         run: |
+          export DOCKER_GID=$(getent group docker | cut -d: -f3)
           cp ~/agent-box-runner/.env .
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           docker compose up -d
