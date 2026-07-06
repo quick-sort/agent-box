@@ -23,6 +23,7 @@ class App:
         self.sessions = SessionManager(settings.workspace_dir)
         self.router = Router(self.sessions)
         self.agents: dict[str, BaseAgent] = {}
+        self.channel_types: list[str] = []
 
     def _get_or_create_agent(self, name: str) -> BaseAgent:
         if name not in self.agents:
@@ -97,6 +98,13 @@ class App:
         """
         if not channel_types:
             channel_types = ["weixin"]
+
+        self.channel_types = channel_types
+
+        # Enable wecom_mcp tool when wecom channel is active
+        if "wecom" in channel_types:
+            from .tools.wecom_mcp import set_wecom_mcp_enabled
+            set_wecom_mcp_enabled(True)
 
         send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](16)
         send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](16)
@@ -240,6 +248,32 @@ def _setup_logging(channel: str) -> None:
 
 
 def main() -> None:
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("""agent-box — IM → Router → Agent pipeline for managing coding projects via chat
+
+Usage: agent-box [OPTIONS]
+
+Channel options (at least one required, defaults to --weixin):
+  --weixin          Enable WeChat (微信) channel
+  --wecom           Enable WeCom (企业微信) WebSocket channel
+  --qq              Enable QQ Bot channel
+  --tui             Enable terminal UI channel (for local testing)
+
+Multiple channels can be enabled simultaneously:
+  agent-box --wecom --tui
+
+Other options:
+  --test-router     Launch interactive router REPL for testing
+  -h, --help        Show this help message
+
+Environment variables (see sample.env):
+  WECOM_BOT_ID, WECOM_SECRET         WeCom bot credentials
+  QQBOT_APP_ID, QQBOT_CLIENT_SECRET  QQ bot credentials
+  WEIXIN_ACCOUNT_ID                  WeChat account ID
+  ANTHROPIC_AUTH_TOKEN                Anthropic API key
+""")
+        return
+
     if "--test-router" in sys.argv:
         _setup_logging("test-router")
         try:

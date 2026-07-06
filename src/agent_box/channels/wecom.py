@@ -1,38 +1,25 @@
-"""WeCom (企业微信) channel adapter.
+"""WeCom (企业微信) channel adapter — WebSocket long connection mode.
 
-Inbound: HTTP webhook receiver (WeCom Bot callback mode).
-  - GET  /wecom  → URL verification (echostr decryption)
-  - POST /wecom  → message callback (AES decrypt → parse → emit)
-
-Outbound: WeCom Agent HTTP API (corpId + corpSecret + agentId).
+Uses the official ``wecom-aibot-sdk`` Python SDK which connects via WebSocket
+to wss://openws.work.weixin.qq.com. Only requires two credentials:
 
 Required config:
-  WECOM_TOKEN            — Webhook 验证 token
-  WECOM_ENCODING_AES_KEY — 43-char Base64 AES key
-  WECOM_CORP_ID          — 企业 ID (corpId)
-  WECOM_CORP_SECRET      — 应用 secret
-  WECOM_AGENT_ID         — 应用 agentId
-  WECOM_WEBHOOK_PORT     — HTTP 监听端口 (default 8088)
+  WECOM_BOT_ID   — 机器人 ID (from 企业微信管理后台 → 智能机器人)
+  WECOM_SECRET   — 机器人 Secret
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
+import asyncio
 import logging
 import mimetypes
-import random
-import struct
-import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-import anyio
-import anyio.from_thread
-import httpx
 from anyio.abc import ObjectSendStream
+
+from wecom_aibot_sdk import WSClient, generate_req_id
+from wecom_aibot_sdk.types import WsFrame, MessageType as WeComMsgType
 
 from ..config import settings
 from ..models import IncomingMessage, MessageType, OutgoingMessage
@@ -40,175 +27,8 @@ from .base import BaseChannel
 
 log = logging.getLogger(__name__)
 
-WECOM_GET_TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
-WECOM_SEND_MSG_URL = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
-WECOM_UPLOAD_MEDIA_URL = "https://qyapi.weixin.qq.com/cgi-bin/media/upload"
-WECOM_DOWNLOAD_MEDIA_URL = "https://qyapi.weixin.qq.com/cgi-bin/media/get"
-
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
 _AUDIO_EXTS = frozenset({".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".amr"})
-
-
-# ── WeCom AES crypto (PKCS#7 + AES-CBC) ─────────────────────────────────────
-
-def _wecom_sha1(*parts: str) -> str:
-    return hashlib.sha1("".join(sorted(parts)).encode()).hexdigest()
-
-
-def _verify_signature(token: str, timestamp: str, nonce: str, *extras: str) -> str:
-    return _wecom_sha1(token, timestamp, nonce, *extras)
-
-
-class _WecomCrypto:
-    """Minimal WeCom AES-256-CBC encrypt/decrypt (mirrors @wecom/aibot-node-sdk WecomCrypto)."""
-
-    def __init__(self, token: str, encoding_aes_key: str, receive_id: str) -> None:
-        self.token = token
-        self.receive_id = receive_id
-        raw = base64.b64decode(encoding_aes_key + "=")  # pad to multiple of 4
-        self._key = raw[:32]
-        self._iv = raw[:16]
-
-    def verify_signature(self, signature: str, timestamp: str, nonce: str, encrypt: str) -> bool:
-        expected = _wecom_sha1(self.token, timestamp, nonce, encrypt)
-        return hmac.compare_digest(expected, signature)
-
-    def decrypt(self, encrypt: str) -> str:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        raw = base64.b64decode(encrypt)
-        cipher = Cipher(algorithms.AES(self._key), modes.CBC(self._iv))
-        dec = cipher.decryptor()
-        plain = dec.update(raw) + dec.finalize()
-        # skip random 16-byte prefix, then 4-byte big-endian length
-        content_len = struct.unpack(">I", plain[16:20])[0]
-        content = plain[20 : 20 + content_len].decode("utf-8")
-        return content
-
-    def encrypt(self, plain: str) -> tuple[str, str, str]:
-        """Returns (encrypt_b64, timestamp, nonce)."""
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        nonce = str(random.randint(100000, 999999))
-        timestamp = str(int(time.time()))
-        content = plain.encode("utf-8")
-        rand16 = bytes(random.getrandbits(8) for _ in range(16))
-        msg = rand16 + struct.pack(">I", len(content)) + content + self.receive_id.encode()
-        # PKCS#7 pad to 32-byte blocks
-        pad = 32 - len(msg) % 32
-        msg += bytes([pad]) * pad
-        cipher = Cipher(algorithms.AES(self._key), modes.CBC(self._iv))
-        enc = cipher.encryptor()
-        encrypted = enc.update(msg) + enc.finalize()
-        encrypt_b64 = base64.b64encode(encrypted).decode()
-        sig = _wecom_sha1(self.token, timestamp, nonce, encrypt_b64)
-        return encrypt_b64, timestamp, nonce
-
-
-# ── WeCom Agent API client ───────────────────────────────────────────────────
-
-class _WecomAgentClient:
-    def __init__(self, corp_id: str, corp_secret: str, agent_id: int) -> None:
-        self._corp_id = corp_id
-        self._corp_secret = corp_secret
-        self._agent_id = agent_id
-        self._token: str | None = None
-        self._token_expires_at: float = 0.0
-
-    async def _get_token(self) -> str:
-        if self._token and time.time() < self._token_expires_at - 300:
-            return self._token
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                WECOM_GET_TOKEN_URL,
-                params={"corpid": self._corp_id, "corpsecret": self._corp_secret},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        if not data.get("access_token"):
-            raise RuntimeError(f"WeCom gettoken failed: {data}")
-        self._token = data["access_token"]
-        self._token_expires_at = time.time() + data.get("expires_in", 7200)
-        return self._token
-
-    async def send_text(self, to_user: str, text: str) -> None:
-        token = await self._get_token()
-        body: dict[str, Any] = {
-            "touser": to_user,
-            "msgtype": "text",
-            "agentid": self._agent_id,
-            "text": {"content": text},
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{WECOM_SEND_MSG_URL}?access_token={token}",
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        if data.get("errcode", 0) != 0:
-            raise RuntimeError(f"WeCom send_text failed: {data}")
-
-    async def upload_media(self, file_path: str, media_type: str) -> str:
-        """Upload temporary media, return media_id."""
-        token = await self._get_token()
-        p = Path(file_path)
-        suffix = p.suffix.lower()
-        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-        content = p.read_bytes()
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{WECOM_UPLOAD_MEDIA_URL}?access_token={token}&type={media_type}",
-                files={"media": (p.name, content, mime)},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        if not data.get("media_id"):
-            raise RuntimeError(f"WeCom upload_media failed: {data}")
-        return data["media_id"]
-
-    async def send_media(self, to_user: str, media_id: str, media_type: str) -> None:
-        token = await self._get_token()
-        body: dict[str, Any] = {
-            "touser": to_user,
-            "msgtype": media_type,
-            "agentid": self._agent_id,
-            media_type: {"media_id": media_id},
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{WECOM_SEND_MSG_URL}?access_token={token}",
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        if data.get("errcode", 0) != 0:
-            raise RuntimeError(f"WeCom send_media failed: {data}")
-
-    async def download_media(self, media_id: str, dest_dir: Path) -> str | None:
-        token = await self._get_token()
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                async with client.stream(
-                    "GET",
-                    f"{WECOM_DOWNLOAD_MEDIA_URL}?access_token={token}&media_id={media_id}",
-                ) as resp:
-                    resp.raise_for_status()
-                    ct = resp.headers.get("content-type", "").split(";")[0].strip()
-                    ext = mimetypes.guess_extension(ct) if ct else None
-                    dest = dest_dir / f"media-{media_id}{ext or '.bin'}"
-                    dest.write_bytes(await resp.aread())
-            return str(dest)
-        except Exception:
-            log.exception("wecom: failed to download media_id=%s", media_id)
-            return None
-
-
-# ── Inbound message parsing ──────────────────────────────────────────────────
-
-def _parse_wecom_xml(xml_text: str) -> dict[str, str]:
-    """Parse WeCom callback XML into a flat dict."""
-    root = ET.fromstring(xml_text)
-    return {child.tag: (child.text or "") for child in root}
 
 
 def _detect_media_type(file_path: str) -> str:
@@ -220,214 +40,72 @@ def _detect_media_type(file_path: str) -> str:
     return "file"
 
 
-# ── HTTP webhook server ──────────────────────────────────────────────────────
+# ── Message parsing helpers ──────────────────────────────────────────────────
 
-async def _handle_http(
-    request_method: str,
-    query: dict[str, str],
-    body_bytes: bytes,
-    crypto: _WecomCrypto,
-    send_stream: ObjectSendStream[IncomingMessage],
-    agent: _WecomAgentClient,
-    download_dir: Path,
-) -> tuple[int, str, str]:
-    """Handle one HTTP request. Returns (status, content_type, body)."""
-    msg_sig = query.get("msg_signature", query.get("signature", ""))
-    timestamp = query.get("timestamp", "")
-    nonce = query.get("nonce", "")
+def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[str]]:
+    """Parse WeCom message body into (text, image_urls).
 
-    if request_method == "GET":
-        echostr = query.get("echostr", "")
-        if not all([msg_sig, timestamp, nonce, echostr]):
-            return 400, "text/plain", "missing params"
-        if not crypto.verify_signature(msg_sig, timestamp, nonce, echostr):
-            return 403, "text/plain", "signature mismatch"
-        try:
-            plain = crypto.decrypt(echostr)
-            return 200, "text/plain", plain
-        except Exception:
-            log.exception("wecom: echostr decrypt failed")
-            return 403, "text/plain", "decrypt failed"
+    Returns extracted text and list of image URLs that need to be downloaded.
+    """
+    msgtype = body.get("msgtype", "")
+    text_parts: list[str] = []
+    image_urls: list[str] = []
 
-    if request_method == "POST":
-        if not body_bytes:
-            return 400, "text/plain", "empty body"
+    if msgtype == "mixed" and body.get("mixed"):
+        # 图文混排消息
+        for item in body["mixed"].get("msg_item", []):
+            if item.get("msgtype") == "text" and item.get("text", {}).get("content"):
+                text_parts.append(item["text"]["content"])
+            elif item.get("msgtype") == "image" and item.get("image", {}).get("url"):
+                image_urls.append(item["image"]["url"])
+    else:
+        # 单条消息
+        if body.get("text", {}).get("content"):
+            text_parts.append(body["text"]["content"])
+        if msgtype == "voice" and body.get("voice", {}).get("content"):
+            # 语音转文字
+            text_parts.append(body["voice"]["content"])
+        if body.get("image", {}).get("url"):
+            image_urls.append(body["image"]["url"])
 
-        # WeCom POST body is XML with <Encrypt> field
-        try:
-            root = ET.fromstring(body_bytes.decode("utf-8"))
-            encrypt = (root.findtext("Encrypt") or "").strip()
-        except Exception:
-            return 400, "text/plain", "invalid xml"
+    # 处理引用消息
+    quote = body.get("quote")
+    if quote:
+        if quote.get("msgtype") == "text" and quote.get("text", {}).get("content"):
+            if not text_parts:
+                text_parts.append(quote["text"]["content"])
+        elif quote.get("msgtype") == "voice" and quote.get("voice", {}).get("content"):
+            if not text_parts:
+                text_parts.append(quote["voice"]["content"])
+        elif quote.get("msgtype") == "image" and quote.get("image", {}).get("url"):
+            image_urls.append(quote["image"]["url"])
 
-        if not encrypt:
-            return 400, "text/plain", "missing Encrypt"
+    text = "\n".join(text_parts).strip()
 
-        if not crypto.verify_signature(msg_sig, timestamp, nonce, encrypt):
-            return 403, "text/plain", "signature mismatch"
+    # 对于纯媒体消息（无文本），生成描述
+    if not text and (image_urls or msgtype in ("file", "video")):
+        label = {"image": "图片", "voice": "语音", "video": "视频", "file": "文件"}.get(msgtype, "文件")
+        text = f"[用户发送了{label}]"
 
-        try:
-            plain = crypto.decrypt(encrypt)
-        except Exception:
-            log.exception("wecom: message decrypt failed")
-            return 400, "text/plain", "decrypt failed"
-
-        msg = _parse_wecom_xml(plain)
-        msg_type = msg.get("MsgType", "")
-        from_user = msg.get("FromUserName", "")
-
-        if not from_user:
-            return 200, "text/plain", ""
-
-        text = ""
-        if msg_type == "text":
-            text = msg.get("Content", "").strip()
-        elif msg_type in ("image", "voice", "file", "video"):
-            media_id = msg.get("MediaId", "")
-            label = {"image": "图片", "voice": "语音", "video": "视频"}.get(msg_type, "文件")
-            if media_id:
-                local = await agent.download_media(media_id, download_dir)
-                if local:
-                    text = f"用户发送了一个{label}，文件路径: {local}"
-                else:
-                    text = f"用户发送了一个{label}，文件路径: (下载失败)"
-            else:
-                text = f"用户发送了一个{label}"
-        elif msg_type == "event":
-            # Ignore events (enter_chat, etc.)
-            return 200, "text/plain", ""
-        else:
-            log.debug("wecom: unhandled msgtype=%s", msg_type)
-            return 200, "text/plain", ""
-
-        if not text:
-            return 200, "text/plain", ""
-
-        log.debug("wecom: inbound from %s: %s", from_user, text[:80])
-        await send_stream.send(
-            IncomingMessage(
-                text=text,
-                user_id=from_user,
-                channel="wecom",
-                raw=msg,
-            )
-        )
-        return 200, "text/plain", ""
-
-    return 405, "text/plain", "method not allowed"
-
-
-def _parse_query(url: str) -> dict[str, str]:
-    idx = url.find("?")
-    if idx < 0:
-        return {}
-    from urllib.parse import parse_qs
-    qs = parse_qs(url[idx + 1 :], keep_blank_values=True)
-    return {k: v[0] for k, v in qs.items()}
-
-
-async def _serve_http(
-    port: int,
-    path: str,
-    crypto: _WecomCrypto,
-    send_stream: ObjectSendStream[IncomingMessage],
-    agent: _WecomAgentClient,
-    download_dir: Path,
-) -> None:
-    """Minimal async HTTP server using anyio TCP sockets."""
-    listener = await anyio.create_tcp_listener(local_port=port, local_host="0.0.0.0")
-    log.info("wecom webhook listening on port %d at %s", port, path)
-
-    async def handle(stream: anyio.abc.ByteStream) -> None:
-        try:
-            # Read full HTTP request (until headers end)
-            raw = b""
-            async with stream:
-                while b"\r\n\r\n" not in raw:
-                    chunk = await stream.receive(4096)
-                    if not chunk:
-                        break
-                    raw += chunk
-
-                header_end = raw.index(b"\r\n\r\n")
-                header_bytes = raw[:header_end]
-                body_so_far = raw[header_end + 4 :]
-
-                lines = header_bytes.decode("latin-1").split("\r\n")
-                request_line = lines[0]
-                parts = request_line.split(" ")
-                method = parts[0] if parts else "GET"
-                url = parts[1] if len(parts) > 1 else "/"
-
-                headers: dict[str, str] = {}
-                for line in lines[1:]:
-                    if ":" in line:
-                        k, _, v = line.partition(":")
-                        headers[k.strip().lower()] = v.strip()
-
-                content_length = int(headers.get("content-length", "0"))
-                while len(body_so_far) < content_length:
-                    chunk = await stream.receive(4096)
-                    if not chunk:
-                        break
-                    body_so_far += chunk
-
-                req_path = url.split("?")[0]
-                if req_path != path:
-                    resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"
-                    await stream.send(resp)
-                    return
-
-                query = _parse_query(url)
-                status, ct, body_str = await _handle_http(
-                    method, query, body_so_far, crypto, send_stream, agent, download_dir
-                )
-                body_b = body_str.encode("utf-8")
-                resp = (
-                    f"HTTP/1.1 {status} OK\r\n"
-                    f"Content-Type: {ct}; charset=utf-8\r\n"
-                    f"Content-Length: {len(body_b)}\r\n"
-                    f"Connection: close\r\n\r\n"
-                ).encode() + body_b
-                await stream.send(resp)
-        except Exception:
-            log.exception("wecom: HTTP handler error")
-
-    async with listener:
-        async with anyio.create_task_group() as tg:
-            async for stream in listener:  # type: ignore[attr-defined]
-                tg.start_soon(handle, stream)
+    return text, image_urls
 
 
 # ── WecomChannel ─────────────────────────────────────────────────────────────
 
 class WecomChannel(BaseChannel):
-    """WeCom Bot webhook channel + Agent API for sending."""
+    """WeCom Bot WebSocket channel using official wecom-aibot-sdk."""
 
     def __init__(self, send_stream: ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
-        self._crypto = _WecomCrypto(
-            token=settings.wecom_token,
-            encoding_aes_key=settings.wecom_encoding_aes_key,
-            receive_id=settings.wecom_corp_id,
-        )
-        self._agent = _WecomAgentClient(
-            corp_id=settings.wecom_corp_id,
-            corp_secret=settings.wecom_corp_secret,
-            agent_id=settings.wecom_agent_id,
-        )
-        self._port = settings.wecom_webhook_port
-        self._path = settings.wecom_webhook_path
+        self._client: WSClient | None = None
         self._download_dir = settings.config_dir / "channels" / "wecom" / "downloads"
+        self._download_dir.mkdir(parents=True, exist_ok=True)
 
     def _check_config(self) -> bool:
         missing = [
             name for name, val in [
-                ("WECOM_TOKEN", settings.wecom_token),
-                ("WECOM_ENCODING_AES_KEY", settings.wecom_encoding_aes_key),
-                ("WECOM_CORP_ID", settings.wecom_corp_id),
-                ("WECOM_CORP_SECRET", settings.wecom_corp_secret),
-                ("WECOM_AGENT_ID", str(settings.wecom_agent_id)),
+                ("WECOM_BOT_ID", settings.wecom_bot_id),
+                ("WECOM_SECRET", settings.wecom_secret),
             ] if not val
         ]
         if missing:
@@ -439,34 +117,181 @@ class WecomChannel(BaseChannel):
         if not self._check_config():
             await self.send_stream.aclose()
             return
+
+        self._client = WSClient(
+            bot_id=settings.wecom_bot_id,
+            secret=settings.wecom_secret,
+            heartbeat_interval=30000,
+            max_reconnect_attempts=10,
+            max_auth_failure_attempts=5,
+        )
+
+        # Register event handlers
+        self._client.on("connected", self._on_connected)
+        self._client.on("authenticated", self._on_authenticated)
+        self._client.on("disconnected", self._on_disconnected)
+        self._client.on("error", self._on_error)
+        self._client.on("message", self._on_message)
+        self._client.on("event", self._on_event)
+
         try:
-            await _serve_http(
-                port=self._port,
-                path=self._path,
-                crypto=self._crypto,
-                send_stream=self.send_stream,
-                agent=self._agent,
-                download_dir=self._download_dir,
-            )
+            await self._client.connect()
+            # Keep running until cancelled
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("wecom: unexpected error in start loop")
         finally:
+            if self._client:
+                await self._client.disconnect()
             await self.send_stream.aclose()
 
+    # ── Event handlers ────────────────────────────────────────────────
+
+    def _on_connected(self) -> None:
+        log.info("wecom: WebSocket connected")
+
+    def _on_authenticated(self) -> None:
+        log.info("wecom: authenticated successfully")
+        # Expose WSClient to the wecom_mcp tool
+        from ..tools.wecom_mcp import set_ws_client
+        set_ws_client(self._client)
+
+    def _on_disconnected(self, reason: str) -> None:
+        log.warning("wecom: disconnected: %s", reason)
+        from ..tools.wecom_mcp import set_ws_client
+        set_ws_client(None)
+
+    def _on_error(self, error: Exception) -> None:
+        log.error("wecom: error: %s", error)
+
+    async def _on_message(self, frame: WsFrame) -> None:
+        """Handle incoming message callback."""
+        body = frame.get("body") or {}
+        msgtype = body.get("msgtype", "")
+        from_user = body.get("from", {}).get("userid", "")
+        chat_id = body.get("chatid") or from_user
+
+        if not from_user:
+            return
+
+        text, image_urls = _parse_message_body(body)
+
+        # Download images to local files
+        if image_urls:
+            for url in image_urls:
+                aes_key = body.get("image", {}).get("aeskey")
+                local_path = await self._download_media(url, aes_key)
+                if local_path:
+                    text += f"\n文件路径: {local_path}"
+
+        if not text:
+            return
+
+        log.debug("wecom: inbound from %s: %s", from_user, text[:80])
+        await self.send_stream.send(
+            IncomingMessage(
+                text=text,
+                user_id=from_user,
+                channel="wecom",
+                raw={
+                    "frame": frame,
+                    "chat_id": chat_id,
+                    "chat_type": body.get("chattype", "single"),
+                },
+            )
+        )
+
+    async def _on_event(self, frame: WsFrame) -> None:
+        """Handle event callbacks (template card clicks, etc.)."""
+        body = frame.get("body") or {}
+        event = body.get("event", {})
+        event_type = event.get("eventtype", "")
+
+        # For now, log events but don't route them
+        log.debug("wecom: event received: type=%s", event_type)
+
+    # ── Media download ────────────────────────────────────────────────
+
+    async def _download_media(self, url: str, aes_key: str | None = None) -> str | None:
+        """Download and optionally decrypt a media file."""
+        if not self._client:
+            return None
+        try:
+            result = await self._client.download_file(url, aes_key)
+            buffer: bytes = result["buffer"]
+            filename: str | None = result.get("filename")
+
+            if not filename:
+                # Guess extension from content
+                import magic  # noqa: F401 - optional
+                ext = ".bin"
+                filename = f"media_{generate_req_id('dl')}{ext}"
+
+            dest = self._download_dir / filename
+            dest.write_bytes(buffer)
+            return str(dest)
+        except ImportError:
+            # No python-magic, use a generic extension
+            pass
+        except Exception:
+            log.exception("wecom: failed to download media from %s", url)
+        return None
+
+    # ── Outbound reply ────────────────────────────────────────────────
+
     async def send_reply(self, msg: OutgoingMessage) -> None:
+        if not self._client or not self._client.is_connected:
+            log.warning("wecom: cannot send reply, not connected")
+            return
+
         if msg.type != MessageType.text:
             return
 
-        data = msg.data or {}
-        file_path: str | None = data.get("file_path") or data.get("image_path")
+        raw = msg.data or {}
+        chat_id = raw.get("chat_id") or msg.user_id
+        file_path: str | None = raw.get("file_path") or raw.get("image_path")
+
         if file_path:
-            try:
-                media_type = _detect_media_type(file_path)
-                media_id = await self._agent.upload_media(file_path, media_type)
-                await self._agent.send_media(msg.user_id, media_id, media_type)
-            except Exception:
-                log.exception("wecom: failed to send file %s", file_path)
+            await self._send_file(chat_id, file_path)
+            return
+
+        # Send text as markdown via proactive send
+        try:
+            await self._client.send_message(chat_id, {
+                "msgtype": "markdown",
+                "markdown": {"content": msg.text},
+            })
+        except Exception:
+            log.exception("wecom: failed to send text to %s", chat_id)
+
+    async def _send_file(self, chat_id: str, file_path: str) -> None:
+        """Upload and send a file/image."""
+        if not self._client:
             return
 
         try:
-            await self._agent.send_text(msg.user_id, msg.text)
+            p = Path(file_path)
+            if not p.exists():
+                log.error("wecom: file not found: %s", file_path)
+                return
+
+            media_type = _detect_media_type(file_path)
+            file_data = p.read_bytes()
+
+            upload_result = await self._client.upload_media(
+                file_data,
+                type=media_type,  # type: ignore[arg-type]
+                filename=p.name,
+            )
+            media_id = upload_result["media_id"]
+
+            await self._client.send_media_message(
+                chat_id,
+                media_type=media_type,  # type: ignore[arg-type]
+                media_id=media_id,
+            )
         except Exception:
-            log.exception("wecom: failed to send text to %s", msg.user_id)
+            log.exception("wecom: failed to send file %s to %s", file_path, chat_id)

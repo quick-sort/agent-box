@@ -20,14 +20,9 @@ class Settings(BaseSettings):
     qqbot_app_id: str = ""
     qqbot_client_secret: str = ""
 
-    # WeCom (企业微信) Bot Webhook channel
-    wecom_token: str = ""
-    wecom_encoding_aes_key: str = ""  # 43-char Base64
-    wecom_corp_id: str = ""
-    wecom_corp_secret: str = ""
-    wecom_agent_id: int = 0
-    wecom_webhook_port: int = 8088
-    wecom_webhook_path: str = "/wecom"
+    # WeCom (企业微信) Bot WebSocket channel (long connection mode)
+    wecom_bot_id: str = ""
+    wecom_secret: str = ""
 
     # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
     glm_api_key: str = ""

@@ -410,6 +410,12 @@ class ClaudeCodeAgent(BaseAgent):
         )
         if self.project.session_id:
             opts.resume = self.project.session_id
+        # Conditionally add wecom_mcp tool when WeCom channel is active
+        from ..tools.wecom_mcp import is_wecom_mcp_enabled
+        if is_wecom_mcp_enabled():
+            from ..tools.wecom_mcp import create_wecom_mcp_server
+            opts.mcp_servers = {"wecom_mcp": create_wecom_mcp_server()}
+            opts.allowed_tools = ["wecom_mcp"]
         return opts
 
     async def _ensure_client(self) -> ClaudeSDKClient:
