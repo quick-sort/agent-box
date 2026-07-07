@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     qqbot_app_id: str = ""
     qqbot_client_secret: str = ""
 
+    # WeCom (企业微信) Bot WebSocket channel (long connection mode)
+    wecom_bot_id: str = ""
+    wecom_secret: str = ""
+
     # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
     glm_api_key: str = ""
     glm_asr_model: str = "glm-asr-2512"
