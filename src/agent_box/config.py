@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     wecom_bot_id: str = ""
     wecom_secret: str = ""
 
+    # Odoo Discuss / Live Chat channel (see docs/odoo_channel_design.md)
+    odoo_url: str = ""       # e.g. https://your-odoo.example.com (no trailing slash)
+    odoo_db: str = ""
+    odoo_login: str = ""
+    odoo_password: str = ""
+    odoo_channel_id: int = 0  # discuss.channel id to bridge
+
     # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
     glm_api_key: str = ""
     glm_asr_model: str = "glm-asr-2512"

@@ -710,3 +710,150 @@ async def test_qqchannel_asr_enabled_when_key_set():
         mock_settings.glm_asr_model = "glm-asr-2512"
         channel = QQChannel(send)
     assert isinstance(channel._asr, GlmASR)
+
+
+# ── OdooChannel ──
+
+
+def _make_odoo_channel(send_stream=None):
+    from agent_box.channels.odoo import OdooChannel
+
+    if send_stream is None:
+        send_stream, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.odoo.settings") as mock_settings:
+        mock_settings.odoo_url = "https://odoo.example.com"
+        mock_settings.odoo_db = "mydb"
+        mock_settings.odoo_login = "bot@example.com"
+        mock_settings.odoo_password = "secret"
+        mock_settings.odoo_channel_id = 42
+        channel = OdooChannel(send_stream)
+    return channel
+
+
+def test_html_to_text_strips_tags_and_entities():
+    from agent_box.channels.odoo import _html_to_text
+
+    assert _html_to_text("<p>Hello&nbsp;<b>world</b></p>") == "Hello world"
+    assert _html_to_text(False) == ""
+    assert _html_to_text(None) == ""
+    assert _html_to_text("") == ""
+
+
+@pytest.mark.anyio
+async def test_odoo_login_session_sets_self_partner_id():
+    channel = _make_odoo_channel()
+
+    async def fake_call(route, params):
+        assert route == "/web/session/authenticate"
+        assert params == {"db": "mydb", "login": "bot@example.com", "password": "secret"}
+        return {"uid": 5, "partner_id": 7}
+
+    channel._call = fake_call
+    await channel._login_session()
+
+    assert channel._self_partner_id == 7
+
+
+@pytest.mark.anyio
+async def test_odoo_login_session_raises_on_failure():
+    channel = _make_odoo_channel()
+
+    async def fake_call(route, params):
+        return {"uid": None}
+
+    channel._call = fake_call
+    with pytest.raises(RuntimeError):
+        await channel._login_session()
+
+
+@pytest.mark.anyio
+async def test_odoo_handle_notification_emits_incoming_message():
+    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = _make_odoo_channel(send)
+    channel._self_partner_id = 99  # "our" account, should be filtered out
+
+    notif = {
+        "type": "discuss.channel/new_message",
+        "payload": {
+            "data": {
+                "mail.message": [
+                    {"id": 1, "author_id": 7, "body": "<p>Hello there</p>"},
+                    {"id": 2, "author_id": 99, "body": "<p>our own echo</p>"},
+                ]
+            }
+        },
+    }
+    await channel._handle_notification(notif)
+
+    msg = recv.receive_nowait()
+    assert msg.text == "Hello there"
+    assert msg.user_id == "7"
+    assert msg.channel == "odoo"
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_odoo_handle_notification_ignores_other_types():
+    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = _make_odoo_channel(send)
+
+    await channel._handle_notification({"type": "bus.presence", "payload": {}})
+
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_odoo_send_reply_posts_message():
+    channel = _make_odoo_channel()
+
+    calls = []
+
+    async def fake_call(route, params):
+        calls.append((route, params))
+        return {}
+
+    channel._client = MagicMock()  # just needs to be non-None
+    channel._call = fake_call
+
+    await channel.send_reply(OutgoingMessage(text="hello back", user_id="7"))
+
+    assert len(calls) == 1
+    route, params = calls[0]
+    assert route == "/mail/message/post"
+    assert params["thread_model"] == "discuss.channel"
+    assert params["thread_id"] == 42
+    assert params["post_data"] == {"body": "hello back", "message_type": "comment"}
+
+
+@pytest.mark.anyio
+async def test_odoo_send_reply_skips_non_text_messages():
+    from agent_box.models import MessageType
+
+    channel = _make_odoo_channel()
+    channel._client = MagicMock()
+    channel._call = AsyncMock()
+
+    await channel.send_reply(OutgoingMessage(text="x", user_id="7", type=MessageType.result))
+
+    channel._call.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_odoo_start_noop_when_not_configured():
+    """start() should warn and return immediately when required settings are missing."""
+    from agent_box.channels.odoo import OdooChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.odoo.settings") as mock_settings:
+        mock_settings.odoo_url = ""
+        mock_settings.odoo_db = ""
+        mock_settings.odoo_login = ""
+        mock_settings.odoo_password = ""
+        mock_settings.odoo_channel_id = 0
+        channel = OdooChannel(send)
+
+    # Should return without ever creating an httpx client.
+    await channel.start()
+    assert channel._client is None

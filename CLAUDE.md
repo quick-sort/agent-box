@@ -47,6 +47,8 @@ src/agent_box/
 │   ├── base.py          # BaseChannel ABC
 │   ├── weixin.py        # WeixinChannel (long-poll)
 │   ├── qq.py            # QQChannel (WebSocket gateway, image send/recv)
+│   ├── wecom.py         # WecomChannel (WebSocket long connection)
+│   ├── odoo.py          # OdooChannel (Odoo Discuss/Live Chat, long-poll via JSON-RPC)
 │   └── tui.py           # TuiChannel (terminal REPL)
 ├── router/
 │   ├── base.py          # BaseRouter ABC, RouteResult
@@ -72,6 +74,8 @@ src/agent_box/
 - `QQBOT_CLIENT_SECRET` — QQ Bot client secret
 - `GLM_API_KEY` — ZhipuAI (GLM) API key for voice-to-text (fallback). QQ voice messages prefer the platform-provided `asr_refer_text`; this key is used only when that field is absent.
 - `GLM_ASR_MODEL` — GLM ASR model id (default: `glm-asr-2512`)
+- `ODOO_URL`, `ODOO_DB`, `ODOO_LOGIN`, `ODOO_PASSWORD` — Odoo instance + account credentials for the Odoo Discuss/Live Chat channel (see `docs/odoo_channel_design.md`)
+- `ODOO_CHANNEL_ID` — id of the `discuss.channel` (Discuss chat/channel or Live Chat session) to bridge
 - `PROJECTS_DIR` — where project folders live (default: `data/projects`)
 - `ROUTER_MODEL` — model override for router (optional)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
@@ -88,6 +92,9 @@ uv run agent-box
 
 # QQ Bot channel mode
 uv run agent-box --qq
+
+# Odoo Discuss/Live Chat channel mode
+uv run agent-box --odoo
 
 # Run both WeChat and QQ simultaneously
 uv run agent-box --qq --weixin
