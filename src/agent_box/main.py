@@ -122,6 +122,9 @@ class App:
         elif spec.type == "wecom":
             from .channels.wecom import WecomChannel
             return WecomChannel(send_in, spec=spec)
+        elif spec.type == "odoo":
+            from .channels.odoo import OdooChannel
+            return OdooChannel(send_in)
         else:
             from .channels.weixin import WeixinChannel
             return WeixinChannel(send_in)
@@ -464,6 +467,7 @@ Channel options (at least one required, defaults to --weixin):
   --weixin          Enable WeChat (微信) channel
   --wecom           Enable WeCom (企业微信) WebSocket channel
   --qq              Enable QQ Bot channel
+  --odoo            Enable Odoo Discuss/Live Chat channel
   --tui             Enable terminal UI channel (for local testing)
 
 Multiple channels can be enabled simultaneously:
@@ -478,6 +482,8 @@ Environment variables (see sample.env):
   WECOM_BOT_ID, WECOM_SECRET         Legacy single-bot credentials (fallback)
   QQBOT_APP_ID, QQBOT_CLIENT_SECRET  QQ bot credentials
   WEIXIN_ACCOUNT_ID                  WeChat account ID
+  ODOO_URL, ODOO_DB, ODOO_LOGIN,
+  ODOO_API_KEY, ODOO_CHANNEL_ID      Odoo Discuss/Live Chat credentials
   ANTHROPIC_AUTH_TOKEN                Anthropic API key
 """)
         return
@@ -490,7 +496,7 @@ Environment variables (see sample.env):
             pass
         return
 
-    # Parse channel flags: --qq --weixin --tui --wecom
+    # Parse channel flags: --qq --weixin --tui --wecom --odoo
     enabled: set[str] = set()
     if "--qq" in sys.argv:
         enabled.add("qq")
@@ -498,6 +504,8 @@ Environment variables (see sample.env):
         enabled.add("tui")
     if "--wecom" in sys.argv:
         enabled.add("wecom")
+    if "--odoo" in sys.argv:
+        enabled.add("odoo")
     if "--weixin" in sys.argv or not enabled:
         enabled.add("weixin")
 
@@ -513,6 +521,8 @@ Environment variables (see sample.env):
         specs.append(ChannelSpec(type="tui", instance_id="tui"))
     if "weixin" in enabled:
         specs.append(ChannelSpec(type="weixin", instance_id="weixin"))
+    if "odoo" in enabled:
+        specs.append(ChannelSpec(type="odoo", instance_id="odoo"))
 
     _setup_logging(",".join(s.instance_id for s in specs))
     app = App()
