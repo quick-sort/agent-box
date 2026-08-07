@@ -28,7 +28,21 @@ from .base import BaseChannel
 log = logging.getLogger(__name__)
 
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
-_AUDIO_EXTS = frozenset({".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".amr"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".mpeg", ".mpg"})
+# 企微语音消息仅支持 AMR；其他音频格式只能作为普通文件发送。
+_VOICE_EXTS = frozenset({".amr"})
+
+# 企微出站媒体大小限制
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+_VIDEO_MAX_BYTES = 10 * 1024 * 1024
+_VOICE_MAX_BYTES = 2 * 1024 * 1024
+_ABSOLUTE_MAX_BYTES = 20 * 1024 * 1024
+
+_TYPE_MAX_BYTES = {
+    "image": _IMAGE_MAX_BYTES,
+    "video": _VIDEO_MAX_BYTES,
+    "voice": _VOICE_MAX_BYTES,
+}
 
 _MEDIA_LABELS = {"image": "图片", "voice": "语音", "video": "视频", "file": "文件"}
 
@@ -91,12 +105,41 @@ def _safe_filename(raw_name: str | None, buffer: bytes, kind: str) -> str:
 
 
 def _detect_media_type(file_path: str) -> str:
+    """Map a local file to the WeCom outbound media type.
+
+    WeCom supports ``image`` / ``voice`` / ``video`` / ``file``. Voice is
+    AMR-only, so every other audio format falls back to ``file``.
+    """
     ext = Path(file_path).suffix.lower()
     if ext in _IMAGE_EXTS:
         return "image"
-    if ext in _AUDIO_EXTS:
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _VOICE_EXTS:
         return "voice"
     return "file"
+
+
+def _apply_size_limits(media_type: str, size: int) -> tuple[str | None, str | None]:
+    """Apply WeCom's per-type size caps.
+
+    Returns ``(final_type, note)``. ``final_type`` is None when the file is
+    too large to send at all; ``note`` describes a downgrade or rejection.
+    """
+    size_mb = size / (1024 * 1024)
+    if size > _ABSOLUTE_MAX_BYTES:
+        return None, (
+            f"文件大小 {size_mb:.2f}MB 超过企业微信允许的最大限制 20MB，无法发送。"
+        )
+
+    limit = _TYPE_MAX_BYTES.get(media_type)
+    if limit is not None and size > limit:
+        label = _MEDIA_LABELS.get(media_type, media_type)
+        return "file", (
+            f"{label}大小 {size_mb:.2f}MB 超过 {limit // (1024 * 1024)}MB 限制，已转为文件格式发送"
+        )
+
+    return media_type, None
 
 
 # ── Message parsing helpers ──────────────────────────────────────────────────
@@ -360,27 +403,45 @@ class WecomChannel(BaseChannel):
             return
 
         # Send text as markdown via proactive send
+        await self._send_text(chat_id, msg.text)
+
+    async def _send_text(self, chat_id: str, text: str) -> None:
+        """Send a markdown text message."""
+        if not self._client:
+            return
         try:
             await self._client.send_message(chat_id, {
                 "msgtype": "markdown",
-                "markdown": {"content": msg.text},
+                "markdown": {"content": text},
             })
         except Exception:
             log.exception("wecom: failed to send text to %s", chat_id)
 
     async def _send_file(self, chat_id: str, file_path: str) -> None:
-        """Upload and send a file/image."""
+        """Upload and send a local file as image / voice / video / file."""
         if not self._client:
             return
 
         try:
             p = Path(file_path)
-            if not p.exists():
+            if not p.is_file():
                 log.error("wecom: file not found: %s", file_path)
                 return
 
-            media_type = _detect_media_type(file_path)
             file_data = p.read_bytes()
+            if not file_data:
+                log.error("wecom: refusing to send empty file: %s", file_path)
+                return
+
+            detected = _detect_media_type(file_path)
+            media_type, note = _apply_size_limits(detected, len(file_data))
+
+            if media_type is None:
+                log.error("wecom: %s (%s)", note, file_path)
+                await self._send_text(chat_id, f"⚠️ {note}")
+                return
+            if note:
+                log.warning("wecom: %s (%s)", note, file_path)
 
             upload_result = await self._client.upload_media(
                 file_data,
@@ -389,10 +450,20 @@ class WecomChannel(BaseChannel):
             )
             media_id = upload_result["media_id"]
 
+            send_kwargs: dict[str, Any] = {}
+            if media_type == "video":
+                # 视频消息支持标题，缺省时企微只显示一个无名视频卡片。
+                send_kwargs["video_title"] = p.stem
+
             await self._client.send_media_message(
                 chat_id,
                 media_type=media_type,  # type: ignore[arg-type]
                 media_id=media_id,
+                **send_kwargs,
+            )
+            log.info(
+                "wecom: media sent: type=%s size=%d name=%s chat=%s",
+                media_type, len(file_data), p.name, chat_id,
             )
         except Exception:
             log.exception("wecom: failed to send file %s to %s", file_path, chat_id)
