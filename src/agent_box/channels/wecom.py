@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import mimetypes
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from anyio.abc import ObjectSendStream
 
@@ -28,36 +28,147 @@ from .base import BaseChannel
 log = logging.getLogger(__name__)
 
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
-_AUDIO_EXTS = frozenset({".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".amr"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".mpeg", ".mpg"})
+# 企微语音消息仅支持 AMR；其他音频格式只能作为普通文件发送。
+_VOICE_EXTS = frozenset({".amr"})
+
+# 企微出站媒体大小限制
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+_VIDEO_MAX_BYTES = 10 * 1024 * 1024
+_VOICE_MAX_BYTES = 2 * 1024 * 1024
+_ABSOLUTE_MAX_BYTES = 20 * 1024 * 1024
+
+_TYPE_MAX_BYTES = {
+    "image": _IMAGE_MAX_BYTES,
+    "video": _VIDEO_MAX_BYTES,
+    "voice": _VOICE_MAX_BYTES,
+}
+
+_MEDIA_LABELS = {"image": "图片", "voice": "语音", "video": "视频", "file": "文件"}
+
+# Download timeouts (seconds) — files can be much larger than images.
+_IMAGE_DOWNLOAD_TIMEOUT = 60.0
+_FILE_DOWNLOAD_TIMEOUT = 180.0
+
+# Magic-byte sniffing for the fallback filename when the server sends no
+# Content-Disposition header.
+_MAGIC_EXTS: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"%PDF-", ".pdf"),
+    (b"PK\x03\x04", ".zip"),  # also docx/xlsx/pptx
+    (b"\xd0\xcf\x11\xe0", ".doc"),  # legacy OLE2: doc/xls/ppt
+    (b"\x1f\x8b", ".gz"),
+    (b"Rar!\x1a\x07", ".rar"),
+    (b"7z\xbc\xaf\x27\x1c", ".7z"),
+    (b"ID3", ".mp3"),
+    (b"#!AMR", ".amr"),
+    (b"\x23\x21SILK", ".silk"),
+)
+
+_UNSAFE_NAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+_DEFAULT_EXT_BY_KIND = {"image": ".jpg", "voice": ".amr", "video": ".mp4", "file": ".bin"}
+
+
+class MediaRef(NamedTuple):
+    """A downloadable media attachment referenced by an inbound message."""
+
+    url: str
+    aes_key: str | None
+    kind: str  # "image" | "file" | "video" | "voice"
+
+
+def _sniff_ext(buffer: bytes, kind: str) -> str:
+    for magic, ext in _MAGIC_EXTS:
+        if buffer.startswith(magic):
+            return ext
+    if buffer[4:12] in (b"ftypmp42", b"ftypisom") or buffer[4:8] == b"ftyp":
+        return ".mp4"
+    if buffer.startswith(b"RIFF") and buffer[8:12] == b"WEBP":
+        return ".webp"
+    if buffer.startswith(b"RIFF") and buffer[8:12] == b"WAVE":
+        return ".wav"
+    return _DEFAULT_EXT_BY_KIND.get(kind, ".bin")
+
+
+def _safe_filename(raw_name: str | None, buffer: bytes, kind: str) -> str:
+    """Build a filesystem-safe filename, sniffing the extension if needed."""
+    name = _UNSAFE_NAME_RE.sub("_", Path(raw_name or "").name).strip(" .")
+    if not name:
+        name = f"media_{generate_req_id('dl')}"
+    if not Path(name).suffix:
+        name += _sniff_ext(buffer, kind)
+    return name
 
 
 def _detect_media_type(file_path: str) -> str:
+    """Map a local file to the WeCom outbound media type.
+
+    WeCom supports ``image`` / ``voice`` / ``video`` / ``file``. Voice is
+    AMR-only, so every other audio format falls back to ``file``.
+    """
     ext = Path(file_path).suffix.lower()
     if ext in _IMAGE_EXTS:
         return "image"
-    if ext in _AUDIO_EXTS:
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _VOICE_EXTS:
         return "voice"
     return "file"
 
 
+def _apply_size_limits(media_type: str, size: int) -> tuple[str | None, str | None]:
+    """Apply WeCom's per-type size caps.
+
+    Returns ``(final_type, note)``. ``final_type`` is None when the file is
+    too large to send at all; ``note`` describes a downgrade or rejection.
+    """
+    size_mb = size / (1024 * 1024)
+    if size > _ABSOLUTE_MAX_BYTES:
+        return None, (
+            f"文件大小 {size_mb:.2f}MB 超过企业微信允许的最大限制 20MB，无法发送。"
+        )
+
+    limit = _TYPE_MAX_BYTES.get(media_type)
+    if limit is not None and size > limit:
+        label = _MEDIA_LABELS.get(media_type, media_type)
+        return "file", (
+            f"{label}大小 {size_mb:.2f}MB 超过 {limit // (1024 * 1024)}MB 限制，已转为文件格式发送"
+        )
+
+    return media_type, None
+
+
 # ── Message parsing helpers ──────────────────────────────────────────────────
 
-def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[str]]:
-    """Parse WeCom message body into (text, image_urls).
+def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[MediaRef]]:
+    """Parse a WeCom message body into (text, media refs to download).
 
-    Returns extracted text and list of image URLs that need to be downloaded.
+    Covers text, voice (already transcribed by WeCom), image, file, video,
+    图文混排 (``mixed``) and quoted (``quote``) messages.
     """
     msgtype = body.get("msgtype", "")
     text_parts: list[str] = []
-    image_urls: list[str] = []
+    media: list[MediaRef] = []
+
+    def add_media(payload: Any, kind: str) -> None:
+        if not isinstance(payload, dict):
+            return
+        url = payload.get("url")
+        if url:
+            media.append(MediaRef(url, payload.get("aeskey"), kind))
 
     if msgtype == "mixed" and body.get("mixed"):
         # 图文混排消息
         for item in body["mixed"].get("msg_item", []):
-            if item.get("msgtype") == "text" and item.get("text", {}).get("content"):
+            item_type = item.get("msgtype")
+            if item_type == "text" and item.get("text", {}).get("content"):
                 text_parts.append(item["text"]["content"])
-            elif item.get("msgtype") == "image" and item.get("image", {}).get("url"):
-                image_urls.append(item["image"]["url"])
+            elif item_type == "image":
+                add_media(item.get("image"), "image")
     else:
         # 单条消息
         if body.get("text", {}).get("content"):
@@ -65,29 +176,37 @@ def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[str]]:
         if msgtype == "voice" and body.get("voice", {}).get("content"):
             # 语音转文字
             text_parts.append(body["voice"]["content"])
-        if body.get("image", {}).get("url"):
-            image_urls.append(body["image"]["url"])
+        add_media(body.get("image"), "image")
+        if msgtype == "file":
+            add_media(body.get("file"), "file")
+        if msgtype == "video":
+            add_media(body.get("video"), "video")
 
     # 处理引用消息
     quote = body.get("quote")
     if quote:
-        if quote.get("msgtype") == "text" and quote.get("text", {}).get("content"):
+        quote_type = quote.get("msgtype")
+        if quote_type == "text" and quote.get("text", {}).get("content"):
             if not text_parts:
                 text_parts.append(quote["text"]["content"])
-        elif quote.get("msgtype") == "voice" and quote.get("voice", {}).get("content"):
+        elif quote_type == "voice" and quote.get("voice", {}).get("content"):
             if not text_parts:
                 text_parts.append(quote["voice"]["content"])
-        elif quote.get("msgtype") == "image" and quote.get("image", {}).get("url"):
-            image_urls.append(quote["image"]["url"])
+        elif quote_type == "image":
+            add_media(quote.get("image"), "image")
+        elif quote_type == "file":
+            add_media(quote.get("file"), "file")
+        elif quote_type == "video":
+            add_media(quote.get("video"), "video")
 
     text = "\n".join(text_parts).strip()
 
     # 对于纯媒体消息（无文本），生成描述
-    if not text and (image_urls or msgtype in ("file", "video")):
-        label = {"image": "图片", "voice": "语音", "video": "视频", "file": "文件"}.get(msgtype, "文件")
+    if not text and media:
+        label = _MEDIA_LABELS.get(media[0].kind, "文件")
         text = f"[用户发送了{label}]"
 
-    return text, image_urls
+    return text, media
 
 
 # ── WecomChannel ─────────────────────────────────────────────────────────────
@@ -177,20 +296,27 @@ class WecomChannel(BaseChannel):
         if not from_user:
             return
 
-        text, image_urls = _parse_message_body(body)
+        text, media = _parse_message_body(body)
 
-        # Download images to local files
-        if image_urls:
-            for url in image_urls:
-                aes_key = body.get("image", {}).get("aeskey")
-                local_path = await self._download_media(url, aes_key)
-                if local_path:
-                    text += f"\n文件路径: {local_path}"
+        # Download attachments (image/file/video) to local files so the agent
+        # can read them by path.
+        local_paths: list[str] = []
+        for ref in media:
+            label = _MEDIA_LABELS.get(ref.kind, "文件")
+            local_path = await self._download_media(ref)
+            if local_path:
+                local_paths.append(local_path)
+                text += f"\n用户发送了一个{label}，文件路径: {local_path}"
+            else:
+                text += f"\n用户发送了一个{label}，但下载失败"
 
         if not text:
             return
 
-        log.debug("wecom: inbound from %s: %s", from_user, text[:80])
+        log.info(
+            "wecom: inbound from %s: msgtype=%s media=%d text_preview=%r",
+            from_user, msgtype, len(media), text[:80],
+        )
         await self.send_stream.send(
             IncomingMessage(
                 text=text,
@@ -200,6 +326,7 @@ class WecomChannel(BaseChannel):
                     "frame": frame,
                     "chat_id": chat_id,
                     "chat_type": body.get("chattype", "single"),
+                    "file_paths": local_paths,
                 },
             )
         )
@@ -215,30 +342,47 @@ class WecomChannel(BaseChannel):
 
     # ── Media download ────────────────────────────────────────────────
 
-    async def _download_media(self, url: str, aes_key: str | None = None) -> str | None:
-        """Download and optionally decrypt a media file."""
+    async def _download_media(self, ref: MediaRef) -> str | None:
+        """Download (and decrypt) one attachment; return the local path."""
         if not self._client:
+            log.warning("wecom: cannot download media, client not ready")
             return None
+
+        timeout = _IMAGE_DOWNLOAD_TIMEOUT if ref.kind == "image" else _FILE_DOWNLOAD_TIMEOUT
+        if not ref.aes_key:
+            log.warning("wecom: no aeskey for %s media, data may stay encrypted", ref.kind)
+
         try:
-            result = await self._client.download_file(url, aes_key)
-            buffer: bytes = result["buffer"]
-            filename: str | None = result.get("filename")
-
-            if not filename:
-                # Guess extension from content
-                import magic  # noqa: F401 - optional
-                ext = ".bin"
-                filename = f"media_{generate_req_id('dl')}{ext}"
-
-            dest = self._download_dir / filename
-            dest.write_bytes(buffer)
-            return str(dest)
-        except ImportError:
-            # No python-magic, use a generic extension
-            pass
+            result = await asyncio.wait_for(
+                self._client.download_file(ref.url, ref.aes_key), timeout
+            )
+        except TimeoutError:
+            log.error("wecom: media download timed out after %.0fs: %s", timeout, ref.url)
+            return None
         except Exception:
-            log.exception("wecom: failed to download media from %s", url)
-        return None
+            log.exception("wecom: failed to download media from %s", ref.url)
+            return None
+
+        buffer: bytes = result.get("buffer") or b""
+        if not buffer:
+            log.error("wecom: media download returned empty body: %s", ref.url)
+            return None
+
+        filename = _safe_filename(result.get("filename"), buffer, ref.kind)
+        dest = self._download_dir / filename
+        if dest.exists():
+            dest = self._download_dir / f"{Path(filename).stem}_{generate_req_id('dl')}{Path(filename).suffix}"
+
+        try:
+            dest.write_bytes(buffer)
+        except OSError:
+            log.exception("wecom: failed to write media to %s", dest)
+            return None
+
+        log.info(
+            "wecom: media saved: kind=%s size=%d path=%s", ref.kind, len(buffer), dest
+        )
+        return str(dest)
 
     # ── Outbound reply ────────────────────────────────────────────────
 
@@ -259,27 +403,45 @@ class WecomChannel(BaseChannel):
             return
 
         # Send text as markdown via proactive send
+        await self._send_text(chat_id, msg.text)
+
+    async def _send_text(self, chat_id: str, text: str) -> None:
+        """Send a markdown text message."""
+        if not self._client:
+            return
         try:
             await self._client.send_message(chat_id, {
                 "msgtype": "markdown",
-                "markdown": {"content": msg.text},
+                "markdown": {"content": text},
             })
         except Exception:
             log.exception("wecom: failed to send text to %s", chat_id)
 
     async def _send_file(self, chat_id: str, file_path: str) -> None:
-        """Upload and send a file/image."""
+        """Upload and send a local file as image / voice / video / file."""
         if not self._client:
             return
 
         try:
             p = Path(file_path)
-            if not p.exists():
+            if not p.is_file():
                 log.error("wecom: file not found: %s", file_path)
                 return
 
-            media_type = _detect_media_type(file_path)
             file_data = p.read_bytes()
+            if not file_data:
+                log.error("wecom: refusing to send empty file: %s", file_path)
+                return
+
+            detected = _detect_media_type(file_path)
+            media_type, note = _apply_size_limits(detected, len(file_data))
+
+            if media_type is None:
+                log.error("wecom: %s (%s)", note, file_path)
+                await self._send_text(chat_id, f"⚠️ {note}")
+                return
+            if note:
+                log.warning("wecom: %s (%s)", note, file_path)
 
             upload_result = await self._client.upload_media(
                 file_data,
@@ -288,10 +450,20 @@ class WecomChannel(BaseChannel):
             )
             media_id = upload_result["media_id"]
 
+            send_kwargs: dict[str, Any] = {}
+            if media_type == "video":
+                # 视频消息支持标题，缺省时企微只显示一个无名视频卡片。
+                send_kwargs["video_title"] = p.stem
+
             await self._client.send_media_message(
                 chat_id,
                 media_type=media_type,  # type: ignore[arg-type]
                 media_id=media_id,
+                **send_kwargs,
+            )
+            log.info(
+                "wecom: media sent: type=%s size=%d name=%s chat=%s",
+                media_type, len(file_data), p.name, chat_id,
             )
         except Exception:
             log.exception("wecom: failed to send file %s to %s", file_path, chat_id)

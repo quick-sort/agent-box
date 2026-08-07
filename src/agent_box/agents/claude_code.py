@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import re
+from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -392,8 +395,22 @@ class ClaudeCodeAgent(BaseAgent):
         # the next ``run()`` call resolves the future with the user's reply,
         # unblocking the callback so it can return the PermissionResult.
         self._pending_permission: dict[str, Any] | None = None
+        # Recent claude CLI stderr lines — the SDK's ProcessError only carries
+        # an exit code, so this is the only place the failure reason shows up.
+        self._stderr_tail: deque[str] = deque(maxlen=50)
 
-    def _build_options(self) -> ClaudeAgentOptions:
+    def _on_stderr(self, line: str) -> None:
+        """Log a claude CLI stderr line and keep it for failure diagnosis.
+
+        ``ProcessError`` raised by the SDK carries only the exit code
+        ("Check stderr output for details"), so the reason a connect failed
+        is only available here.
+        """
+        line = line.rstrip()
+        self._stderr_tail.append(line)
+        log.warning("claude stderr [%s]: %s", self.project.name, line)
+
+    def _build_options(self, *, resume: bool = True) -> ClaudeAgentOptions:
         opts = ClaudeAgentOptions(
             cwd=self.project.path,
             permission_mode=settings.agent_permission_mode,
@@ -406,9 +423,9 @@ class ClaudeCodeAgent(BaseAgent):
                 "append": _SEND_FILE_INSTRUCTION,
             },
             can_use_tool=self._can_use_tool,
-            stderr=lambda line: log.warning("claude stderr [%s]: %s", self.project.name, line.rstrip()),
+            stderr=self._on_stderr,
         )
-        if self.project.session_id:
+        if resume and self.project.session_id:
             opts.resume = self.project.session_id
         # Conditionally add wecom_mcp tool when WeCom channel is active
         from ..tools.wecom_mcp import is_wecom_mcp_enabled
@@ -419,11 +436,43 @@ class ClaudeCodeAgent(BaseAgent):
         return opts
 
     async def _ensure_client(self) -> ClaudeSDKClient:
-        if self._client is None:
-            self._client = ClaudeSDKClient(self._build_options())
-            await self._client.connect()
-            log.info("agent connected for project %s", self.project.name)
+        if self._client is not None:
+            return self._client
+
+        stale_session = self.project.session_id or ""
+        self._stderr_tail.clear()
+        client = ClaudeSDKClient(self._build_options())
+        try:
+            await client.connect()
+        except Exception as exc:
+            # A session id can go stale — history pruned, or the id was
+            # persisted in a different environment (container, other host)
+            # whose ~/.claude session store this machine doesn't have. The
+            # CLI then exits non-zero with "No conversation found with
+            # session ID: ..." and every message fails. Drop the id and
+            # start a fresh session instead of staying permanently broken.
+            if not (stale_session and self._is_stale_session_failure()):
+                raise
+            log.warning(
+                "resume failed for project %s — session %s not found, "
+                "starting a fresh session (%s)",
+                self.project.name, stale_session, exc,
+            )
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            self.project.session_id = ""
+            self._stderr_tail.clear()
+            client = ClaudeSDKClient(self._build_options(resume=False))
+            await client.connect()
+
+        self._client = client
+        log.info("agent connected for project %s", self.project.name)
         return self._client
+
+    def _is_stale_session_failure(self) -> bool:
+        """True when the captured stderr says the resumed session is gone."""
+        blob = " ".join(self._stderr_tail).lower()
+        return "no conversation found" in blob
 
     # ------------------------------------------------------------------
     # AskUserQuestion helpers
