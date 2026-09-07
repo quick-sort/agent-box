@@ -10,7 +10,7 @@
 - **实时进度** — 工具执行状态（读文件、写代码、运行命令）实时反馈到聊天窗口
 - **容器隔离运行** — Agent 在 Docker 容器内执行，文件系统与宿主机隔离，安全可控
 - **自然语言路由** — 无需斜杠命令，直接说"切换到 demo 项目"即可，中英文均支持
-- **可扩展** — Channel（WeChat、QQ…）和 Agent 后端（Claude Code、Codex…）均可独立插拔
+- **可扩展** — Channel（WeChat、QQ…）和 Agent 后端（Claude Code、Kiro、其它 ACP Agent）均可独立插拔
 
 ## 使用
 
@@ -27,8 +27,22 @@ Bot：（Claude Code 执行，返回结果）
 Bot：📌 Pinned to project: demo
 
 你：继续上次的任务
-Bot：（demo 项目的 Claude Code 恢复上次会话，继续执行）
+Bot：（demo 项目的 Agent 恢复上次会话，继续执行）
+
+你：用 Kiro 新建一个项目叫 acp-demo
+Bot：✅ Created project: acp-demo (agent: kiro)
 ```
+
+### Agent 后端
+
+- `claude_code`（默认）— 通过 `claude-agent-sdk` 运行持久 Claude Code 会话。
+- `kiro` — 通过通用 ACP driver 启动持久的 `kiro-cli acp` 进程。ACP 负责结构化文本、工具进度、权限请求和会话事件；以后接入其它 ACP-compatible CLI 时只需增加 provider 描述。
+
+新项目默认使用 `DEFAULT_AGENT`，也可直接说“用 Kiro 新建项目 foo”。已有项目继续使用 `projects.json` 中保存的 `agent_type`。
+
+Kiro 需要安装 `kiro-cli` 并完成登录；无浏览器或容器环境可设置 `KIRO_API_KEY`。安装和 API key 说明见 [Kiro CLI headless mode](https://kiro.dev/docs/cli/headless/)。Docker 镜像已包含固定版本的 Kiro CLI。Kiro 只替换项目执行 Agent；项目管理 Router 目前仍使用 Anthropic API，因此仍需配置 Router model 和 Anthropic credential。
+
+> Kiro 会话在 agent-box 运行期间保持完整上下文。driver 会在重启后尝试 ACP `session/load`；若当前 Kiro CLI 无法恢复该会话，则安全地创建新会话，而不是让项目永久不可用。
 
 ### 项目管理命令
 
@@ -42,8 +56,7 @@ Bot：（demo 项目的 Claude Code 恢复上次会话，继续执行）
 
 ### 项目背景
 
-每个项目有独立的 Claude Code 会话，存储在 `~/.claude/projects/<path>/`。
-切换回某个项目时，Agent 自动恢复上次的对话历史——整个编码历史即为隐式背景。
+每个项目有独立的 Agent 实例和会话。Claude Code 会话存储在 `~/.claude/projects/<path>/`；ACP Agent 使用 provider 返回的 session ID，并在 agent-box 进程内保持持久连接。切换项目不会混合上下文。
 
 还可以在 `projects.json` 里给项目添加 `description`，记录项目用途：
 
@@ -84,6 +97,8 @@ uv run agent-box --qq         # QQ Bot 模式
 uv run agent-box --qq --weixin # WeChat + QQ 同时运行
 uv run agent-box --test-router  # 只测试路由，不执行 Agent
 ```
+
+本地使用 Kiro 前确认 `kiro-cli --version` 可用，并通过 `kiro-cli login` 登录，或设置 `KIRO_API_KEY`。然后在 `.env` 中设置 `DEFAULT_AGENT=kiro`，或在创建项目时明确指定 Kiro。
 
 ## WeChat 渠道
 
@@ -135,8 +150,16 @@ uv run agent-box --qq
 | `GH_TOKEN` | GitHub token（供 Agent 使用 `gh` CLI） | — |
 | `CONFIG_DIR` | 配置根目录 | `~/.agent-box` |
 | `WORKSPACE_DIR` | 项目工作区根目录 | `~/.agent-box/workspace` |
-| `AGENT_PERMISSION_MODE` | Claude Code 权限模式 | `bypassPermissions` |
-| `AGENT_MAX_TURNS` | 单次请求最大轮数 | — |
+| `AGENTS` | 启用的 Agent JSON 数组 | `["claude_code","kiro"]` |
+| `DEFAULT_AGENT` | 新项目默认 Agent | `claude_code` |
+| `AGENT_PERMISSION_MODE` | `bypassPermissions` 自动批准工具；其它值经聊天确认 | `bypassPermissions` |
+| `AGENT_MAX_TURNS` | Claude Code 单次请求最大轮数 | — |
+| `KIRO_API_KEY` | Kiro 无头认证 API key | — |
+| `KIRO_CLI_PATH` | Kiro CLI 可执行文件 | `kiro-cli` |
+| `KIRO_ACP_ENGINE` | Kiro ACP engine (`v1`/`v2`/`v3`) | `v2` |
+| `KIRO_AGENT` | 可选 Kiro custom agent 名称 | — |
+| `ACP_STARTUP_TIMEOUT` | ACP 初始化超时（秒） | `30` |
+| `ACP_SHUTDOWN_TIMEOUT` | ACP 关闭超时（秒） | `5` |
 
 路由模型优先读取 `ANTHROPIC_SMALL_FAST_MODEL`，回退到 `ANTHROPIC_DEFAULT_HAIKU_MODEL`，
 两者均未设置时启动失败。
@@ -150,25 +173,25 @@ Agent 执行的模型可通过对话切换：说"切换模型到 claude-sonnet-4
 
 ```
 Channel (WeChat / QQ / TUI) → Router (LLM + tools) → Project Agent → Channel
-                            │                        │
-                            │ tools:                 │ claude-agent-sdk
-                            │  create_project        │ cwd = project folder
-                            │  switch_project        │ continue_conversation=True
-                            │  list_projects         │
-                            │ else: forward to       │
-                            │ pinned project         │
-                            ▼                        ▼
-                    SessionManager              ~/.claude/projects/
-                    .router/projects.json       (session storage)
+                            │                        ├─ ClaudeCodeAgent
+                            │                        │  └─ claude-agent-sdk
+                            │                        └─ KiroAgent
+                            │                           └─ ACPAgent → kiro-cli acp
+                            │
+                            │ project tools
+                            ▼
+                    SessionManager
+                    .router/projects.json
                     .router/current_project
 ```
 
 - 多渠道可同时运行（`--qq --weixin`），回复通过 `OutgoingMessage.channel` 路由回来源渠道
-- 每条消息在独立 anyio task 中处理，多项目可同时执行
-- Router 每次做一次 Anthropic API 调用，暴露三个工具；未调用工具则消息直接转发
+- 每条消息在独立 anyio task 中处理；不同项目并行，同一项目通过 per-project lock 顺序执行，保护持久 Agent 会话
+- Router 负责项目管理；普通消息直接转发到 pinned project 的 Agent backend
+- Agent factory 使用 typed registry；ACP 协议、provider 启动参数和 channel 输出映射彼此分离
 - 项目以 `name` 为主键，默认项目为 `_default`
 - Agent 生成文件时使用 `[SEND_FILE:路径]` 标记，自动发回给用户
-- 工具执行状态（读文件、写代码等）以简短文本实时反馈到聊天窗口
+- 工具执行状态以简短文本实时反馈到聊天窗口
 
 ## 项目结构
 
@@ -187,9 +210,18 @@ src/agent_box/
 │   ├── base.py          # BaseRouter ABC, RouteResult
 │   └── router.py        # Router：Anthropic SDK + 三个工具
 └── agents/
-    ├── base.py          # BaseAgent ABC
+    ├── base.py          # BaseAgent provider-neutral contract
+    ├── delivery.py      # Agent → channel file delivery markers
+    ├── acp.py           # Generic persistent ACP subprocess/session driver
+    ├── kiro.py          # Kiro CLI ACP provider + model discovery
     └── claude_code.py   # ClaudeCodeAgent（claude-agent-sdk）
 ```
+
+### 添加 ACP Agent Provider
+
+1. 在 `src/agent_box/agents/` 创建薄 wrapper，构造 `ACPProvider(name, command, model_flag)` 并继承 `ACPAgent`。
+2. 在 `agents/__init__.py` 的 typed registry 注册 provider；需要时提供异步 model lister。
+3. 不要在 provider 中重复 JSON-RPC、权限、事件流或进程生命周期逻辑；这些由 `ACPAgent` 统一处理。
 
 ## CI/CD
 

@@ -36,11 +36,21 @@ class Settings(BaseSettings):
     def weixin_state_dir(self) -> Path:
         return self.config_dir / "channels" / "weixin"
 
-    # Enabled agents (comma-separated in env: AGENTS=claude_code,opencode)
-    agents: list[str] = ["claude_code"]
+    # Enabled agents. Pydantic settings expects JSON in AGENTS, for example:
+    # AGENTS=["claude_code","kiro"]
+    agents: list[str] = ["claude_code", "kiro"]
     default_agent: str = "claude_code"
     agent_permission_mode: str = "bypassPermissions"
     agent_max_turns: int | None = None
+
+    # Generic ACP driver
+    acp_startup_timeout: float = 30.0
+    acp_shutdown_timeout: float = 5.0
+
+    # Kiro CLI ACP provider
+    kiro_cli_path: str = "kiro-cli"
+    kiro_acp_engine: str = "v2"
+    kiro_agent: str = ""
 
     # Default CLAUDE.md template for new projects
     default_claude_md_path: Path = Path(__file__).resolve().parent.parent.parent / "data" / "default_claude_md"

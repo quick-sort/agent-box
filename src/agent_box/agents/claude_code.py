@@ -32,6 +32,8 @@ from claude_agent_sdk import (
 from ..config import settings
 from ..models import MessageType, OutgoingMessage, ProjectInfo
 from .base import BaseAgent
+from .delivery import SEND_FILE_INSTRUCTION as _SEND_FILE_INSTRUCTION
+from .delivery import parse_send_file_markers as _parse_send_file_markers
 
 log = logging.getLogger(__name__)
 
@@ -49,35 +51,6 @@ _TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # Hint appended to surfaced plans so the user knows how to respond.
 # Reply "Yes" to approve, or "No <feedback>" to send feedback to the agent.
 _PLAN_APPROVAL_HINT = "\n\n— 回复 Yes 批准 / No <修改意见> 退回修改"
-
-# Regex to match [SEND_FILE:/path/to/file] markers in agent text output.
-_SEND_FILE_RE = re.compile(r"\[SEND_FILE:([^\]]+)\]")
-
-# System prompt appended to Claude Code's default prompt, instructing the
-# agent to use [SEND_FILE:path] markers when generating files the user
-# should receive.
-_SEND_FILE_INSTRUCTION = (
-    "When you generate a file that the user should receive (images, charts, "
-    "PDFs, documents), include a marker on its own line:\n"
-    "[SEND_FILE:/absolute/path/to/file]\n"
-    "You can include multiple markers for multiple files. The markers will be "
-    "automatically removed from your response and the files will be sent to "
-    "the user. Only use this for files the user explicitly asked for or that "
-    "are final deliverables — not intermediate temporary files."
-)
-
-
-def _parse_send_file_markers(text: str) -> tuple[str, list[str]]:
-    """Extract ``[SEND_FILE:path]`` markers from text.
-
-    Returns ``(cleaned_text, file_paths)``.
-    """
-    paths = _SEND_FILE_RE.findall(text)
-    if not paths:
-        return text, []
-    cleaned = _SEND_FILE_RE.sub("", text).strip()
-    return cleaned, paths
-
 
 def _build_path_prefixes(project_path: str) -> tuple[str, ...]:
     """Collect directory prefixes to strip from file paths in tool summaries.

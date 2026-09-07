@@ -1,6 +1,6 @@
 """Router: classifies incoming messages with the Anthropic SDK + tools.
 
-Three tools are exposed to the model:
+Project-management tools are exposed to the model, including:
   - ``create_project(name)``
   - ``switch_project(name)``
   - ``list_projects()``
@@ -24,6 +24,8 @@ import re
 from anthropic import AsyncAnthropic
 from anthropic.types import ToolUseBlock
 
+from ..agents import get_agent_definition
+from ..config import settings
 from ..models import IncomingMessage
 from ..session_manager import DEFAULT_PROJECT_NAME, SessionManager
 from .base import BaseRouter, RouteResult
@@ -71,6 +73,13 @@ _TOOLS = [
                 "name": {
                     "type": "string",
                     "description": "Short identifier for the new project (no spaces preferred).",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": (
+                        "Optional agent backend. Use 'kiro' when the user explicitly asks "
+                        "for Kiro; otherwise omit it to use the configured default."
+                    ),
                 },
             },
             "required": ["name"],
@@ -145,6 +154,8 @@ MESSAGES THAT ARE PROJECT-MANAGEMENT COMMANDS (call a tool):
     - 'new project foo'
     - 'create a project called foo'
     - 'start a new project foo'
+    - 'create project foo using Kiro' (→ agent='kiro')
+    - '用 Kiro 新建项目 foo' (→ agent='kiro')
     - 'init project foo'
     - '新建一个项目 foo'
     - '创建一个 foo 项目'
@@ -241,7 +252,7 @@ class Router(BaseRouter):
             models = [m.id for m in resp.data]
             log.info("fetched %d available models", len(models))
             return models
-        except Exception:
+        except Exception:  # noqa: BLE001 - external API boundary
             log.warning("failed to fetch available models")
             return []
 
@@ -287,9 +298,10 @@ class Router(BaseRouter):
         inputs = tool_call.input or {}
         name = (inputs.get("name") or "").strip() if isinstance(inputs, dict) else ""
         model = (inputs.get("model") or "").strip() if isinstance(inputs, dict) else ""
+        agent_type = (inputs.get("agent") or "").strip() if isinstance(inputs, dict) else ""
 
         if tool_call.name == "create_project":
-            return self._handle_create(name)
+            return self._handle_create(name, agent_type or None)
         if tool_call.name == "switch_project":
             return self._handle_switch(name)
         if tool_call.name == "list_projects":
@@ -337,14 +349,23 @@ class Router(BaseRouter):
                 return block
         return None
 
-    def _handle_create(self, name: str) -> RouteResult:
+    def _handle_create(self, name: str, agent_type: str | None = None) -> RouteResult:
         if not name:
             return RouteResult(reply="❌ Project name required.")
+        if agent_type:
+            try:
+                get_agent_definition(agent_type)
+            except ValueError:
+                return RouteResult(reply=f"❌ Unknown agent: {agent_type}")
+            if agent_type not in settings.agents:
+                return RouteResult(reply=f"❌ Agent '{agent_type}' is not enabled.")
         existed = self.sessions.get(name) is not None
-        project = self.sessions.create(name)
+        project = self.sessions.create(name, agent_type=agent_type)
         self.sessions.set_current(project.name)
         verb = "Switched to existing" if existed else "Created"
-        return RouteResult(reply=f"✅ {verb} project: {project.name}")
+        return RouteResult(
+            reply=f"✅ {verb} project: {project.name} (agent: {project.agent_type})"
+        )
 
     def _handle_switch(self, name: str) -> RouteResult:
         if not name:
@@ -377,18 +398,33 @@ class Router(BaseRouter):
         if self.sessions.get(name) is None:
             return RouteResult(reply=f"❌ Unknown project: {name}")
         self.sessions.delete(name)
-        return RouteResult(reply=f"🗑️ Deleted project: {name}")
+        return RouteResult(reply=f"🗑️ Deleted project: {name}", reset_project=name)
 
     async def _handle_list_models(self) -> RouteResult:
-        models = await self._fetch_available_models()
-        if not models:
-            return RouteResult(reply="❌ Unable to fetch available models. Check API connection.")
         current = self.sessions.get_current()
         project = self.sessions.get(current)
-        lines = [f"  - {m}" for m in models]
-        if project and project.model:
+        if project is None:
+            return RouteResult(reply="❌ No current project.")
+
+        definition = get_agent_definition(project.agent_type)
+        try:
+            models = (
+                await definition.list_models()
+                if definition.list_models is not None
+                else await self._fetch_available_models()
+            )
+        except Exception as exc:  # noqa: BLE001 - provider/API boundary
+            log.warning("failed to list models for agent %s: %s", project.agent_type, exc)
+            return RouteResult(reply=f"❌ Unable to fetch {project.agent_type} models: {exc}")
+        if not models:
+            return RouteResult(reply="❌ Unable to fetch available models. Check agent configuration.")
+
+        lines = [f"  - {model}" for model in models]
+        if project.model:
             lines.append(f"\nCurrent project model: {project.model}")
-        return RouteResult(reply="Available models:\n" + "\n".join(lines))
+        return RouteResult(
+            reply=f"Available models for {project.agent_type}:\n" + "\n".join(lines)
+        )
 
     async def _handle_switch_model(self, model: str) -> RouteResult:
         if not model:
@@ -401,22 +437,41 @@ class Router(BaseRouter):
 
         if model.lower() == "default":
             self.sessions.reset_model(current)
-            return RouteResult(reply=f"✅ Reset {current} to default model", reset_agent=True)
-
-        # Validate model by testing with router's API key/URL
-        test_client = AsyncAnthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
-            base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
-        )
-        try:
-            await test_client.messages.create(
-                model=model,
-                max_tokens=1,
-                messages=[{"role": "user", "content": "test"}],
+            return RouteResult(
+                reply=f"✅ Reset {current} to default model",
+                reset_agent=True,
+                reset_project=current,
             )
-        except Exception as e:
-            log.warning("model %s test failed: %s", model, e)
-            return RouteResult(reply=f"❌ Model '{model}' not available: {e}")
+
+        definition = get_agent_definition(project.agent_type)
+        if definition.list_models is not None:
+            try:
+                available = await definition.list_models()
+            except Exception as exc:  # noqa: BLE001 - provider/API boundary
+                log.warning("model listing failed for %s: %s", project.agent_type, exc)
+                return RouteResult(reply=f"❌ Unable to validate {project.agent_type} model: {exc}")
+            if model not in available:
+                return RouteResult(
+                    reply=f"❌ Model '{model}' is not available for {project.agent_type}."
+                )
+        elif definition.validate_model_with_anthropic:
+            test_client = AsyncAnthropic(
+                api_key=os.environ.get("ANTHROPIC_API_KEY"),
+                base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
+            )
+            try:
+                await test_client.messages.create(
+                    model=model,
+                    max_tokens=1,
+                    messages=[{"role": "user", "content": "test"}],
+                )
+            except Exception as exc:  # noqa: BLE001 - provider/API boundary
+                log.warning("model %s test failed: %s", model, exc)
+                return RouteResult(reply=f"❌ Model '{model}' not available: {exc}")
 
         self.sessions.set_model(current, model)
-        return RouteResult(reply=f"✅ Switched {current} to {model}", reset_agent=True)
+        return RouteResult(
+            reply=f"✅ Switched {current} to {model}",
+            reset_agent=True,
+            reset_project=current,
+        )
