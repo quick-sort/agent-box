@@ -13,5 +13,13 @@ class BaseAgent(ABC):
         self.project = project
 
     @abstractmethod
-    async def run(self, prompt: str, user_id: str = "") -> AsyncIterator[OutgoingMessage]:
-        """Execute a prompt and yield OutgoingMessage events."""
+    async def run(
+        self,
+        prompt: str,
+        user_id: str = "",
+        channel: str = "",
+    ) -> AsyncIterator[OutgoingMessage]:
+        """Execute one conversational turn and stream channel-neutral events."""
+
+    async def close(self) -> None:
+        """Release agent resources. Stateless implementations may do nothing."""

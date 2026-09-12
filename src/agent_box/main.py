@@ -23,7 +23,16 @@ class App:
         self.sessions = SessionManager(settings.workspace_dir)
         self.router = Router(self.sessions)
         self.agents: dict[str, BaseAgent] = {}
+        self._agent_locks: dict[str, anyio.Lock] = {}
         self.channel_types: list[str] = []
+
+    def _get_project_lock(self, name: str) -> anyio.Lock:
+        # Some tests construct App without calling __init__, so initialize the
+        # lock registry lazily as well as in the normal constructor.
+        locks = getattr(self, "_agent_locks", None)
+        if locks is None:
+            locks = self._agent_locks = {}
+        return locks.setdefault(name, anyio.Lock())
 
     def _get_or_create_agent(self, name: str) -> BaseAgent:
         if name not in self.agents:
@@ -31,6 +40,13 @@ class App:
             assert project is not None, f"unknown project: {name!r}"
             self.agents[name] = create_agent(project.agent_type, project)
         return self.agents[name]
+
+    async def _close_agent(self, name: str) -> None:
+        """Close and evict one project agent under its serialization lock."""
+        async with self._get_project_lock(name):
+            agent = self.agents.pop(name, None)
+            if agent is not None:
+                await agent.close()
 
     def _create_channel(self, channel_type: str, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
         """Instantiate a channel by type name."""
@@ -59,35 +75,78 @@ class App:
         if result.reply is not None:
             log.info("router replied directly (no agent call): %r", (result.reply or "")[:200])
             await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
-            if result.reset_agent:
-                current = self.sessions.get_current()
-                if current in self.agents:
-                    await self.agents[current].close()
-                    del self.agents[current]
+            reset_project = result.reset_project
+            if reset_project is None and result.reset_agent:
+                reset_project = self.sessions.get_current()
+            if reset_project is not None:
+                await self._close_agent(reset_project)
             return
 
         project_name = result.project or self.sessions.get_current()
         self.sessions.ensure_default()  # always available as a fallback
-        agent = self._get_or_create_agent(project_name)
-        # Surface pending-question state so we can see whether the user's
-        # reply is about to be consumed as a tool_result or treated as a
-        # fresh query.
-        has_pending = getattr(agent, "has_pending_question", False)
-        log.info(
-            "dispatching to agent: project=%s agent_type=%s has_pending_question=%s",
-            project_name, type(agent).__name__, has_pending,
+        agent_at_arrival = self.agents.get(project_name)
+        permission_pending_at_arrival = (
+            getattr(agent_at_arrival, "has_pending_question", False) is True
         )
-        async for out_msg in agent.run(msg.text, user_id=msg.user_id, channel=msg.channel):
-            if out_msg.text and out_msg.type.value == "text" and self.sessions.get_current() != project_name:
-                out_msg = OutgoingMessage(
-                    text=f"[{project_name}] {out_msg.text}",
-                    user_id=out_msg.user_id,
-                    channel=out_msg.channel,
-                    type=out_msg.type,
-                    data=out_msg.data,
+
+        # A persistent agent process may only handle one turn at a time. Keep
+        # same-project messages ordered while preserving concurrency across
+        # different projects.
+        async with self._get_project_lock(project_name):
+            agent = self._get_or_create_agent(project_name)
+            has_pending = getattr(agent, "has_pending_question", False) is True
+            log.info(
+                "dispatching to agent: project=%s agent_type=%s has_pending_question=%s",
+                project_name, type(agent).__name__, has_pending,
+            )
+            # A message that entered the queue before the permission prompt
+            # existed must never be interpreted as approval. Likewise, a
+            # duplicate reply must not become a new coding request after a
+            # previous reply has already resolved the prompt.
+            if has_pending and not permission_pending_at_arrival:
+                await reply.send(
+                    OutgoingMessage(
+                        text=(
+                            "⚠️ This message arrived before the agent requested permission "
+                            "and was not used as an answer. Please reply to the permission prompt."
+                        ),
+                        user_id=msg.user_id,
+                        channel=msg.channel,
+                    )
                 )
-            await reply.send(out_msg)
-        self.sessions.update_session_id(project_name, agent.project.session_id or "")
+                return
+            if permission_pending_at_arrival and not has_pending:
+                await reply.send(
+                    OutgoingMessage(
+                        text="⚠️ The permission request was already answered; this reply was ignored.",
+                        user_id=msg.user_id,
+                        channel=msg.channel,
+                    )
+                )
+                return
+            try:
+                async for out_msg in agent.run(
+                    msg.text,
+                    user_id=msg.user_id,
+                    channel=msg.channel,
+                ):
+                    if (
+                        out_msg.text
+                        and out_msg.type.value == "text"
+                        and self.sessions.get_current() != project_name
+                    ):
+                        out_msg = OutgoingMessage(
+                            text=f"[{project_name}] {out_msg.text}",
+                            user_id=out_msg.user_id,
+                            channel=out_msg.channel,
+                            type=out_msg.type,
+                            data=out_msg.data,
+                        )
+                    await reply.send(out_msg)
+            finally:
+                # ACP sessions are assigned during lazy startup. Persist even
+                # when a turn fails or pauses for a permission reply.
+                self.sessions.update_session_id(project_name, agent.project.session_id or "")
         log.info("handle_message done: project=%s", project_name)
 
     async def run(self, channel_types: list[str] | None = None) -> None:
@@ -114,27 +173,31 @@ class App:
         for ct in channel_types:
             channels[ct] = self._create_channel(ct, send_in)
 
-        async with anyio.create_task_group() as tg:
-            # Start each channel's inbound listener and outbound sender
-            for ct, ch in channels.items():
-                # Each channel gets a filtered outbound stream
-                ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](16)
-                tg.start_soon(ch.start)
-                tg.start_soon(ch.send_loop, ch_recv)
-                # Store the send stream for routing
-                ch._outbound_send = ch_send  # type: ignore[attr-defined]
+        try:
+            async with anyio.create_task_group() as tg:
+                # Start each channel's inbound listener and outbound sender
+                for ct, ch in channels.items():
+                    # Each channel gets a filtered outbound stream
+                    ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](16)
+                    tg.start_soon(ch.start)
+                    tg.start_soon(ch.send_loop, ch_recv)
+                    # Store the send stream for routing
+                    ch._outbound_send = ch_send  # type: ignore[attr-defined]
 
-            # Route outbound messages to correct channel
-            tg.start_soon(self._route_outbound, recv_out, channels)
+                # Route outbound messages to correct channel
+                tg.start_soon(self._route_outbound, recv_out, channels)
 
-            # Dispatch inbound messages to handler
-            tg.start_soon(self._dispatch_loop, recv_in, send_out)
-
-        for agent in list(self.agents.values()):
-            try:
-                await agent.close()
-            except Exception:
-                pass
+                # Dispatch inbound messages to handler
+                tg.start_soon(self._dispatch_loop, recv_in, send_out)
+        finally:
+            # Long-lived ACP subprocesses must be released even when a channel
+            # task crashes or the application is cancelled.
+            for name, agent in list(self.agents.items()):
+                try:
+                    await agent.close()
+                except Exception:
+                    log.exception("failed to close agent for project %s", name)
+            self.agents.clear()
 
     async def _route_outbound(
         self,
@@ -170,7 +233,12 @@ class App:
                         channel=msg.channel,
                     ))
                 except Exception:
-                    pass
+                    log.debug(
+                        "failed to send error reply for user=%s channel=%s",
+                        msg.user_id,
+                        msg.channel,
+                        exc_info=True,
+                    )
 
         try:
             async with anyio.create_task_group() as tg:

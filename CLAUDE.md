@@ -8,15 +8,14 @@ IM → Router → Agent pipeline. Chat via WeChat/QQ, route messages to project-
 WeChat ─┐                                       ┌─→ WeixinChannel.send_reply()
         ├─→ IncomingMessage ─→ Router ─→ Agent ─┤
 QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_reply()
-                                    │                          │
-                                    │ tools:                   │ ClaudeSDKClient
-                                    │  create_project          │ cwd=project folder
-                                    │  switch_project          │ continue_conversation=True
-                                    │ else: forward to         │
-                                    │ pinned project           │
-                                    ▼                          ▼
-                          SessionManager                 ~/.claude/projects/
-                          .router/projects.json          (session storage)
+                                    │                   │
+                                    │                   ├─ ClaudeCodeAgent
+                                    │                   │  └─ ClaudeSDKClient
+                                    │                   └─ KiroAgent
+                                    │                      └─ ACPAgent → kiro-cli acp
+                                    ▼
+                          SessionManager
+                          .router/projects.json
                           .router/current_project
 ```
 
@@ -24,8 +23,10 @@ QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_rep
 
 - **Single user** — no auth, one router, one set of projects
 - **Multi-channel** — multiple channels (WeChat + QQ + TUI) can run simultaneously; replies are routed to the originating channel via `OutgoingMessage.channel`
-- **Concurrent agents** — each `handle_message` runs in its own anyio task; multiple projects can execute simultaneously
-- **Session persistence** — `ClaudeSDKClient(continue_conversation=True)` resumes the last session for each project's cwd; Claude Code stores sessions under `~/.claude/projects/<sanitized-cwd>/`
+- **Concurrent agents** — each `handle_message` runs in its own anyio task; different projects execute concurrently, while a per-project lock serializes turns sent to one persistent agent process
+- **Provider-neutral agents** — `BaseAgent.run()` streams `OutgoingMessage`; the typed registry selects Claude Code or Kiro without exposing provider protocols to `App` or channels
+- **ACP driver** — `ACPAgent` owns subprocess lifecycle, ACP initialize/new/load/prompt calls, streaming event normalization, tool permissions, stale-session fallback, and shutdown. Provider wrappers such as `KiroAgent` only define launch policy.
+- **Session persistence** — session IDs are stored per project. Claude Code resumes from `~/.claude/projects/<sanitized-cwd>/`; ACP providers attempt `session/load` and create a fresh session if the provider rejects stale history.
 - **Router** — direct Anthropic SDK call with three tools (`create_project`, `switch_project`, `list_projects`). If no tool is invoked, the message is forwarded to the currently pinned project. The pinned project is persisted to `.router/current_project`. No slash-command shortcuts — natural language only.
 - **Project identity** — projects are identified by `name` (no slug). The project folder is `<workspace>/<name>`.
 - **Default project** — `_default` is always created and used when nothing else is pinned.
@@ -52,7 +53,10 @@ src/agent_box/
 │   ├── base.py          # BaseRouter ABC, RouteResult
 │   └── router.py        # Router: anthropic SDK + create_project/switch_project tools
 └── agents/
-    ├── base.py          # BaseAgent ABC
+    ├── base.py          # BaseAgent provider-neutral contract
+    ├── delivery.py      # Shared [SEND_FILE:path] bridge
+    ├── acp.py           # Generic persistent ACP driver
+    ├── kiro.py          # Kiro CLI provider + model discovery
     └── claude_code.py   # ClaudeCodeAgent (ClaudeSDKClient)
 ```
 
@@ -61,9 +65,9 @@ src/agent_box/
 1. Channels emit `IncomingMessage` (with `channel` field) to shared inbound stream
 2. `App._dispatch_loop` picks up each message, spawns `handle_message` task
 3. `Router.route()` makes one anthropic API call exposing three tools (`create_project`, `switch_project`, `list_projects`). If the model calls a tool, the router runs it and returns a `RouteResult(reply=...)`. Otherwise it returns `RouteResult(project=<pinned>)`.
-4. If `RouteResult.reply` is set, `App` sends it back directly. Otherwise it resolves `project` → `ClaudeCodeAgent` and calls `agent.run(prompt, user_id, channel)`.
-5. `ClaudeCodeAgent` sends prompt via `ClaudeSDKClient.query()`, collects response via `receive_response()`
-6. Each `OutgoingMessage` carries `channel` field → `_route_outbound()` dispatches to correct channel
+4. If `RouteResult.reply` is set, `App` sends it back directly. Otherwise it resolves `project` → cached `BaseAgent`, acquires that project's lock, and streams `agent.run(prompt, user_id, channel)`.
+5. `ClaudeCodeAgent` uses `ClaudeSDKClient`; `KiroAgent` delegates to the generic ACP driver, which keeps `kiro-cli acp` and its session alive per project.
+6. Each `OutgoingMessage` carries `channel` field → `_route_outbound()` dispatches to correct channel.
 
 ## Environment Variables
 
@@ -75,7 +79,14 @@ src/agent_box/
 - `PROJECTS_DIR` — where project folders live (default: `data/projects`)
 - `ROUTER_MODEL` — model override for router (optional)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
-- `ANTHROPIC_API_KEY` — required by Claude Code SDK
+- `ANTHROPIC_API_KEY` — required by Claude Code SDK and the project-management Router
+- `AGENTS` — enabled backend JSON array (default `["claude_code", "kiro"]`)
+- `DEFAULT_AGENT` — backend assigned to new projects (default `claude_code`)
+- `KIRO_API_KEY` — Kiro headless authentication; interactive login state also works
+- `KIRO_CLI_PATH` — Kiro executable (default `kiro-cli`)
+- `KIRO_ACP_ENGINE` — Kiro ACP engine (`v1`, `v2`, or `v3`; default `v2`)
+- `KIRO_AGENT` — optional Kiro custom agent name
+- `ACP_STARTUP_TIMEOUT` / `ACP_SHUTDOWN_TIMEOUT` — ACP process lifecycle timeouts
 
 ## Usage
 
@@ -112,9 +123,13 @@ docker run -v weixin-state:/root/.openclaw-weixin-python \
 
 ## Adding a New Agent Backend
 
-1. Create `src/agent_box/agents/my_agent.py` extending `BaseAgent`
-2. Implement `run(prompt) -> str`
-3. Swap in `main.py` `_get_or_create_agent()`
+For an ACP-compatible CLI:
+1. Create a thin wrapper in `src/agent_box/agents/` that subclasses `ACPAgent`
+2. Supply an `ACPProvider` descriptor with executable argv and optional model flag
+3. Register an `AgentDefinition` in `agents/__init__.py`; add a model lister only when the provider supports it
+4. Keep JSON-RPC, event translation, permissions, and process lifecycle in `ACPAgent`
+
+For a non-ACP backend, extend `BaseAgent`, implement the async `run()` iterator and `close()`, then register it in the same typed registry.
 
 ## Pull Request Guidelines
 
