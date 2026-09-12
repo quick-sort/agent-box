@@ -1,6 +1,6 @@
 """Tests for agent_box.agents."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -1372,4 +1372,98 @@ async def test_run_context_limit_compact_fails(sample_project: ProjectInfo):
     texts = [m.text for m in msgs]
     assert any("自动压缩" in t for t in texts)
     assert any("压缩失败" in t for t in texts)
+
+
+# ── CLI 进程中途崩溃的自愈 ──
+#
+# 问题背景（prod 观察，174.15.0.56 的 scrum 项目）：
+#   Claude Code CLI 是 agent-box 每项目持有的持久子进程。当它在某次任务
+#   执行中途崩溃（Node.js 内部错误 "undefined is not an object (evaluating
+#   'e.includes')"、OOM 被 kill 等），进程退出（exit 1），但
+#   ``ClaudeSDKClient`` 对象仍被缓存。此后的每条消息都会在
+#   ``client.query()`` 处抛 ``CLIConnectionError: Cannot write to terminated
+#   process``，项目永久瘫痪，直到重启 agent-box。
+#
+# 修复：``_ensure_client()`` 通过 ``_is_alive()`` 检测缓存 client 的 CLI
+#   子进程是否仍在运行；``run()`` 捕获异常后调用 ``_reset_dead_client()``
+#   置空缓存，使下一条消息重建全新会话。
+
+
+def test_is_alive_detects_dead_process(sample_project: ProjectInfo):
+    """returncode 为正整数 → 进程已死，_is_alive 返回 False。"""
+    agent = ClaudeCodeAgent(sample_project)
+    dead_process = Mock(returncode=1)
+    dead_client = Mock(_transport=Mock(_process=dead_process))
+    agent._client = dead_client
+    assert agent._is_alive() is False
+
+
+def test_is_alive_running_process(sample_project: ProjectInfo):
+    """returncode 为 None → 进程仍在运行，_is_alive 返回 True。"""
+    agent = ClaudeCodeAgent(sample_project)
+    running_process = Mock(returncode=None)
+    running_client = Mock(_transport=Mock(_process=running_process))
+    agent._client = running_client
+    assert agent._is_alive() is True
+
+
+def test_is_alive_no_client(sample_project: ProjectInfo):
+    """没有缓存 client 时返回 False。"""
+    agent = ClaudeCodeAgent(sample_project)
+    assert agent._is_alive() is False
+
+
+def test_is_alive_unknown_transport_assumes_alive(sample_project: ProjectInfo):
+    """测试用 mock 没有 _transport/_process 时，按存活处理，避免误重建。"""
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = AsyncMock()  # AsyncMock 无 _transport._process
+    assert agent._is_alive() is True
+
+
+@pytest.mark.anyio
+async def test_ensure_client_rebuilds_when_process_dead(sample_project: ProjectInfo):
+    """缓存 client 的进程已死时，_ensure_client 应丢弃并重建全新 client。"""
+    agent = ClaudeCodeAgent(sample_project)
+    dead_process = Mock(returncode=1)
+    old_client = Mock(_transport=Mock(_process=dead_process))
+    old_client.disconnect = AsyncMock()
+    agent._client = old_client
+
+    fresh_client = AsyncMock()
+    with patch(
+        "agent_box.agents.claude_code.ClaudeSDKClient", return_value=fresh_client
+    ):
+        result = await agent._ensure_client()
+
+    assert result is fresh_client
+    # 旧 client 被 disconnect
+    old_client.disconnect.assert_awaited_once()
+    fresh_client.connect.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_run_resets_dead_client_after_mid_turn_crash(sample_project: ProjectInfo):
+    """CLI 在 receive_response 中途崩溃（抛异常）→ run() 应重置 client 并重抛，
+    使下一条消息能重建会话，而不是返回死 client。"""
+    from claude_agent_sdk import CLIConnectionError
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def crash_receive():
+        # 模拟 CLI 崩溃：SDK 抛出 CLIConnectionError（进程已终止）
+        raise CLIConnectionError("Cannot write to terminated process (exit code: 1)")
+        yield  # pragma: no cover — 让此函数成为 async generator
+
+    mock_client.receive_response = crash_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+
+    with pytest.raises(CLIConnectionError):
+        [m async for m in agent.run("continue the task")]
+
+    # 崩溃后 client 缓存被清空，disconnect 被调用
+    assert agent._client is None
+    mock_client.disconnect.assert_awaited_once()
 
