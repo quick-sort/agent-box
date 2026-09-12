@@ -14,7 +14,6 @@ from typing import Any
 
 import anyio
 from anthropic import AsyncAnthropic
-
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -435,9 +434,43 @@ class ClaudeCodeAgent(BaseAgent):
             opts.allowed_tools = ["wecom_mcp"]
         return opts
 
+    def _is_alive(self) -> bool:
+        """Return True when the cached client's CLI subprocess is still running.
+
+        The SDK spawns the CLI as a subprocess and keeps it alive across turns.
+        If the CLI crashes mid-turn (a Node.js error, an OOM kill, …), the
+        ``ClaudeSDKClient`` object stays cached but the process is gone — the
+        next ``client.query()`` then fails with ``CLIConnectionError: Cannot
+        write to terminated process`` and the project is permanently broken.
+        Detect that here so ``_ensure_client`` can rebuild instead of returning
+        a dead client.
+        """
+        client = self._client
+        if client is None:
+            return False
+        process = getattr(client, "_transport", None)
+        process = getattr(process, "_process", None)
+        if process is None:
+            # No subprocess exposed (e.g. a custom transport in tests) — assume
+            # the client is healthy unless something tells us otherwise.
+            return True
+        returncode = getattr(process, "returncode", None)
+        # Only a positive integer returncode means the process exited; ``None``
+        # means it is still running, and anything else (e.g. a mock's
+        # auto-created attribute) is treated as "unknown → assume alive".
+        return not isinstance(returncode, int)
+
     async def _ensure_client(self) -> ClaudeSDKClient:
-        if self._client is not None:
+        if self._client is not None and self._is_alive():
             return self._client
+        if self._client is not None:
+            log.warning(
+                "claude CLI process died for project %s — rebuilding client",
+                self.project.name,
+            )
+            with contextlib.suppress(Exception):
+                await self._client.disconnect()
+            self._client = None
 
         stale_session = self.project.session_id or ""
         self._stderr_tail.clear()
@@ -725,6 +758,20 @@ class ClaudeCodeAgent(BaseAgent):
     # Main run loop
     # ------------------------------------------------------------------
 
+    async def _reset_dead_client(self, client: ClaudeSDKClient) -> None:
+        """Drop a dead client so the next ``run()`` rebuilds a fresh session.
+
+        A crash inside the CLI mid-turn (Node.js error, OOM kill, …) surfaces
+        either as ``CLIConnectionError`` on the next ``client.query()`` or as a
+        raw ``Exception`` bubbling out of ``receive_response()``. In both cases
+        the cached client now wraps a dead process. Reset it (and disconnect)
+        so ``_ensure_client()`` rebuilds instead of returning a dead client on
+        the next message.
+        """
+        self._client = None
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
     async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
         client = await self._ensure_client()
 
@@ -739,153 +786,160 @@ class ClaudeCodeAgent(BaseAgent):
             (prompt or "")[:200], pending_tool,
         )
 
-        if self._pending_permission is not None:
-            # Resume: the prompt is the user's reply to a pending permission.
-            # Resolve the future so the ``can_use_tool`` callback can return
-            # its PermissionResult and unblock the CLI. Do NOT send a fresh
-            # query — the CLI is mid-turn, still waiting on the permission
-            # response.
-            pending = self._pending_permission
-            log.info(
-                "run(): resolving pending permission future with user reply "
-                "(tool=%s tool_use_id=%s reply_preview=%r)",
-                pending["tool_name"], pending["tool_use_id"],
-                (prompt or "")[:200],
-            )
-            future: asyncio.Future = pending["future"]
-            if not future.done():
-                future.set_result(prompt)
-        else:
-            log.info("run(): no pending permission — sending prompt as fresh query")
-            await client.query(prompt)
+        try:
+            if self._pending_permission is not None:
+                # Resume: the prompt is the user's reply to a pending permission.
+                # Resolve the future so the ``can_use_tool`` callback can return
+                # its PermissionResult and unblock the CLI. Do NOT send a fresh
+                # query — the CLI is mid-turn, still waiting on the permission
+                # response.
+                pending = self._pending_permission
+                log.info(
+                    "run(): resolving pending permission future with user reply "
+                    "(tool=%s tool_use_id=%s reply_preview=%r)",
+                    pending["tool_name"], pending["tool_use_id"],
+                    (prompt or "")[:200],
+                )
+                future: asyncio.Future = pending["future"]
+                if not future.done():
+                    future.set_result(prompt)
+            else:
+                log.info("run(): no pending permission — sending prompt as fresh query")
+                await client.query(prompt)
 
-        # Build prefixes to strip from file paths in tool summaries.
-        # - Project path: /home/.../workspace/project  → src/main.py
-        # - Channel downloads: ~/.agent-box/channels/*/downloads → image.jpg
-        _path_prefixes = _build_path_prefixes(self.project.path)
+            # Build prefixes to strip from file paths in tool summaries.
+            # - Project path: /home/.../workspace/project  → src/main.py
+            # - Channel downloads: ~/.agent-box/channels/*/downloads → image.jpg
+            _path_prefixes = _build_path_prefixes(self.project.path)
 
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    # --- Tools that require user interaction ---
-                    # AskUserQuestion and ExitPlanMode trigger a ``can_use_tool``
-                    # request from the CLI even in bypassPermissions mode (they
-                    # are ``requiresUserInteraction`` tools). We surface the
-                    # question/plan to the IM channel, ensure a pending future
-                    # exists (shared with the callback), and return so the user
-                    # can reply. The next run() resolves the future; the
-                    # ``_can_use_tool`` callback then returns the PermissionResult.
-                    if (
-                        isinstance(block, ToolUseBlock)
-                        and block.name in _TOOLS_REQUIRING_USER_INPUT
-                    ):
-                        if block.name == "ExitPlanMode":
-                            plan = (block.input or {}).get("plan")
-                            body = plan.strip() if isinstance(plan, str) else ""
-                            if not body:
-                                body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
-                            text = body + _PLAN_APPROVAL_HINT
+            async for msg in client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        # --- Tools that require user interaction ---
+                        # AskUserQuestion and ExitPlanMode trigger a ``can_use_tool``
+                        # request from the CLI even in bypassPermissions mode (they
+                        # are ``requiresUserInteraction`` tools). We surface the
+                        # question/plan to the IM channel, ensure a pending future
+                        # exists (shared with the callback), and return so the user
+                        # can reply. The next run() resolves the future; the
+                        # ``_can_use_tool`` callback then returns the PermissionResult.
+                        if (
+                            isinstance(block, ToolUseBlock)
+                            and block.name in _TOOLS_REQUIRING_USER_INPUT
+                        ):
+                            if block.name == "ExitPlanMode":
+                                plan = (block.input or {}).get("plan")
+                                body = plan.strip() if isinstance(plan, str) else ""
+                                if not body:
+                                    body = "(agent 请求退出 plan 模式，但没有提供计划内容)"
+                                text = body + _PLAN_APPROVAL_HINT
+                                log.info(
+                                    "ExitPlanMode detected — surfacing plan, "
+                                    "tool_use_id=%s",
+                                    block.id,
+                                )
+                                yield OutgoingMessage(
+                                    text=text,
+                                    user_id=user_id,
+                                    channel=channel,
+                                    type=MessageType.text,
+                                    data={"id": block.id, "name": block.name, "input": block.input},
+                                )
+                                self._get_or_create_permission_future(
+                                    "ExitPlanMode", block.id, block.input or {},
+                                )
+                                log.info(
+                                    "ExitPlanMode pending permission saved, returning from run() — "
+                                    "waiting for user reply to approve/reject"
+                                )
+                                return  # Stop yielding; next run() will resume
+
+                            # AskUserQuestion
                             log.info(
-                                "ExitPlanMode detected — surfacing plan, "
-                                "tool_use_id=%s",
-                                block.id,
+                                "AskUserQuestion detected — surfacing question, "
+                                "tool_use_id=%s input=%s",
+                                block.id, block.input,
                             )
+                            question_text = self._format_question(block)
                             yield OutgoingMessage(
-                                text=text,
+                                text=question_text,
                                 user_id=user_id,
                                 channel=channel,
                                 type=MessageType.text,
-                                data={"id": block.id, "name": block.name, "input": block.input},
                             )
                             self._get_or_create_permission_future(
-                                "ExitPlanMode", block.id, block.input or {},
+                                "AskUserQuestion", block.id, block.input or {},
                             )
                             log.info(
-                                "ExitPlanMode pending permission saved, returning from run() — "
-                                "waiting for user reply to approve/reject"
+                                "AskUserQuestion pending permission saved, returning from run() — "
+                                "waiting for user reply (question_preview=%r)",
+                                question_text[:200],
                             )
                             return  # Stop yielding; next run() will resume
 
-                        # AskUserQuestion
-                        log.info(
-                            "AskUserQuestion detected — surfacing question, "
-                            "tool_use_id=%s input=%s",
-                            block.id, block.input,
-                        )
-                        question_text = self._format_question(block)
-                        yield OutgoingMessage(
-                            text=question_text,
-                            user_id=user_id,
-                            channel=channel,
-                            type=MessageType.text,
-                        )
-                        self._get_or_create_permission_future(
-                            "AskUserQuestion", block.id, block.input or {},
-                        )
-                        log.info(
-                            "AskUserQuestion pending permission saved, returning from run() — "
-                            "waiting for user reply (question_preview=%r)",
-                            question_text[:200],
-                        )
-                        return  # Stop yielding; next run() will resume
-
-                    # --- normal block handling ---
-                    if isinstance(block, TextBlock):
-                        cleaned = block.text.strip()
-                        if cleaned:
-                            text, file_paths = _parse_send_file_markers(cleaned)
-                            if text:
-                                yield OutgoingMessage(text=text, user_id=user_id, channel=channel, type=MessageType.text)
-                            for fp in file_paths:
-                                log.info("Agent requested file send: %s", fp)
-                                yield OutgoingMessage(
-                                    text="", user_id=user_id, channel=channel, type=MessageType.text,
-                                    data={"file_path": fp},
-                                )
-                    elif isinstance(block, ToolUseBlock):
-                        # Brief one-liner so the user knows something is happening.
-                        summary = _format_tool_summary(block, prefixes=_path_prefixes)
-                        yield OutgoingMessage(
-                            text=summary, user_id=user_id, channel=channel, type=MessageType.text,
-                            data={"id": block.id, "name": block.name, "input": block.input},
-                        )
-                    # ThinkingBlock / ToolResultBlock deliberately skipped —
-                    # too noisy for IM channels.
-            elif isinstance(msg, SystemMessage):
-                yield OutgoingMessage(
-                    text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
-                    data=msg.data,
-                )
-            elif isinstance(msg, ResultMessage):
-                # --- Context window limit recovery ---
-                if _is_context_limit_error(msg):
-                    log.warning(
-                        "context window limit hit for project %s, session %s",
-                        self.project.name, msg.session_id,
-                    )
-                    async for out_msg in self._recover_from_context_limit(
-                        client, prompt, user_id, channel, msg.session_id,
-                    ):
-                        yield out_msg
-                    return
-
-                if msg.session_id and msg.session_id != self.project.session_id:
-                    self.project.session_id = msg.session_id
-
-                if msg.is_error:
-                    error_detail = " ".join(msg.errors or []) or msg.result or "未知错误"
-                    log.error(
-                        "agent error for project %s: %s", self.project.name, error_detail,
-                    )
+                        # --- normal block handling ---
+                        if isinstance(block, TextBlock):
+                            cleaned = block.text.strip()
+                            if cleaned:
+                                text, file_paths = _parse_send_file_markers(cleaned)
+                                if text:
+                                    yield OutgoingMessage(text=text, user_id=user_id, channel=channel, type=MessageType.text)
+                                for fp in file_paths:
+                                    log.info("Agent requested file send: %s", fp)
+                                    yield OutgoingMessage(
+                                        text="", user_id=user_id, channel=channel, type=MessageType.text,
+                                        data={"file_path": fp},
+                                    )
+                        elif isinstance(block, ToolUseBlock):
+                            # Brief one-liner so the user knows something is happening.
+                            summary = _format_tool_summary(block, prefixes=_path_prefixes)
+                            yield OutgoingMessage(
+                                text=summary, user_id=user_id, channel=channel, type=MessageType.text,
+                                data={"id": block.id, "name": block.name, "input": block.input},
+                            )
+                        # ThinkingBlock / ToolResultBlock deliberately skipped —
+                        # too noisy for IM channels.
+                elif isinstance(msg, SystemMessage):
                     yield OutgoingMessage(
-                        text=f"❌ Agent 错误：{error_detail}",
-                        user_id=user_id, channel=channel, type=MessageType.text,
+                        text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
+                        data=msg.data,
                     )
+                elif isinstance(msg, ResultMessage):
+                    # --- Context window limit recovery ---
+                    if _is_context_limit_error(msg):
+                        log.warning(
+                            "context window limit hit for project %s, session %s",
+                            self.project.name, msg.session_id,
+                        )
+                        async for out_msg in self._recover_from_context_limit(
+                            client, prompt, user_id, channel, msg.session_id,
+                        ):
+                            yield out_msg
+                        return
 
-                yield OutgoingMessage(
-                    text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
-                    data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
-                )
+                    if msg.session_id and msg.session_id != self.project.session_id:
+                        self.project.session_id = msg.session_id
+
+                    if msg.is_error:
+                        error_detail = " ".join(msg.errors or []) or msg.result or "未知错误"
+                        log.error(
+                            "agent error for project %s: %s", self.project.name, error_detail,
+                        )
+                        yield OutgoingMessage(
+                            text=f"❌ Agent 错误：{error_detail}",
+                            user_id=user_id, channel=channel, type=MessageType.text,
+                        )
+
+                    yield OutgoingMessage(
+                        text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
+                        data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
+                    )
+        except Exception:
+            # The CLI process died mid-turn. Drop the cached client so the
+            # next message rebuilds a fresh session, then re-raise — main.py's
+            # _safe_handle already catches it and replies with an error message.
+            await self._reset_dead_client(client)
+            raise
 
     async def _recover_from_context_limit(
         self,
