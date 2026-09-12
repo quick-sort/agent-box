@@ -240,11 +240,18 @@ def _extract_text_from_content(content: Any) -> str:
         return ""
     parts: list[str] = []
     for block in content:
+        text: str | None = None
         if isinstance(block, dict):
             if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        elif isinstance(block, TextBlock):
-            parts.append(block.text)
+                text = block.get("text", "")
+        else:
+            # pydantic content blocks — covers both the anthropic SDK's
+            # ``TextBlock`` and claude_agent_sdk's ``TextBlock`` (distinct
+            # classes), while skipping ``ThinkingBlock`` and others.
+            if getattr(block, "type", None) == "text":
+                text = getattr(block, "text", "") or ""
+        if text:
+            parts.append(text)
     return "\n".join(parts).strip()
 
 
@@ -315,7 +322,7 @@ async def _parse_user_answer(questions: list[dict], user_reply: str) -> dict:
         max_tokens=512,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text.strip()
+    text = _extract_text_from_content(resp.content)
     # Strip optional markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
