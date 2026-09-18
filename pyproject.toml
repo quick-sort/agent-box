@@ -4,7 +4,11 @@ version = "0.1.4"
 description = "IM → Router → Agent pipeline for managing coding projects via chat"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>=0.2.87",
+    # Pinned: 0.2.132+ (bundled CLI 2.1.224) no longer treats /clear as a
+    # built-in command in SDK mode, so "/clear" leaks to the LLM as plain text.
+    # 0.2.87 is the last known-good version. Do not bump without re-verifying
+    # slash-command (/clear) behaviour through the SDK.
+    "claude-agent-sdk==0.2.87",
     "anthropic>=0.40",
     "anyio>=4.0",
     "pycryptodome>=3.20",
