@@ -25,12 +25,20 @@ class App:
         self.agents: dict[str, BaseAgent] = {}
         self.channel_types: list[str] = []
 
-    def _get_or_create_agent(self, name: str) -> BaseAgent:
-        if name not in self.agents:
+    def _get_or_create_agent(self, name: str, conversation_id: str | None = None) -> BaseAgent:
+        """Get or create the agent for a (project, conversation) pair.
+
+        Each conversation gets its own agent (and thus its own Claude Code
+        session), so multiple groups / single chats pinned to the same project
+        no longer share context or clobber each other's pending-permission
+        state.
+        """
+        key = (name, conversation_id or "")
+        if key not in self.agents:
             project = self.sessions.get(name)
             assert project is not None, f"unknown project: {name!r}"
-            self.agents[name] = create_agent(project.agent_type, project)
-        return self.agents[name]
+            self.agents[key] = create_agent(project.agent_type, project)
+        return self.agents[key]
 
     def _create_channel(self, channel_type: str, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
         """Instantiate a channel by type name."""
@@ -58,17 +66,20 @@ class App:
 
         if result.reply is not None:
             log.info("router replied directly (no agent call): %r", (result.reply or "")[:200])
-            await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
+            await reply.send(OutgoingMessage(
+                text=result.reply, user_id=msg.user_id, channel=msg.channel,
+                conversation_id=msg.conversation_id,
+            ))
             if result.reset_agent:
                 current = self.sessions.get_current()
-                if current in self.agents:
-                    await self.agents[current].close()
-                    del self.agents[current]
+                for key in [k for k in self.agents if k[0] == current]:
+                    await self.agents[key].close()
+                    del self.agents[key]
             return
 
         project_name = result.project or self.sessions.get_current()
         self.sessions.ensure_default()  # always available as a fallback
-        agent = self._get_or_create_agent(project_name)
+        agent = self._get_or_create_agent(project_name, msg.conversation_id)
         # Surface pending-question state so we can see whether the user's
         # reply is about to be consumed as a tool_result or treated as a
         # fresh query.
@@ -78,6 +89,8 @@ class App:
             project_name, type(agent).__name__, has_pending,
         )
         async for out_msg in agent.run(msg.text, user_id=msg.user_id, channel=msg.channel):
+            # 回填会话 id，使回复回到正确的会话（群聊=群 chatid，单聊=user_id）。
+            out_msg.conversation_id = msg.conversation_id
             if out_msg.text and out_msg.type.value == "text" and self.sessions.get_current() != project_name:
                 out_msg = OutgoingMessage(
                     text=f"[{project_name}] {out_msg.text}",
@@ -85,9 +98,9 @@ class App:
                     channel=out_msg.channel,
                     type=out_msg.type,
                     data=out_msg.data,
+                    conversation_id=msg.conversation_id,
                 )
             await reply.send(out_msg)
-        self.sessions.update_session_id(project_name, agent.project.session_id or "")
         log.info("handle_message done: project=%s", project_name)
 
     async def run(self, channel_types: list[str] | None = None) -> None:
