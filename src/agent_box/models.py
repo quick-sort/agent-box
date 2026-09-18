@@ -25,6 +25,15 @@ class IncomingMessage:
     user_id: str
     channel: str  # e.g. "weixin"
     raw: dict | None = None  # original payload
+    # The chat/session the message came from. Defaults to user_id, but for
+    # group channels it is the group id (e.g. WeCom group chatid), which is
+    # *different* from the sender's user_id. Drives per-conversation isolation
+    # and reply routing.
+    conversation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.conversation_id:
+            self.conversation_id = self.user_id
 
 
 @dataclass
@@ -36,6 +45,14 @@ class OutgoingMessage:
     channel: str = ""  # target channel name (e.g. "qq", "weixin")
     type: MessageType = MessageType.text
     data: dict[str, Any] | None = None  # extra payload per type
+    # The chat/session the reply must go back to. Defaults to user_id; group
+    # channels set it to the group id so the reply lands in the same group the
+    # original message came from.
+    conversation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.conversation_id:
+            self.conversation_id = self.user_id
 
 
 @dataclass
