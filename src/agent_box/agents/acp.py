@@ -527,20 +527,28 @@ class ACPAgent(BaseAgent):
             with contextlib.suppress(asyncio.CancelledError):
                 await stderr_task
 
-    async def close(self) -> None:
+    async def cancel(self) -> None:
+        """Interrupt the active ACP turn without closing its persistent process."""
         pending, self._pending_permission = self._pending_permission, None
         if pending is not None and not pending.future.done():
             pending.future.cancel()
 
-        prompt_task, self._prompt_task = self._prompt_task, None
+        prompt_task = self._prompt_task
         if prompt_task is not None and not prompt_task.done():
             if self._connection is not None and self.project.session_id:
                 with contextlib.suppress(Exception):
                     await self._connection.cancel(self.project.session_id)
+            # Protocol cancellation asks the server to stop its work; task
+            # cancellation guarantees the local stream unblocks immediately.
             prompt_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await prompt_task
-
-        self._events = None
         self._text_chunks.clear()
+
+    async def close(self) -> None:
+        await self.cancel()
+        self._prompt_task = None
+        self._events = None
+        self._active_user_id = ""
+        self._active_channel = ""
         await self._close_transport()

@@ -17,6 +17,9 @@ from .session_manager import SessionManager
 
 log = logging.getLogger(__name__)
 
+_STOP_COMMANDS = frozenset({"stop", "停止", "停下"})
+_ActiveTurn = tuple[str, BaseAgent, anyio.CancelScope]
+
 
 class App:
     def __init__(self) -> None:
@@ -24,6 +27,7 @@ class App:
         self.router = Router(self.sessions)
         self.agents: dict[str, BaseAgent] = {}
         self._agent_locks: dict[str, anyio.Lock] = {}
+        self._active_turns: dict[tuple[str, str], _ActiveTurn] = {}
         self.channel_types: list[str] = []
 
     def _get_project_lock(self, name: str) -> anyio.Lock:
@@ -33,6 +37,13 @@ class App:
         if locks is None:
             locks = self._agent_locks = {}
         return locks.setdefault(name, anyio.Lock())
+
+    def _get_active_turns(self) -> dict[tuple[str, str], _ActiveTurn]:
+        # Tests may construct App via __new__, so keep this registry lazy too.
+        turns = getattr(self, "_active_turns", None)
+        if turns is None:
+            turns = self._active_turns = {}
+        return turns
 
     def _get_or_create_agent(self, name: str) -> BaseAgent:
         if name not in self.agents:
@@ -47,6 +58,29 @@ class App:
             agent = self.agents.pop(name, None)
             if agent is not None:
                 await agent.close()
+
+    async def _handle_stop_command(
+        self,
+        msg: IncomingMessage,
+        reply: anyio.abc.ObjectSendStream[OutgoingMessage],
+    ) -> None:
+        """Cancel this channel/user's active turn without waiting for its project lock."""
+        key = (msg.channel, msg.user_id)
+        active = self._get_active_turns().pop(key, None)
+        if active is None:
+            text = "ℹ️ 当前没有正在执行的任务。"
+        else:
+            project_name, agent, cancel_scope = active
+            log.info(
+                "stop command: user=%s channel=%s project=%s",
+                msg.user_id, msg.channel, project_name,
+            )
+            # Cancel the handler first so a turn still connecting/starting
+            # cannot proceed before its backend object becomes interruptible.
+            cancel_scope.cancel()
+            await agent.cancel()
+            text = "⏹️ 已停止当前任务。"
+        await reply.send(OutgoingMessage(text=text, user_id=msg.user_id, channel=msg.channel))
 
     def _create_channel(self, channel_type: str, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
         """Instantiate a channel by type name."""
@@ -70,6 +104,10 @@ class App:
             "handle_message entry: user=%s channel=%s text_preview=%r",
             msg.user_id, msg.channel, (msg.text or "")[:200],
         )
+        if (msg.text or "").strip().casefold() in _STOP_COMMANDS:
+            await self._handle_stop_command(msg, reply)
+            return
+
         result = await self.router.route(msg)
 
         if result.reply is not None:
@@ -124,29 +162,45 @@ class App:
                     )
                 )
                 return
-            try:
-                async for out_msg in agent.run(
-                    msg.text,
-                    user_id=msg.user_id,
-                    channel=msg.channel,
-                ):
-                    if (
-                        out_msg.text
-                        and out_msg.type.value == "text"
-                        and self.sessions.get_current() != project_name
+
+            key = (msg.channel, msg.user_id)
+            completed = False
+            with anyio.CancelScope() as cancel_scope:
+                turn: _ActiveTurn = (project_name, agent, cancel_scope)
+                self._get_active_turns()[key] = turn
+                try:
+                    async for out_msg in agent.run(
+                        msg.text,
+                        user_id=msg.user_id,
+                        channel=msg.channel,
                     ):
-                        out_msg = OutgoingMessage(
-                            text=f"[{project_name}] {out_msg.text}",
-                            user_id=out_msg.user_id,
-                            channel=out_msg.channel,
-                            type=out_msg.type,
-                            data=out_msg.data,
-                        )
-                    await reply.send(out_msg)
-            finally:
-                # ACP sessions are assigned during lazy startup. Persist even
-                # when a turn fails or pauses for a permission reply.
-                self.sessions.update_session_id(project_name, agent.project.session_id or "")
+                        # A stop command removes this exact turn before awaiting
+                        # backend cancellation, so late stream events are dropped.
+                        if self._get_active_turns().get(key) is not turn:
+                            continue
+                        if (
+                            out_msg.text
+                            and out_msg.type.value == "text"
+                            and self.sessions.get_current() != project_name
+                        ):
+                            out_msg = OutgoingMessage(
+                                text=f"[{project_name}] {out_msg.text}",
+                                user_id=out_msg.user_id,
+                                channel=out_msg.channel,
+                                type=out_msg.type,
+                                data=out_msg.data,
+                            )
+                        await reply.send(out_msg)
+                    completed = True
+                finally:
+                    # ACP sessions are assigned during lazy startup. Persist even
+                    # when a turn fails or pauses for a permission reply.
+                    self.sessions.update_session_id(project_name, agent.project.session_id or "")
+                    has_pending = getattr(agent, "has_pending_question", False) is True
+                    if not (completed and has_pending):
+                        turns = self._get_active_turns()
+                        if turns.get(key) is turn:
+                            turns.pop(key)
         log.info("handle_message done: project=%s", project_name)
 
     async def run(self, channel_types: list[str] | None = None) -> None:

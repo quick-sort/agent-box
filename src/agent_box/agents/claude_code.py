@@ -1022,15 +1022,36 @@ class ClaudeCodeAgent(BaseAgent):
                     data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},
                 )
 
+    def _cancel_pending_permission(self) -> None:
+        if self._pending_permission is None:
+            return
+        future: asyncio.Future = self._pending_permission["future"]
+        if not future.done():
+            future.cancel()
+        self._pending_permission = None
+
+    async def cancel(self) -> None:
+        """Interrupt the active Claude turn while keeping the client reusable."""
+        self._cancel_pending_permission()
+        client = self._client
+        if client is None:
+            return
+        try:
+            await client.interrupt()
+        except Exception:
+            # If the streaming interrupt cannot be delivered, disconnecting is
+            # the only reliable way to stop the CLI. The next turn reconnects.
+            log.exception("failed to interrupt Claude agent for project %s", self.project.name)
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            if self._client is client:
+                self._client = None
+
     async def close(self) -> None:
         # Cancel any pending permission future so the ``can_use_tool`` callback
         # (awaiting in a background task) unblocks and returns a deny instead
         # of hanging on a client that's about to disconnect.
-        if self._pending_permission is not None:
-            future: asyncio.Future = self._pending_permission["future"]
-            if not future.done():
-                future.cancel()
-            self._pending_permission = None
+        self._cancel_pending_permission()
         if self._client:
             await self._client.disconnect()
             self._client = None

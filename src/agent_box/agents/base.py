@@ -21,5 +21,8 @@ class BaseAgent(ABC):
     ) -> AsyncIterator[OutgoingMessage]:
         """Execute one conversational turn and stream channel-neutral events."""
 
+    async def cancel(self) -> None:
+        """Interrupt the current turn without releasing persistent resources."""
+
     async def close(self) -> None:
         """Release agent resources. Stateless implementations may do nothing."""
