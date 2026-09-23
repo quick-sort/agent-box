@@ -77,8 +77,7 @@ _TOOLS = [
                 "agent": {
                     "type": "string",
                     "description": (
-                        "Optional agent backend. Use 'kiro' when the user explicitly asks "
-                        "for Kiro; otherwise omit it to use the configured default."
+                        "Optional agent backend. Omit it to use the configured default."
                     ),
                 },
             },
@@ -154,8 +153,6 @@ MESSAGES THAT ARE PROJECT-MANAGEMENT COMMANDS (call a tool):
     - 'new project foo'
     - 'create a project called foo'
     - 'start a new project foo'
-    - 'create project foo using Kiro' (→ agent='kiro')
-    - '用 Kiro 新建项目 foo' (→ agent='kiro')
     - 'init project foo'
     - '新建一个项目 foo'
     - '创建一个 foo 项目'

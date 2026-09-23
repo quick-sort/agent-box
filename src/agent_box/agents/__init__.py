@@ -28,16 +28,10 @@ def _ensure_registry() -> None:
     if _REGISTRY:
         return
     from .claude_code import ClaudeCodeAgent
-    from .kiro import KiroAgent, list_kiro_models
 
     _REGISTRY.update(
         {
             "claude_code": AgentDefinition(factory=ClaudeCodeAgent),
-            "kiro": AgentDefinition(
-                factory=KiroAgent,
-                list_models=list_kiro_models,
-                validate_model_with_anthropic=False,
-            ),
         }
     )
 

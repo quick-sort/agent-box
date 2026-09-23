@@ -11,8 +11,8 @@ QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_rep
                                     │                   │
                                     │                   ├─ ClaudeCodeAgent
                                     │                   │  └─ ClaudeSDKClient
-                                    │                   └─ KiroAgent
-                                    │                      └─ ACPAgent → kiro-cli acp
+                                    │                   └─ ACPAgent
+                                    │                      └─ ACP-compatible CLI
                                     ▼
                           SessionManager
                           .router/projects.json
@@ -24,8 +24,8 @@ QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_rep
 - **Single user** — no auth, one router, one set of projects
 - **Multi-channel** — multiple channels (WeChat + QQ + TUI) can run simultaneously; replies are routed to the originating channel via `OutgoingMessage.channel`
 - **Concurrent agents** — each `handle_message` runs in its own anyio task; different projects execute concurrently, while a per-project lock serializes turns sent to one persistent agent process
-- **Provider-neutral agents** — `BaseAgent.run()` streams `OutgoingMessage`; the typed registry selects Claude Code or Kiro without exposing provider protocols to `App` or channels
-- **ACP driver** — `ACPAgent` owns subprocess lifecycle, ACP initialize/new/load/prompt calls, streaming event normalization, tool permissions, stale-session fallback, and shutdown. Provider wrappers such as `KiroAgent` only define launch policy.
+- **Provider-neutral agents** — `BaseAgent.run()` streams `OutgoingMessage`; the typed registry selects the backend without exposing provider protocols to `App` or channels
+- **ACP driver** — `ACPAgent` owns subprocess lifecycle, ACP initialize/new/load/prompt calls, streaming event normalization, tool permissions, stale-session fallback, and shutdown. Provider wrappers only define launch policy.
 - **Session persistence** — session IDs are stored per project. Claude Code resumes from `~/.claude/projects/<sanitized-cwd>/`; ACP providers attempt `session/load` and create a fresh session if the provider rejects stale history.
 - **Router** — direct Anthropic SDK call with three tools (`create_project`, `switch_project`, `list_projects`). If no tool is invoked, the message is forwarded to the currently pinned project. The pinned project is persisted to `.router/current_project`. No slash-command shortcuts — natural language only.
 - **Project identity** — projects are identified by `name` (no slug). The project folder is `<workspace>/<name>`.
@@ -56,7 +56,6 @@ src/agent_box/
     ├── base.py          # BaseAgent provider-neutral contract
     ├── delivery.py      # Shared [SEND_FILE:path] bridge
     ├── acp.py           # Generic persistent ACP driver
-    ├── kiro.py          # Kiro CLI provider + model discovery
     └── claude_code.py   # ClaudeCodeAgent (ClaudeSDKClient)
 ```
 
@@ -66,7 +65,7 @@ src/agent_box/
 2. `App._dispatch_loop` picks up each message, spawns `handle_message` task
 3. `Router.route()` makes one anthropic API call exposing three tools (`create_project`, `switch_project`, `list_projects`). If the model calls a tool, the router runs it and returns a `RouteResult(reply=...)`. Otherwise it returns `RouteResult(project=<pinned>)`.
 4. If `RouteResult.reply` is set, `App` sends it back directly. Otherwise it resolves `project` → cached `BaseAgent`, acquires that project's lock, and streams `agent.run(prompt, user_id, channel)`.
-5. `ClaudeCodeAgent` uses `ClaudeSDKClient`; `KiroAgent` delegates to the generic ACP driver, which keeps `kiro-cli acp` and its session alive per project.
+5. `ClaudeCodeAgent` uses `ClaudeSDKClient`; ACP backends delegate to the generic ACP driver, which keeps their CLI process and session alive per project.
 6. Each `OutgoingMessage` carries `channel` field → `_route_outbound()` dispatches to correct channel.
 
 ## Environment Variables
@@ -80,12 +79,8 @@ src/agent_box/
 - `ROUTER_MODEL` — model override for router (optional)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
 - `ANTHROPIC_API_KEY` — required by Claude Code SDK and the project-management Router
-- `AGENTS` — enabled backend JSON array (default `["claude_code", "kiro"]`)
+- `AGENTS` — enabled backend JSON array (default `["claude_code"]`)
 - `DEFAULT_AGENT` — backend assigned to new projects (default `claude_code`)
-- `KIRO_API_KEY` — Kiro headless authentication; interactive login state also works
-- `KIRO_CLI_PATH` — Kiro executable (default `kiro-cli`)
-- `KIRO_ACP_ENGINE` — Kiro ACP engine (`v1`, `v2`, or `v3`; default `v2`)
-- `KIRO_AGENT` — optional Kiro custom agent name
 - `ACP_STARTUP_TIMEOUT` / `ACP_SHUTDOWN_TIMEOUT` — ACP process lifecycle timeouts
 
 ## Usage
