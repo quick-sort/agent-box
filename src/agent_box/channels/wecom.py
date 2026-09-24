@@ -291,6 +291,7 @@ class WecomChannel(BaseChannel):
         body = frame.get("body") or {}
         msgtype = body.get("msgtype", "")
         from_user = body.get("from", {}).get("userid", "")
+        # 单聊：chatid 缺失，会话即发送者 userid；群聊：chatid 为群聊 ID。
         chat_id = body.get("chatid") or from_user
 
         if not from_user:
@@ -322,6 +323,7 @@ class WecomChannel(BaseChannel):
                 text=text,
                 user_id=from_user,
                 channel="wecom",
+                conversation_id=chat_id,
                 raw={
                     "frame": frame,
                     "chat_id": chat_id,
@@ -395,7 +397,9 @@ class WecomChannel(BaseChannel):
             return
 
         raw = msg.data or {}
-        chat_id = raw.get("chat_id") or msg.user_id
+        # 优先用 conversation_id（群聊时是群 chatid，单聊时等于 user_id），
+        # 其次回退 raw["chat_id"]，最后才是 user_id —— 兼容旧消息。
+        chat_id = msg.conversation_id or raw.get("chat_id") or msg.user_id
         file_path: str | None = raw.get("file_path") or raw.get("image_path")
 
         if file_path:

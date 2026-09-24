@@ -25,7 +25,7 @@ class App:
     def __init__(self) -> None:
         self.sessions = SessionManager(settings.workspace_dir)
         self.router = Router(self.sessions)
-        self.agents: dict[str, BaseAgent] = {}
+        self.agents: dict[tuple[str, str], BaseAgent] = {}
         self._agent_locks: dict[str, anyio.Lock] = {}
         self._active_turns: dict[tuple[str, str], _ActiveTurn] = {}
         self.channel_types: list[str] = []
@@ -45,19 +45,33 @@ class App:
             turns = self._active_turns = {}
         return turns
 
-    def _get_or_create_agent(self, name: str) -> BaseAgent:
-        if name not in self.agents:
+    def _get_or_create_agent(self, name: str, conversation_id: str | None = None) -> BaseAgent:
+        """Get or create the agent for a (project, conversation) pair.
+
+        Each conversation gets its own agent (and thus its own Claude Code
+        session), so multiple groups / single chats pinned to the same project
+        no longer share context or clobber each other's pending-permission
+        state.
+        """
+        key = (name, conversation_id or "")
+        if key not in self.agents:
             project = self.sessions.get(name)
             assert project is not None, f"unknown project: {name!r}"
-            self.agents[name] = create_agent(project.agent_type, project)
-        return self.agents[name]
+            self.agents[key] = create_agent(project.agent_type, project)
+        return self.agents[key]
 
     async def _close_agent(self, name: str) -> None:
-        """Close and evict one project agent under its serialization lock."""
+        """Close and evict every agent for *name* under its serialization lock.
+
+        A project may have one agent per conversation (``(project, conversation)``
+        keys), so a project reset must evict all of them.
+        """
         async with self._get_project_lock(name):
-            agent = self.agents.pop(name, None)
-            if agent is not None:
-                await agent.close()
+            keys = [k for k in self.agents if k[0] == name]
+            for key in keys:
+                agent = self.agents.pop(key, None)
+                if agent is not None:
+                    await agent.close()
 
     async def _handle_stop_command(
         self,
@@ -112,7 +126,10 @@ class App:
 
         if result.reply is not None:
             log.info("router replied directly (no agent call): %r", (result.reply or "")[:200])
-            await reply.send(OutgoingMessage(text=result.reply, user_id=msg.user_id, channel=msg.channel))
+            await reply.send(OutgoingMessage(
+                text=result.reply, user_id=msg.user_id, channel=msg.channel,
+                conversation_id=msg.conversation_id,
+            ))
             reset_project = result.reset_project
             if reset_project is None and result.reset_agent:
                 reset_project = self.sessions.get_current()
@@ -122,7 +139,8 @@ class App:
 
         project_name = result.project or self.sessions.get_current()
         self.sessions.ensure_default()  # always available as a fallback
-        agent_at_arrival = self.agents.get(project_name)
+        agent_key = (project_name, msg.conversation_id or "")
+        agent_at_arrival = self.agents.get(agent_key)
         permission_pending_at_arrival = (
             getattr(agent_at_arrival, "has_pending_question", False) is True
         )
@@ -131,7 +149,7 @@ class App:
         # same-project messages ordered while preserving concurrency across
         # different projects.
         async with self._get_project_lock(project_name):
-            agent = self._get_or_create_agent(project_name)
+            agent = self._get_or_create_agent(project_name, msg.conversation_id)
             has_pending = getattr(agent, "has_pending_question", False) is True
             log.info(
                 "dispatching to agent: project=%s agent_type=%s has_pending_question=%s",
@@ -150,6 +168,7 @@ class App:
                         ),
                         user_id=msg.user_id,
                         channel=msg.channel,
+                        conversation_id=msg.conversation_id,
                     )
                 )
                 return
@@ -159,6 +178,7 @@ class App:
                         text="⚠️ The permission request was already answered; this reply was ignored.",
                         user_id=msg.user_id,
                         channel=msg.channel,
+                        conversation_id=msg.conversation_id,
                     )
                 )
                 return
@@ -178,6 +198,8 @@ class App:
                         # backend cancellation, so late stream events are dropped.
                         if self._get_active_turns().get(key) is not turn:
                             continue
+                        # 回填会话 id，使回复回到正确的会话（群聊=群 chatid，单聊=user_id）。
+                        out_msg.conversation_id = msg.conversation_id
                         if (
                             out_msg.text
                             and out_msg.type.value == "text"
@@ -189,6 +211,7 @@ class App:
                                 channel=out_msg.channel,
                                 type=out_msg.type,
                                 data=out_msg.data,
+                                conversation_id=msg.conversation_id,
                             )
                         await reply.send(out_msg)
                     completed = True
@@ -246,11 +269,11 @@ class App:
         finally:
             # Long-lived ACP subprocesses must be released even when a channel
             # task crashes or the application is cancelled.
-            for name, agent in list(self.agents.items()):
+            for key, agent in list(self.agents.items()):
                 try:
                     await agent.close()
                 except Exception:
-                    log.exception("failed to close agent for project %s", name)
+                    log.exception("failed to close agent for %s", key)
             self.agents.clear()
 
     async def _route_outbound(
@@ -285,6 +308,7 @@ class App:
                         text=f"❌ 系统错误：{exc}",
                         user_id=msg.user_id,
                         channel=msg.channel,
+                        conversation_id=msg.conversation_id,
                     ))
                 except Exception:
                     log.debug(
