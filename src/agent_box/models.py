@@ -51,3 +51,19 @@ class ProjectInfo:
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+
+
+@dataclass(frozen=True)
+class ChannelSpec:
+    """A concrete channel instance to run.
+
+    ``type`` is the adapter kind ("wecom" / "qq" / "tui" / "weixin").
+    ``instance_id`` is the routing key carried in ``IncomingMessage.channel``
+    / ``OutgoingMessage.channel`` — unique per running channel (e.g.
+    ``"wecom:prod"``). ``config`` carries per-instance configuration for
+    adapters that need it (WeCom), or ``None`` for single-instance types.
+    """
+
+    type: str
+    instance_id: str
+    config: Any | None = None

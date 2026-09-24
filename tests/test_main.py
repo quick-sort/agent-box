@@ -182,3 +182,60 @@ async def test_handle_message_no_tag_when_same_project(tmp_path: Path):
 
     msg = recv.receive_nowait()
     assert msg.text == "done"
+
+
+# ── Channel specs (multi-instance) ──
+
+
+def test_create_channel_wecom_spec(tmp_path: Path):
+    from agent_box.channels.wecom import WecomChannel
+    from agent_box.config import WecomBotConfig
+    from agent_box.models import ChannelSpec
+
+    app = _make_app(tmp_path)
+    config = WecomBotConfig(name="prod", bot_id="b", secret="s")
+    spec = ChannelSpec(type="wecom", instance_id="wecom:prod", config=config)
+
+    with patch("agent_box.channels.wecom.settings") as mock_settings:
+        mock_settings.config_dir = tmp_path
+        send_in, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+        ch = app._create_channel(spec, send_in)
+
+    assert isinstance(ch, WecomChannel)
+    assert ch.channel_id == "wecom:prod"
+
+
+def test_create_channel_qq_still_works(tmp_path: Path):
+    from agent_box.channels.qq import QQChannel
+    from agent_box.models import ChannelSpec
+
+    app = _make_app(tmp_path)
+    send_in, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    ch = app._create_channel(ChannelSpec(type="qq", instance_id="qq"), send_in)
+    assert isinstance(ch, QQChannel)
+
+
+@pytest.mark.anyio
+async def test_route_outbound_dispatches_by_instance_id(tmp_path: Path):
+    """Outgoing messages are routed to the channel matching msg.channel."""
+    app = _make_app(tmp_path)
+
+    send_a, recv_a = anyio.create_memory_object_stream[OutgoingMessage](4)
+    send_b, recv_b = anyio.create_memory_object_stream[OutgoingMessage](4)
+
+    ch_a = MagicMock()
+    ch_a._outbound_send = send_a
+    ch_b = MagicMock()
+    ch_b._outbound_send = send_b
+    channels = {"wecom:prod": ch_a, "wecom:test": ch_b}
+
+    send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app._route_outbound, recv_out, channels)
+        await send_out.send(OutgoingMessage(text="hello", user_id="u1", channel="wecom:test"))
+        await send_out.aclose()
+
+    msg = recv_b.receive_nowait()
+    assert msg.text == "hello"
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv_a.receive_nowait()

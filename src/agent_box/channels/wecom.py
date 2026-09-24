@@ -17,12 +17,11 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from anyio.abc import ObjectSendStream
-
 from wecom_aibot_sdk import WSClient, generate_req_id
-from wecom_aibot_sdk.types import WsFrame, MessageType as WeComMsgType
+from wecom_aibot_sdk.types import WsFrame
 
-from ..config import settings
-from ..models import IncomingMessage, MessageType, OutgoingMessage
+from ..config import WecomBotConfig, settings
+from ..models import ChannelSpec, IncomingMessage, MessageType, OutgoingMessage
 from .base import BaseChannel
 
 log = logging.getLogger(__name__)
@@ -214,21 +213,29 @@ def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[MediaRef]]:
 class WecomChannel(BaseChannel):
     """WeCom Bot WebSocket channel using official wecom-aibot-sdk."""
 
-    def __init__(self, send_stream: ObjectSendStream[IncomingMessage]) -> None:
+    def __init__(self, send_stream: ObjectSendStream[IncomingMessage], *, spec: ChannelSpec) -> None:
         super().__init__(send_stream)
+        assert isinstance(spec.config, WecomBotConfig)
+        self._config: WecomBotConfig = spec.config
+        self.channel_id: str = spec.instance_id
         self._client: WSClient | None = None
-        self._download_dir = settings.config_dir / "channels" / "wecom" / "downloads"
+        self._download_dir = (
+            settings.config_dir / "channels" / "wecom" / self._config.name / "downloads"
+        )
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
     def _check_config(self) -> bool:
         missing = [
             name for name, val in [
-                ("WECOM_BOT_ID", settings.wecom_bot_id),
-                ("WECOM_SECRET", settings.wecom_secret),
+                ("bot_id", self._config.bot_id),
+                ("secret", self._config.secret),
             ] if not val
         ]
         if missing:
-            log.error("WeCom channel: missing config: %s", ", ".join(missing))
+            log.error(
+                "WeCom channel %s: missing config: %s",
+                self.channel_id, ", ".join(missing),
+            )
             return False
         return True
 
@@ -237,12 +244,18 @@ class WecomChannel(BaseChannel):
             await self.send_stream.aclose()
             return
 
+        c = self._config
         self._client = WSClient(
-            bot_id=settings.wecom_bot_id,
-            secret=settings.wecom_secret,
-            heartbeat_interval=30000,
-            max_reconnect_attempts=10,
-            max_auth_failure_attempts=5,
+            bot_id=c.bot_id,
+            secret=c.secret,
+            scene=c.scene,
+            plug_version=c.plug_version,
+            reconnect_interval=c.reconnect_interval,
+            max_reconnect_attempts=c.max_reconnect_attempts,
+            max_auth_failure_attempts=c.max_auth_failure_attempts,
+            heartbeat_interval=c.heartbeat_interval,
+            request_timeout=c.request_timeout,
+            ws_url=c.ws_url,
         )
 
         # Register event handlers
@@ -273,15 +286,15 @@ class WecomChannel(BaseChannel):
         log.info("wecom: WebSocket connected")
 
     def _on_authenticated(self) -> None:
-        log.info("wecom: authenticated successfully")
-        # Expose WSClient to the wecom_mcp tool
+        log.info("wecom [%s]: authenticated successfully", self.channel_id)
+        # Expose WSClient to the wecom_mcp tool, keyed by instance id.
         from ..tools.wecom_mcp import set_ws_client
-        set_ws_client(self._client)
+        set_ws_client(self.channel_id, self._client)
 
     def _on_disconnected(self, reason: str) -> None:
-        log.warning("wecom: disconnected: %s", reason)
+        log.warning("wecom [%s]: disconnected: %s", self.channel_id, reason)
         from ..tools.wecom_mcp import set_ws_client
-        set_ws_client(None)
+        set_ws_client(self.channel_id, None)
 
     def _on_error(self, error: Exception) -> None:
         log.error("wecom: error: %s", error)
@@ -321,7 +334,7 @@ class WecomChannel(BaseChannel):
             IncomingMessage(
                 text=text,
                 user_id=from_user,
-                channel="wecom",
+                channel=self.channel_id,
                 raw={
                     "frame": frame,
                     "chat_id": chat_id,

@@ -368,6 +368,10 @@ class ClaudeCodeAgent(BaseAgent):
     def __init__(self, project: ProjectInfo) -> None:
         super().__init__(project)
         self._client: ClaudeSDKClient | None = None
+        # Channel instance id of the turn currently being served. Set at the
+        # top of run(); the wecom_mcp tool closure reads it to resolve which
+        # WeCom bot's MCP server to talk to.
+        self._current_channel: str = ""
         # When the agent calls AskUserQuestion / ExitPlanMode, the
         # ``can_use_tool`` callback parks here on an ``asyncio.Future``.
         # ``run()`` surfaces the question to the IM channel and returns;
@@ -410,7 +414,7 @@ class ClaudeCodeAgent(BaseAgent):
         from ..tools.wecom_mcp import is_wecom_mcp_enabled
         if is_wecom_mcp_enabled():
             from ..tools.wecom_mcp import create_wecom_mcp_server
-            opts.mcp_servers = {"wecom_mcp": create_wecom_mcp_server()}
+            opts.mcp_servers = {"wecom_mcp": create_wecom_mcp_server(lambda: self._current_channel)}
             opts.allowed_tools = ["wecom_mcp"]
         return opts
 
@@ -753,6 +757,9 @@ class ClaudeCodeAgent(BaseAgent):
             await client.disconnect()
 
     async def run(self, prompt: str, user_id: str = "", channel: str = "") -> AsyncIterator[OutgoingMessage]:
+        # Set before _ensure_client() so the wecom_mcp tool closure (built in
+        # _build_options) sees the correct channel instance for this turn.
+        self._current_channel = channel
         client = await self._ensure_client()
 
         # Diagnostic: trace every run() entry — what prompt, what pending state.

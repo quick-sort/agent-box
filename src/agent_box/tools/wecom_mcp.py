@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -26,7 +26,6 @@ from claude_agent_sdk import tool, create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig
 
 from wecom_aibot_sdk import WSClient, generate_req_id
-from wecom_aibot_sdk.types import WsCmd
 
 log = logging.getLogger(__name__)
 
@@ -46,26 +45,40 @@ def is_wecom_mcp_enabled() -> bool:
     """Check if wecom_mcp tool is currently enabled."""
     return _enabled
 
-# ── Global WSClient reference ────────────────────────────────────────────────
-# Set by WecomChannel when the WebSocket connection is established.
+# ── Per-instance WSClient registry ──────────────────────────────────────────
+# Set by WecomChannel when its WebSocket connection is established. Keyed by
+# channel instance id (e.g. "wecom:prod"), so multiple bots don't overwrite
+# each other. ``instance_id=None`` resolves to a primary fallback used when a
+# message does not originate from a WeCom channel.
 
-_ws_client: WSClient | None = None
-
-
-def set_ws_client(client: WSClient | None) -> None:
-    """Store the active WSClient for use by the MCP tool."""
-    global _ws_client
-    _ws_client = client
+_ws_clients: dict[str, WSClient] = {}
 
 
-def get_ws_client() -> WSClient | None:
-    """Get the currently active WSClient."""
-    return _ws_client
+def set_ws_client(instance_id: str, client: WSClient | None) -> None:
+    """Register (or clear) the WSClient for a channel instance."""
+    global _ws_clients
+    if client is None:
+        _ws_clients.pop(instance_id, None)
+    else:
+        _ws_clients[instance_id] = client
+
+
+def get_ws_client(instance_id: str | None = None) -> WSClient | None:
+    """Get the WSClient for *instance_id*, or the primary fallback when None.
+
+    The primary fallback prefers ``wecom:default`` (the legacy single-instance
+    name) and otherwise the first registered instance.
+    """
+    if instance_id is not None:
+        return _ws_clients.get(instance_id)
+    if "wecom:default" in _ws_clients:
+        return _ws_clients["wecom:default"]
+    return next(iter(_ws_clients.values()), None)
 
 
 # ── MCP Config cache ─────────────────────────────────────────────────────────
 
-_mcp_config_cache: dict[str, str] = {}  # category → URL
+_mcp_config_cache: dict[tuple[str | None, str], str] = {}  # (instance, category) → URL
 
 
 def clear_mcp_cache() -> None:
@@ -73,16 +86,17 @@ def clear_mcp_cache() -> None:
     _mcp_config_cache.clear()
 
 
-async def _get_mcp_url(category: str) -> str:
+async def _get_mcp_url(instance: str | None, category: str) -> str:
     """Fetch MCP Server URL for a category via WSClient.
 
     Sends `aibot_get_mcp_config` command through the WebSocket connection
     to retrieve the HTTP endpoint for the given MCP category.
     """
-    if category in _mcp_config_cache:
-        return _mcp_config_cache[category]
+    key = (instance, category)
+    if key in _mcp_config_cache:
+        return _mcp_config_cache[key]
 
-    client = get_ws_client()
+    client = get_ws_client(instance)
     if not client or not client.is_connected:
         raise RuntimeError("WeCom WebSocket 未连接，无法获取 MCP 配置")
 
@@ -104,16 +118,16 @@ async def _get_mcp_url(category: str) -> str:
     if not url:
         raise RuntimeError(f"MCP 配置响应缺少 url 字段 (category={category!r})")
 
-    _mcp_config_cache[category] = url
-    log.info("wecom_mcp: config fetched for category=%s url=%s", category, url)
+    _mcp_config_cache[key] = url
+    log.info("wecom_mcp: config fetched for instance=%s category=%s url=%s", instance, category, url)
     return url
 
 
 # ── Streamable HTTP session management ───────────────────────────────────────
 
-# category → session_id (None = stateless)
-_sessions: dict[str, str | None] = {}
-_stateless_categories: set[str] = set()
+# (instance, category) → session_id (None = stateless)
+_sessions: dict[tuple[str | None, str], str | None] = {}
+_stateless_categories: set[tuple[str | None, str]] = set()
 
 _HTTP_TIMEOUT = 30.0
 _INIT_TIMEOUT = 15.0
@@ -199,12 +213,13 @@ def _parse_sse(text: str) -> Any:
     return rpc.get("result")
 
 
-async def _ensure_session(category: str, url: str) -> str | None:
+async def _ensure_session(instance: str | None, category: str, url: str) -> str | None:
     """Ensure MCP session is initialized for a category. Returns session_id."""
-    if category in _stateless_categories:
+    key = (instance, category)
+    if key in _stateless_categories:
         return None
-    if category in _sessions:
-        return _sessions[category]
+    if key in _sessions:
+        return _sessions[key]
 
     # Initialize session
     init_params = {
@@ -218,8 +233,8 @@ async def _ensure_session(category: str, url: str) -> str | None:
 
     if not session_id:
         # Stateless server
-        _stateless_categories.add(category)
-        _sessions[category] = None
+        _stateless_categories.add(key)
+        _sessions[key] = None
         return None
 
     # Send initialized notification
@@ -235,37 +250,42 @@ async def _ensure_session(category: str, url: str) -> str | None:
     async with httpx.AsyncClient(timeout=_INIT_TIMEOUT) as client:
         await client.post(url, json=notify_body, headers=headers)
 
-    _sessions[category] = session_id
-    log.info("wecom_mcp: session established for category=%s", category)
+    _sessions[key] = session_id
+    log.info("wecom_mcp: session established for instance=%s category=%s", instance, category)
     return session_id
 
 
-async def _mcp_request(category: str, method: str, params: dict[str, Any] | None = None) -> Any:
+async def _mcp_request(
+    instance: str | None,
+    category: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> Any:
     """High-level MCP request with session management and retry on 404."""
-    url = await _get_mcp_url(category)
-    session_id = await _ensure_session(category, url)
+    url = await _get_mcp_url(instance, category)
+    session_id = await _ensure_session(instance, category, url)
+    key = (instance, category)
 
     try:
         result, new_sid = await _send_jsonrpc(url, method, params, session_id)
         if new_sid:
-            _sessions[category] = new_sid
+            _sessions[key] = new_sid
         return result
     except RuntimeError as e:
         # Session expired (404) — rebuild and retry once
         if "404" in str(e):
-            _sessions.pop(category, None)
-            session_id = await _ensure_session(category, url)
+            _sessions.pop(key, None)
+            session_id = await _ensure_session(instance, category, url)
             result, new_sid = await _send_jsonrpc(url, method, params, session_id)
             if new_sid:
-                _sessions[category] = new_sid
+                _sessions[key] = new_sid
             return result
         raise
 
 
 # ── Tool definitions ─────────────────────────────────────────────────────────
 
-@tool(
-    "wecom_mcp",
+_TOOL_DESCRIPTION = (
     "调用企业微信 MCP 工具。支持两种操作：\n"
     "  - list: 列出指定品类的所有可用工具及其参数定义\n"
     "  - call: 调用指定品类的某个工具方法\n\n"
@@ -273,77 +293,93 @@ async def _mcp_request(category: str, method: str, params: dict[str, Any] | None
     "meeting(会议), todo(待办), msg(消息), smartsheet(智能表格)\n\n"
     "示例:\n"
     "  list contact → 列出通讯录相关的所有工具\n"
-    "  call doc createDocument {\"title\": \"会议纪要\"} → 创建文档",
-    {
-        "action": str,
-        "category": str,
-        "method": str,
-        "args": str,
-    },
+    '  call doc createDocument {"title": "会议纪要"} → 创建文档'
 )
-async def wecom_mcp_tool(args: dict[str, Any]) -> dict[str, Any]:
-    """Execute a wecom_mcp action (list or call)."""
-    action = args.get("action", "")
-    category = args.get("category", "")
-    method = args.get("method", "")
-    raw_args = args.get("args", "")
 
-    if not category:
-        return _text_result({"error": "缺少 category 参数"})
 
-    try:
-        if action == "list":
-            result = await _mcp_request(category, "tools/list")
-            tools = (result or {}).get("tools", [])
-            return _text_result({
-                "category": category,
-                "count": len(tools),
-                "tools": [
-                    {
-                        "name": t.get("name"),
-                        "description": t.get("description", ""),
-                        "inputSchema": t.get("inputSchema"),
-                    }
-                    for t in tools
-                ],
-            })
+def _resolve_instance(channel: str) -> str | None:
+    """Map a channel id to a WeCom instance id (None = primary fallback)."""
+    return channel if channel.startswith("wecom:") else None
 
-        elif action == "call":
-            if not method:
-                return _text_result({"error": "action 为 call 时必须提供 method 参数"})
 
-            # Parse args
-            call_args: dict[str, Any] = {}
-            if raw_args:
-                if isinstance(raw_args, str):
-                    try:
-                        call_args = json.loads(raw_args)
-                    except json.JSONDecodeError as e:
-                        return _text_result({"error": f"args 不是合法 JSON: {e}"})
-                elif isinstance(raw_args, dict):
-                    call_args = raw_args
+def create_wecom_mcp_server(get_current_channel: Callable[[], str]) -> McpSdkServerConfig:
+    """Create the wecom_mcp SDK MCP server, bound to the calling agent.
 
-            result = await _mcp_request(category, "tools/call", {
-                "name": method,
-                "arguments": call_args,
-            })
-            return _text_result(result)
+    ``get_current_channel`` returns the channel instance id of the turn the
+    agent is currently serving (set by the agent's ``run()``). The tool uses it
+    to resolve which WeCom bot's WSClient — and therefore MCP server — to talk
+    to, so a message from bot A never reaches bot B's MCP server.
+    """
 
-        else:
-            return _text_result({"error": f"未知操作: {action}，支持 list 和 call"})
+    @tool(
+        "wecom_mcp",
+        _TOOL_DESCRIPTION,
+        {
+            "action": str,
+            "category": str,
+            "method": str,
+            "args": str,
+        },
+    )
+    async def wecom_mcp_tool(args: dict[str, Any]) -> dict[str, Any]:
+        """Execute a wecom_mcp action (list or call)."""
+        action = args.get("action", "")
+        category = args.get("category", "")
+        method = args.get("method", "")
+        raw_args = args.get("args", "")
+        instance = _resolve_instance(get_current_channel())
 
-    except Exception as e:
-        log.exception("wecom_mcp: action=%s category=%s method=%s failed", action, category, method)
-        return _text_result({"error": str(e)})
+        if not category:
+            return _text_result({"error": "缺少 category 参数"})
+
+        try:
+            if action == "list":
+                result = await _mcp_request(instance, category, "tools/list")
+                tools = (result or {}).get("tools", [])
+                return _text_result({
+                    "category": category,
+                    "count": len(tools),
+                    "tools": [
+                        {
+                            "name": t.get("name"),
+                            "description": t.get("description", ""),
+                            "inputSchema": t.get("inputSchema"),
+                        }
+                        for t in tools
+                    ],
+                })
+
+            elif action == "call":
+                if not method:
+                    return _text_result({"error": "action 为 call 时必须提供 method 参数"})
+
+                # Parse args
+                call_args: dict[str, Any] = {}
+                if raw_args:
+                    if isinstance(raw_args, str):
+                        try:
+                            call_args = json.loads(raw_args)
+                        except json.JSONDecodeError as e:
+                            return _text_result({"error": f"args 不是合法 JSON: {e}"})
+                    elif isinstance(raw_args, dict):
+                        call_args = raw_args
+
+                result = await _mcp_request(instance, category, "tools/call", {
+                    "name": method,
+                    "arguments": call_args,
+                })
+                return _text_result(result)
+
+            else:
+                return _text_result({"error": f"未知操作: {action}，支持 list 和 call"})
+
+        except Exception as e:
+            log.exception("wecom_mcp: action=%s category=%s method=%s failed", action, category, method)
+            return _text_result({"error": str(e)})
+
+    return create_sdk_mcp_server("wecom_mcp", tools=[wecom_mcp_tool])
 
 
 def _text_result(data: Any) -> dict[str, Any]:
     """Format result as MCP tool response."""
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
-
-
-# ── Public API ───────────────────────────────────────────────────────────────
-
-def create_wecom_mcp_server() -> McpSdkServerConfig:
-    """Create the wecom_mcp SDK MCP server config for ClaudeAgentOptions."""
-    return create_sdk_mcp_server("wecom_mcp", tools=[wecom_mcp_tool])

@@ -137,6 +137,8 @@ uv run agent-box --qq
 | `WEIXIN_ACCOUNT_ID` | 微信账号 ID | — |
 | `QQBOT_APP_ID` | QQ Bot AppID | — |
 | `QQBOT_CLIENT_SECRET` | QQ Bot Secret | — |
+| `WECOM_BOTS` | 多个企业微信机器人的 JSON 数组（每项含 `name`/`bot_id`/`secret`/`ws_url`/`scene` 等，见 `sample.env`） | — |
+| `WECOM_BOT_ID` / `WECOM_SECRET` | 单机器人凭据（`WECOM_BOTS` 为空时生效） | — |
 | `GH_TOKEN` | GitHub token（供 Agent 使用 `gh` CLI） | — |
 | `CONFIG_DIR` | 配置根目录 | `~/.agent-box` |
 | `WORKSPACE_DIR` | 项目工作区根目录 | `~/.agent-box/workspace` |
