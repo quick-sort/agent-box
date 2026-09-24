@@ -1,14 +1,8 @@
-"""Tests for the generic ACP agent driver and the Kiro provider.
+"""Tests for the generic ACP agent driver.
 
-Pure-logic branches are covered with mocks (CI-safe and deterministic); the
-Kiro CLI model lister also has an integration test that runs only when
-``kiro-cli`` is present on the machine.
+Pure-logic branches are covered with mocks (CI-safe and deterministic).
 """
 
-import shutil
-from unittest.mock import AsyncMock, patch
-
-import pytest
 from acp.schema import (
     DeniedOutcome,
     PermissionOption,
@@ -17,7 +11,6 @@ from acp.schema import (
 )
 
 from agent_box.agents.acp import ACPAgent, ACPProvider
-from agent_box.agents.kiro import KiroAgent, list_kiro_models
 from agent_box.models import ProjectInfo
 
 # ── helpers ──
@@ -163,109 +156,3 @@ def test_format_tool_call_truncates_long_title(sample_project: ProjectInfo):
     assert result.startswith("🔧 ")
     assert result.endswith("...")
     assert len(result) <= 84  # icon + space + 77 chars + "..."
-
-
-# ── KiroAgent command construction ──
-
-
-def test_kiro_agent_command_default_engine(sample_project: ProjectInfo):
-    agent = KiroAgent(sample_project)
-    assert agent.provider.command == ("kiro-cli", "acp", "--agent-engine", "v2")
-
-
-def test_kiro_agent_command_with_agent(sample_project: ProjectInfo, monkeypatch):
-    from agent_box.config import settings
-    monkeypatch.setattr(settings, "kiro_agent", "my-agent")
-    agent = KiroAgent(sample_project)
-    assert agent.provider.command == (
-        "kiro-cli", "acp", "--agent-engine", "v2", "--agent", "my-agent",
-    )
-
-
-def test_kiro_agent_model_flag_appended(sample_project: ProjectInfo):
-    agent = KiroAgent(sample_project)
-    sample_project.model = "gpt-5.6-sol"
-    assert agent.provider.command_for(sample_project) == (
-        "kiro-cli", "acp", "--agent-engine", "v2", "--model", "gpt-5.6-sol",
-    )
-
-
-# ── list_kiro_models (mocked subprocess) ──
-
-
-@pytest.mark.anyio
-async def test_list_kiro_models_parses_model_ids():
-    proc = AsyncMock()
-    proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(
-        b'{"models":[{"model_id":"gpt-5.6-sol"},{"model_id":"deepseek-3.2"}]}',
-        b"",
-    ))
-    with patch(
-        "agent_box.agents.kiro.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=proc),
-    ):
-        models = await list_kiro_models()
-    assert models == ["gpt-5.6-sol", "deepseek-3.2"]
-
-
-@pytest.mark.anyio
-async def test_list_kiro_models_filters_empty_model_ids():
-    proc = AsyncMock()
-    proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(
-        b'{"models":[{"model_id":"a"},{"model_id":""},{"model_id":"b"}]}',
-        b"",
-    ))
-    with patch(
-        "agent_box.agents.kiro.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=proc),
-    ):
-        models = await list_kiro_models()
-    assert models == ["a", "b"]
-
-
-@pytest.mark.anyio
-async def test_list_kiro_models_cli_not_found():
-    with patch(
-        "agent_box.agents.kiro.asyncio.create_subprocess_exec",
-        side_effect=FileNotFoundError,
-    ), pytest.raises(RuntimeError, match="Kiro CLI not found"):
-        await list_kiro_models()
-
-
-@pytest.mark.anyio
-async def test_list_kiro_models_nonzero_exit():
-    proc = AsyncMock()
-    proc.returncode = 1
-    proc.communicate = AsyncMock(return_value=(b"", b"auth error"))
-    with patch(
-        "agent_box.agents.kiro.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=proc),
-    ), pytest.raises(RuntimeError, match="auth error"):
-        await list_kiro_models()
-
-
-@pytest.mark.anyio
-async def test_list_kiro_models_invalid_json():
-    proc = AsyncMock()
-    proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"not json at all", b""))
-    with patch(
-        "agent_box.agents.kiro.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=proc),
-    ), pytest.raises(RuntimeError, match="invalid model list"):
-        await list_kiro_models()
-
-
-# ── list_kiro_models (real CLI integration) ──
-
-
-@pytest.mark.anyio
-@pytest.mark.skipif(shutil.which("kiro-cli") is None, reason="kiro-cli not installed")
-async def test_list_kiro_models_integration():
-    """Real kiro-cli run — validates the output format the parser expects."""
-    models = await list_kiro_models()
-    assert isinstance(models, list)
-    assert models, "expected a non-empty model list from a logged-in kiro-cli"
-    assert all(isinstance(m, str) and m for m in models)

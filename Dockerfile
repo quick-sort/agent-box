@@ -40,28 +40,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && useradd --no-create-home -d /home/agent -s /bin/bash agent
 
-# Kiro CLI ACP provider. Pin both the release and checksums so image builds
-# remain reproducible; arm64 uses the musl build because Debian's glibc is
-# below Kiro's current aarch64-gnu minimum.
-ARG TARGETARCH
-ARG KIRO_CLI_VERSION=2.21.1
-RUN case "$TARGETARCH" in \
-        amd64) archive="kirocli-x86_64-linux.zip"; checksum="1f81a69b2a5d49fc74793d8805e6c31650b78e957ebcf54e90877a8e72f4b0a1" ;; \
-        arm64) archive="kirocli-aarch64-linux-musl.zip"; checksum="7f5df29bd3a1097a387a4e0c88e035e5a26d56aa59cea8c5c78123608b4549c0" ;; \
-        *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${archive}" -o /tmp/kiro-cli.zip \
-    && echo "${checksum}  /tmp/kiro-cli.zip" | sha256sum -c - \
-    && mkdir -p /tmp/kiro-cli \
-    && unzip -q /tmp/kiro-cli.zip -d /tmp/kiro-cli \
-    && chmod +x /tmp/kiro-cli/kirocli/install.sh \
-    && HOME=/home/agent KIRO_CLI_SKIP_SETUP=1 /tmp/kiro-cli/kirocli/install.sh \
-    && install -m 0755 /home/agent/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
-    && install -m 0755 /home/agent/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat \
-    && rm -f /home/agent/.local/bin/kiro-cli /home/agent/.local/bin/kiro-cli-chat \
-    && test -x /usr/local/bin/kiro-cli \
-    && rm -rf /tmp/kiro-cli /tmp/kiro-cli.zip
-
 
 # Persist channel state, agent credentials, and project data across restarts
 VOLUME ["/home/agent"]
