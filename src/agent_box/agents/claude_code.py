@@ -933,6 +933,75 @@ class ClaudeCodeAgent(BaseAgent):
             await self._reset_dead_client(client)
             raise
 
+        # After the turn is fully streamed and the CLI is idle, check context
+        # usage and proactively compact before a future turn hits the hard
+        # limit. Skip when paused on a permission question (CLI is mid-turn).
+        if self._pending_permission is None:
+            async for out_msg in self._maybe_compact_proactively(client, user_id, channel):
+                yield out_msg
+
+    async def _maybe_compact_proactively(
+        self,
+        client: ClaudeSDKClient,
+        user_id: str,
+        channel: str,
+    ) -> AsyncIterator[OutgoingMessage]:
+        """Compact proactively when post-turn context usage exceeds the threshold.
+
+        Runs after a turn's messages have been streamed, while the client is
+        still alive and idle. ``get_context_usage`` resolves locally in the
+        CLI (no API call), so this is a cheap control request.
+        """
+        threshold = settings.agent_auto_compact_threshold
+        if threshold is None:
+            return
+        # The CLI must be connected and idle to answer the control request.
+        if self._client is not client or not self._is_alive():
+            return
+        try:
+            usage = await client.get_context_usage()
+        except Exception:
+            log.debug("proactive context-usage check failed", exc_info=True)
+            return
+        pct = float(usage.get("percentage") or 0.0)
+        log.info(
+            "post-turn context usage for project %s: %.1f%% (threshold %.1f%%)",
+            self.project.name, pct, threshold,
+        )
+        if pct < threshold:
+            return
+        log.warning(
+            "context usage %.1f%% >= threshold %.1f%% for project %s — compacting proactively",
+            pct, threshold, self.project.name,
+        )
+        async for out_msg in self._compact_session(client, user_id, channel):
+            yield out_msg
+
+    async def _compact_session(
+        self,
+        client: ClaudeSDKClient,
+        user_id: str,
+        channel: str,
+    ) -> AsyncIterator[OutgoingMessage]:
+        """Send /compact and stream the terminal ResultMessage, updating the
+        resume session id. Yields a failure message when compaction errors."""
+        yield OutgoingMessage(
+            text="聊这么久，我脑子都蒙了，让我先整理下",
+            user_id=user_id, channel=channel, type=MessageType.system,
+        )
+        log.info("sending /compact to project %s", self.project.name)
+        await client.query("/compact")
+        async for msg in client.receive_response():
+            if isinstance(msg, ResultMessage):
+                if msg.session_id:
+                    self._session_id = msg.session_id
+                if msg.is_error:
+                    yield OutgoingMessage(
+                        text="❌ 自动压缩失败，请手动发送 /compact",
+                        user_id=user_id, channel=channel, type=MessageType.text,
+                    )
+                return
+
     async def _recover_from_context_limit(
         self,
         client: ClaudeSDKClient,
@@ -960,20 +1029,9 @@ class ClaudeCodeAgent(BaseAgent):
         except Exception:
             log.warning("failed to read session messages for context replay", exc_info=True)
 
-        # 2. Send /compact
-        log.info("sending /compact to project %s", self.project.name)
-        await client.query("/compact")
-        async for msg in client.receive_response():
-            if isinstance(msg, ResultMessage):
-                if msg.session_id:
-                    self._session_id = msg.session_id
-                if msg.is_error:
-                    yield OutgoingMessage(
-                        text="❌ 自动压缩失败，请手动发送 /compact",
-                        user_id=user_id, channel=channel, type=MessageType.text,
-                    )
-                    return
-                break
+        # 2. Compact the session (shared with the proactive path).
+        async for out_msg in self._compact_session(client, user_id, channel):
+            yield out_msg
 
         # 3. Re-send context + original prompt
         replay = recent_context + "\n\n" + prompt if recent_context else prompt

@@ -1349,6 +1349,7 @@ async def test_run_triggers_context_limit_recovery(sample_project: ProjectInfo):
 
     # Should have: recovery notice + response text + result
     texts = [m.text for m in msgs]
+    assert any("聊这么久，我脑子都蒙了" in t for t in texts)
     assert any("自动压缩" in t for t in texts)
     assert any("Recovered response" in t for t in texts)
 
@@ -1395,6 +1396,152 @@ async def test_run_context_limit_compact_fails(sample_project: ProjectInfo):
     texts = [m.text for m in msgs]
     assert any("自动压缩" in t for t in texts)
     assert any("压缩失败" in t for t in texts)
+
+
+# ── Post-turn proactive compaction ──
+
+
+def _compact_result():
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype="success", is_error=False, duration_ms=100, duration_api_ms=50,
+        num_turns=1, session_id="sess-pro", total_cost_usd=0.01, usage=None,
+    )
+
+
+def _ok_result():
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype="success", is_error=False, duration_ms=200, duration_api_ms=100,
+        num_turns=1, session_id="sess-pro", total_cost_usd=0.02, usage=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_proactive_compact_disabled_by_default(sample_project: ProjectInfo):
+    """With no threshold configured, post-turn usage is never queried."""
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield _ok_result()
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    with patch("agent_box.agents.claude_code.settings") as s:
+        s.agent_auto_compact_threshold = None
+        [m async for m in agent.run("do work")]
+
+    mock_client.get_context_usage.assert_not_called()
+    assert mock_client.query.await_count == 1
+    assert mock_client.query.await_args.args[0] == "do work"
+
+
+@pytest.mark.anyio
+async def test_proactive_compact_triggers_over_threshold(sample_project: ProjectInfo):
+    """When post-turn usage exceeds the threshold, /compact runs."""
+    from agent_box.agents.claude_code import settings as _settings
+
+    original = _settings.agent_auto_compact_threshold
+    _settings.agent_auto_compact_threshold = 80.0
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    mock_client.get_context_usage = AsyncMock(return_value={"percentage": 92.0})
+
+    call_count = {"receives": 0}
+
+    async def fake_receive():
+        call_count["receives"] += 1
+        if call_count["receives"] == 1:
+            yield _ok_result()  # main turn
+        else:
+            yield _compact_result()  # /compact result
+
+    mock_client.receive_response = fake_receive
+
+    try:
+        agent = ClaudeCodeAgent(sample_project)
+        agent._client = mock_client
+        msgs = [m async for m in agent.run("do work")]
+    finally:
+        _settings.agent_auto_compact_threshold = original
+
+    texts = [m.text for m in msgs]
+    assert any("聊这么久，我脑子都蒙了" in t for t in texts)
+    calls = [c.args[0] for c in mock_client.query.call_args_list]
+    assert calls == ["do work", "/compact"]
+
+
+@pytest.mark.anyio
+async def test_proactive_compact_skips_under_threshold(sample_project: ProjectInfo):
+    """When post-turn usage is under the threshold, /compact is not sent."""
+    from agent_box.agents.claude_code import settings as _settings
+
+    original = _settings.agent_auto_compact_threshold
+    _settings.agent_auto_compact_threshold = 80.0
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    mock_client.get_context_usage = AsyncMock(return_value={"percentage": 42.0})
+
+    async def fake_receive():
+        yield _ok_result()
+
+    mock_client.receive_response = fake_receive
+
+    try:
+        agent = ClaudeCodeAgent(sample_project)
+        agent._client = mock_client
+        [m async for m in agent.run("do work")]
+    finally:
+        _settings.agent_auto_compact_threshold = original
+
+    mock_client.get_context_usage.assert_awaited_once()
+    calls = [c.args[0] for c in mock_client.query.call_args_list]
+    assert calls == ["do work"]
+
+
+@pytest.mark.anyio
+async def test_proactive_compact_skips_while_permission_pending(sample_project: ProjectInfo):
+    """No usage check when a permission question left the CLI mid-turn."""
+    from agent_box.agents.claude_code import settings as _settings
+
+    original = _settings.agent_auto_compact_threshold
+    _settings.agent_auto_compact_threshold = 80.0
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+    mock_client.get_context_usage = AsyncMock(return_value={"percentage": 95.0})
+
+    async def fake_receive():
+        yield _ok_result()
+
+    mock_client.receive_response = fake_receive
+
+    try:
+        import asyncio
+        agent = ClaudeCodeAgent(sample_project)
+        agent._client = mock_client
+        future = asyncio.get_event_loop().create_future()
+        agent._pending_permission = {
+            "tool_name": "ExitPlanMode",
+            "tool_use_id": "tu_1",
+            "input": {},
+            "questions": [],
+            "future": future,
+        }
+        [m async for m in agent.run("approved")]
+    finally:
+        _settings.agent_auto_compact_threshold = original
+
+    # Permission-resume path: no fresh query, and no proactive compact either.
+    mock_client.query.assert_not_called()
+    mock_client.get_context_usage.assert_not_called()
 
 
 # ── CLI 进程中途崩溃的自愈 ──
