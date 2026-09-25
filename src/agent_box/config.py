@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     default_agent: str = "claude_code"
     agent_permission_mode: str = "bypassPermissions"
     agent_max_turns: int | None = None
+    # Proactively compact a session when post-turn context usage exceeds this
+    # percentage of the window (SDK ``ContextUsageResponse.percentage``).
+    # None disables proactive compaction (turns fail at the hard limit only).
+    agent_auto_compact_threshold: float | None = None
 
     # Generic ACP driver
     acp_startup_timeout: float = 30.0
