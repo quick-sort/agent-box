@@ -710,3 +710,89 @@ async def test_qqchannel_asr_enabled_when_key_set():
         mock_settings.glm_asr_model = "glm-asr-2512"
         channel = QQChannel(send)
     assert isinstance(channel._asr, GlmASR)
+
+
+# ── WecomChannel (multi-instance) ──
+
+
+def _make_wecom_spec(name="prod", **overrides):
+    from agent_box.config import WecomBotConfig
+    from agent_box.models import ChannelSpec
+
+    kwargs = {"bot_id": "bid", "secret": "sec", **overrides}
+    config = WecomBotConfig(name=name, **kwargs)
+    return ChannelSpec(type="wecom", instance_id=f"wecom:{name}", config=config)
+
+
+def _make_wecom_channel(tmp_path, name="prod", **overrides):
+    from agent_box.channels.wecom import WecomChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    spec = _make_wecom_spec(name, **overrides)
+    with patch("agent_box.channels.wecom.settings") as mock_settings:
+        mock_settings.config_dir = tmp_path
+        channel = WecomChannel(send, spec=spec)
+    return channel
+
+
+def test_wecom_channel_uses_instance_id(tmp_path):
+    channel = _make_wecom_channel(tmp_path, name="prod")
+    assert channel.channel_id == "wecom:prod"
+    assert channel._config.bot_id == "bid"
+    assert channel._config.secret == "sec"
+
+
+def test_wecom_download_dir_namespaced(tmp_path):
+    a = _make_wecom_channel(tmp_path, name="prod")
+    b = _make_wecom_channel(tmp_path, name="test")
+    assert str(a._download_dir) != str(b._download_dir)
+    assert a._download_dir.name == "downloads"
+    assert a._download_dir.parent.name == "prod"
+    assert b._download_dir.parent.name == "test"
+
+
+@pytest.mark.anyio
+async def test_wecom_client_constructed_with_full_config(tmp_path):
+    from agent_box.channels.wecom import WecomChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    spec = _make_wecom_spec(
+        name="prod",
+        ws_url="wss://custom",
+        scene=3,
+        heartbeat_interval=12345,
+        request_timeout=9999,
+    )
+
+    with patch("agent_box.channels.wecom.WSClient") as MockWS:
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_client.disconnect = AsyncMock()
+        MockWS.return_value = mock_client
+
+        with patch("agent_box.channels.wecom.settings") as mock_settings:
+            mock_settings.config_dir = tmp_path
+            channel = WecomChannel(send, spec=spec)
+        await channel.start()
+
+    kwargs = MockWS.call_args.kwargs
+    assert kwargs["bot_id"] == "bid"
+    assert kwargs["secret"] == "sec"
+    assert kwargs["ws_url"] == "wss://custom"
+    assert kwargs["scene"] == 3
+    assert kwargs["heartbeat_interval"] == 12345
+    assert kwargs["request_timeout"] == 9999
+
+
+@pytest.mark.anyio
+async def test_wecom_registers_ws_client_by_instance(tmp_path):
+    channel = _make_wecom_channel(tmp_path, name="prod")
+    channel._client = MagicMock()
+
+    with patch("agent_box.tools.wecom_mcp.set_ws_client") as mock_set:
+        channel._on_authenticated()
+        mock_set.assert_called_once_with("wecom:prod", channel._client)
+
+    with patch("agent_box.tools.wecom_mcp.set_ws_client") as mock_set:
+        channel._on_disconnected("some reason")
+        mock_set.assert_called_once_with("wecom:prod", None)

@@ -16,6 +16,7 @@ def _make_channel():
     channel = WecomChannel.__new__(WecomChannel)
     channel.send_stream = send
     channel._download_dir = MagicMock()
+    channel.channel_id = "wecom:test"
     channel._client = MagicMock()
     return channel, send, recv
 
@@ -29,6 +30,7 @@ async def test_group_message_sets_conversation_id_to_chatid():
     channel = WecomChannel.__new__(WecomChannel)
     channel.send_stream = send
     channel._download_dir = MagicMock()
+    channel.channel_id = "wecom:test"
 
     frame = {
         "body": {
@@ -56,6 +58,7 @@ async def test_single_message_conversation_id_is_user_id():
     channel = WecomChannel.__new__(WecomChannel)
     channel.send_stream = send
     channel._download_dir = MagicMock()
+    channel.channel_id = "wecom:test"
 
     frame = {
         "body": {

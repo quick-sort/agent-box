@@ -12,7 +12,7 @@ from .agents import create_agent
 from .agents.base import BaseAgent
 from .channels.base import BaseChannel
 from .config import settings
-from .models import IncomingMessage, OutgoingMessage
+from .models import ChannelSpec, IncomingMessage, OutgoingMessage
 from .router.router import Router
 from .session_manager import SessionManager
 
@@ -111,17 +111,17 @@ class App:
             text = "⏹️ 已停止当前任务。"
         await reply.send(OutgoingMessage(text=text, user_id=msg.user_id, channel=msg.channel))
 
-    def _create_channel(self, channel_type: str, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
-        """Instantiate a channel by type name."""
-        if channel_type == "tui":
+    def _create_channel(self, spec: ChannelSpec, send_in: anyio.abc.ObjectSendStream[IncomingMessage]) -> BaseChannel:
+        """Instantiate a channel from its spec."""
+        if spec.type == "tui":
             from .channels.tui import TuiChannel
             return TuiChannel(send_in)
-        elif channel_type == "qq":
+        elif spec.type == "qq":
             from .channels.qq import QQChannel
             return QQChannel(send_in)
-        elif channel_type == "wecom":
+        elif spec.type == "wecom":
             from .channels.wecom import WecomChannel
-            return WecomChannel(send_in)
+            return WecomChannel(send_in, spec=spec)
         else:
             from .channels.weixin import WeixinChannel
             return WeixinChannel(send_in)
@@ -241,34 +241,36 @@ class App:
                             turns.pop(key)
         log.info("handle_message done: project=%s", project_name)
 
-    async def run(self, channel_types: list[str] | None = None) -> None:
-        """Run the app with one or more channels simultaneously.
+    async def run(self, specs: list[ChannelSpec] | None = None) -> None:
+        """Run the app with one or more channel instances simultaneously.
 
         Each channel gets its own outbound stream. A router task fans out
-        outgoing messages to the correct channel based on ``msg.channel``.
+        outgoing messages to the correct channel based on ``msg.channel``,
+        which is the channel instance id (e.g. ``"wecom:prod"``).
         """
-        if not channel_types:
-            channel_types = ["weixin"]
+        if not specs:
+            specs = [ChannelSpec(type="weixin", instance_id="weixin")]
 
-        self.channel_types = channel_types
+        self.channel_types = [s.instance_id for s in specs]
 
-        # Enable wecom_mcp tool when wecom channel is active
-        if "wecom" in channel_types:
+        # Enable wecom_mcp tool when any wecom instance is active
+        if any(s.type == "wecom" for s in specs):
             from .tools.wecom_mcp import set_wecom_mcp_enabled
             set_wecom_mcp_enabled(True)
 
         send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](16)
         send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](16)
 
-        # Create all channels
+        # Create all channels, keyed by instance id so same-type instances
+        # (e.g. two WeCom bots) don't collide.
         channels: dict[str, BaseChannel] = {}
-        for ct in channel_types:
-            channels[ct] = self._create_channel(ct, send_in)
+        for spec in specs:
+            channels[spec.instance_id] = self._create_channel(spec, send_in)
 
         try:
             async with anyio.create_task_group() as tg:
                 # Start each channel's inbound listener and outbound sender
-                for ct, ch in channels.items():
+                for ch in channels.values():
                     # Each channel gets a filtered outbound stream
                     ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](16)
                     tg.start_soon(ch.start)
@@ -467,7 +469,8 @@ Other options:
   -h, --help        Show this help message
 
 Environment variables (see sample.env):
-  WECOM_BOT_ID, WECOM_SECRET         WeCom bot credentials
+  WECOM_BOTS                         JSON array of WeCom bots (name/bot_id/secret/ws_url/...)
+  WECOM_BOT_ID, WECOM_SECRET         Legacy single-bot credentials (fallback)
   QQBOT_APP_ID, QQBOT_CLIENT_SECRET  QQ bot credentials
   WEIXIN_ACCOUNT_ID                  WeChat account ID
   ANTHROPIC_AUTH_TOKEN                Anthropic API key
@@ -483,20 +486,33 @@ Environment variables (see sample.env):
         return
 
     # Parse channel flags: --qq --weixin --tui --wecom
-    channel_types: list[str] = []
+    enabled: set[str] = set()
     if "--qq" in sys.argv:
-        channel_types.append("qq")
+        enabled.add("qq")
     if "--tui" in sys.argv:
-        channel_types.append("tui")
+        enabled.add("tui")
     if "--wecom" in sys.argv:
-        channel_types.append("wecom")
-    if "--weixin" in sys.argv or not channel_types:
-        channel_types.append("weixin")
+        enabled.add("wecom")
+    if "--weixin" in sys.argv or not enabled:
+        enabled.add("weixin")
 
-    _setup_logging(",".join(channel_types))
+    # Expand enabled types into concrete channel instances. WeCom can expand
+    # to N instances (one per configured bot); other types stay single-instance.
+    specs: list[ChannelSpec] = []
+    if "wecom" in enabled:
+        for inst in settings.wecom_instances():
+            specs.append(ChannelSpec(type="wecom", instance_id=f"wecom:{inst.name}", config=inst))
+    if "qq" in enabled:
+        specs.append(ChannelSpec(type="qq", instance_id="qq"))
+    if "tui" in enabled:
+        specs.append(ChannelSpec(type="tui", instance_id="tui"))
+    if "weixin" in enabled:
+        specs.append(ChannelSpec(type="weixin", instance_id="weixin"))
+
+    _setup_logging(",".join(s.instance_id for s in specs))
     app = App()
     try:
-        anyio.run(app.run, channel_types)
+        anyio.run(app.run, specs)
     except KeyboardInterrupt:
         pass
     # Suppress "Event loop is closed" from subprocess GC at shutdown

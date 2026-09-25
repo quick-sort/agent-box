@@ -69,6 +69,29 @@ def test_initial_client_is_none(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
+async def test_run_sets_current_channel(sample_project: ProjectInfo):
+    """run() records the channel instance id so wecom_mcp can resolve it."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.0, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    [m async for m in agent.run("test prompt", user_id="u1", channel="wecom:test")]
+
+    assert agent._current_channel == "wecom:test"
+
+
+@pytest.mark.anyio
 async def test_ensure_client_creates_once(sample_project: ProjectInfo):
     agent = ClaudeCodeAgent(sample_project)
 
