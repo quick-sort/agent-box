@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 
 import anyio
@@ -19,6 +20,20 @@ log = logging.getLogger(__name__)
 
 _STOP_COMMANDS = frozenset({"stop", "停止", "停下"})
 _ActiveTurn = tuple[str, BaseAgent, anyio.CancelScope]
+
+
+def _merge_messages(msgs: list[IncomingMessage]) -> IncomingMessage:
+    """Coalesce queued messages into one request, keeping the first's metadata."""
+    if len(msgs) == 1:
+        return msgs[0]
+    first = msgs[0]
+    return IncomingMessage(
+        text="\n".join(m.text for m in msgs if m.text),
+        user_id=first.user_id,
+        channel=first.channel,
+        conversation_id=first.conversation_id,
+        raw=first.raw,
+    )
 
 
 class App:
@@ -318,6 +333,26 @@ class App:
                         exc_info=True,
                     )
 
+        # Per-conversation FIFO queues. Each conversation gets its own worker so
+        # messages are handled in arrival order within a chat, while distinct
+        # conversations stay concurrent.
+        queues: dict[str, anyio.abc.ObjectSendStream[IncomingMessage]] = {}
+
+        async def _conversation_worker(
+            recv: anyio.abc.ObjectReceiveStream[IncomingMessage],
+        ) -> None:
+            reply = send_out.clone()
+            async for first in recv:
+                batch = [first]
+                # Coalesce any messages that queued up during the previous turn
+                # into a single request so rapid follow-ups aren't run one by one.
+                while True:
+                    try:
+                        batch.append(recv.receive_nowait())
+                    except (anyio.WouldBlock, anyio.EndOfStream):
+                        break
+                await _safe_handle(_merge_messages(batch), reply)
+
         try:
             async with anyio.create_task_group() as tg:
                 async for msg in recv_in:
@@ -325,7 +360,26 @@ class App:
                         "dispatch_loop received message: user=%s channel=%s text_preview=%r",
                         msg.user_id, msg.channel, (msg.text or "")[:200],
                     )
-                    tg.start_soon(_safe_handle, msg, send_out.clone())
+                    # Stop commands bypass the FIFO queue so they can cancel the
+                    # in-flight turn immediately instead of waiting behind it.
+                    if (msg.text or "").strip().casefold() in _STOP_COMMANDS:
+                        tg.start_soon(_safe_handle, msg, send_out.clone())
+                        continue
+
+                    key = msg.conversation_id or msg.user_id
+                    queue = queues.get(key)
+                    if queue is None:
+                        q_send, q_recv = anyio.create_memory_object_stream[IncomingMessage](
+                            max_buffer_size=math.inf
+                        )
+                        queues[key] = q_send
+                        tg.start_soon(_conversation_worker, q_recv)
+                        queue = q_send
+                    await queue.send(msg)
+
+                # recv_in closed — close the queues so workers drain and exit.
+                for q_send in queues.values():
+                    await q_send.aclose()
         except Exception:
             log.exception("dispatch loop crashed")
         finally:
