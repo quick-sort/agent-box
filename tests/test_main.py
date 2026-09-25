@@ -205,6 +205,36 @@ async def test_dispatch_loop_stop_bypasses_queue(tmp_path: Path):
         tg.cancel_scope.cancel()
 
 
+@pytest.mark.anyio
+async def test_dispatch_loop_rewrites_new_alias_to_clear(tmp_path: Path):
+    """'/new' is an alias for '/clear', rewritten before the handler sees it."""
+    app = _make_app(tmp_path)
+
+    received: list[str] = []
+
+    async def handle(msg, reply):
+        received.append(msg.text)
+
+    app.handle_message = handle
+
+    send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](4)
+    send_out, _recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app._dispatch_loop, recv_in, send_out)
+        await send_in.send(_msg("/new"))
+        await anyio.sleep(0.05)
+        await send_in.send(_msg("  /NEW  "))  # whitespace + case variant
+        await anyio.sleep(0.05)
+        await send_in.send(_msg("/newest"))  # prefix must NOT be rewritten
+        await anyio.sleep(0.05)
+        await send_in.send(_msg("hello"))
+        await anyio.sleep(0.05)
+        assert received == ["/clear", "/clear", "/newest", "hello"]
+        await send_in.aclose()
+        tg.cancel_scope.cancel()
+
+
 # ── Project tag when user switches away ──
 
 
