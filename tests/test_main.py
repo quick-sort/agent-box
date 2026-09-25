@@ -113,16 +113,17 @@ async def test_get_or_create_agent_caches(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_dispatch_loop_fifo_within_conversation(tmp_path: Path):
-    """Messages in the same conversation are handled in arrival order."""
+async def test_dispatch_loop_merges_queued_messages(tmp_path: Path):
+    """Messages queued during a turn are coalesced into one request."""
     app = _make_app(tmp_path)
 
-    call_order = []
+    release = anyio.Event()
+    received: list[str] = []
 
     async def handle(msg, reply):
-        call_order.append(f"start-{msg.text}")
-        await anyio.sleep(0.02)
-        call_order.append(f"end-{msg.text}")
+        received.append(msg.text)
+        if msg.text == "first":
+            await release.wait()
 
     app.handle_message = handle
 
@@ -131,13 +132,16 @@ async def test_dispatch_loop_fifo_within_conversation(tmp_path: Path):
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(app._dispatch_loop, recv_in, send_out)
-        await send_in.send(_msg("a"))
-        await send_in.send(_msg("b"))
+        await send_in.send(_msg("first"))
+        await anyio.sleep(0.05)  # worker picks up "first" and blocks on release
+        await send_in.send(_msg("second"))
+        await send_in.send(_msg("third"))
+        await anyio.sleep(0.1)  # "second"/"third" enqueue while "first" runs
+        release.set()
+        await anyio.sleep(0.2)  # worker drains + merges the queued messages
+        assert received == ["first", "second\nthird"]
         await send_in.aclose()
-        await anyio.sleep(0.3)
         tg.cancel_scope.cancel()
-
-    assert call_order == ["start-a", "end-a", "start-b", "end-b"]
 
 
 @pytest.mark.anyio
