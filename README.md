@@ -155,6 +155,37 @@ uv run agent-box --qq
 Agent 执行的模型可通过对话切换：说"切换模型到 claude-sonnet-4-6"即可，无需重启。
 切换模型功能由 Router 的 `switch_model` 工具实现，每个项目独立记忆使用的模型。
 
+### 企业微信机器人（多实例）
+
+企业微信渠道通过 `--wecom` 启动，支持多个机器人同时在线。多机器人用 `WECOM_BOTS`
+（JSON 数组）配置，优先级高于单机器人字段：
+
+```env
+WECOM_BOTS=[{"name":"prod","bot_id":"...","secret":"...","ws_url":"wss://openws.work.weixin.qq.com"},{"name":"test","bot_id":"...","secret":"..."}]
+```
+
+每项字段（`name`/`bot_id`/`secret` 必填，其余可选）：
+
+| 字段 | 说明 | 默认值 |
+|---|---|---|
+| `name` | 实例 ID，路由 key 为 `wecom:<name>` | — |
+| `bot_id` | 机器人 ID | — |
+| `secret` | 机器人 Secret | — |
+| `ws_url` | WebSocket 地址 | 空（SDK 默认） |
+| `scene` / `plug_version` | 场景值 / 插件版本 | — |
+| `reconnect_interval` | 重连间隔（ms） | `1000` |
+| `max_reconnect_attempts` | 最大重连次数 | `10` |
+| `max_auth_failure_attempts` | 最大鉴权失败次数 | `5` |
+| `heartbeat_interval` | 心跳间隔（ms） | `30000` |
+| `request_timeout` | 请求超时（ms） | `10000` |
+
+`WECOM_BOTS` 为空时回退到单机器人字段 `WECOM_BOT_ID` / `WECOM_SECRET`（包装为
+`name="default"`）。每个实例有独立的连接参数、下载目录与鉴权状态。
+
+```bash
+uv run agent-box --wecom
+```
+
 ---
 
 ## 架构
