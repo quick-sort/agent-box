@@ -362,6 +362,11 @@ class App:
                         "dispatch_loop received message: user=%s channel=%s text_preview=%r",
                         msg.user_id, msg.channel, (msg.text or "")[:200],
                     )
+                    # '/new' is an alias for '/clear'. Rewritten per-message,
+                    # before queueing, so a queued alias never gets merged into
+                    # a multi-line prompt.
+                    if (msg.text or "").strip().casefold() == "/new":
+                        msg.text = "/clear"
                     # Stop commands bypass the FIFO queue so they can cancel the
                     # in-flight turn immediately instead of waiting behind it.
                     if (msg.text or "").strip().casefold() in _STOP_COMMANDS:
