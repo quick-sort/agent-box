@@ -318,6 +318,18 @@ class App:
                         exc_info=True,
                     )
 
+        # Per-conversation FIFO queues. Each conversation gets its own worker so
+        # messages are handled in arrival order within a chat, while distinct
+        # conversations stay concurrent.
+        queues: dict[str, anyio.abc.ObjectSendStream[IncomingMessage]] = {}
+
+        async def _conversation_worker(
+            recv: anyio.abc.ObjectReceiveStream[IncomingMessage],
+        ) -> None:
+            reply = send_out.clone()
+            async for msg in recv:
+                await _safe_handle(msg, reply)
+
         try:
             async with anyio.create_task_group() as tg:
                 async for msg in recv_in:
@@ -325,7 +337,26 @@ class App:
                         "dispatch_loop received message: user=%s channel=%s text_preview=%r",
                         msg.user_id, msg.channel, (msg.text or "")[:200],
                     )
-                    tg.start_soon(_safe_handle, msg, send_out.clone())
+                    # Stop commands bypass the FIFO queue so they can cancel the
+                    # in-flight turn immediately instead of waiting behind it.
+                    if (msg.text or "").strip().casefold() in _STOP_COMMANDS:
+                        tg.start_soon(_safe_handle, msg, send_out.clone())
+                        continue
+
+                    key = msg.conversation_id or msg.user_id
+                    queue = queues.get(key)
+                    if queue is None:
+                        q_send, q_recv = anyio.create_memory_object_stream[IncomingMessage](
+                            max_buffer_size=0
+                        )
+                        queues[key] = q_send
+                        tg.start_soon(_conversation_worker, q_recv)
+                        queue = q_send
+                    await queue.send(msg)
+
+                # recv_in closed — close the queues so workers drain and exit.
+                for q_send in queues.values():
+                    await q_send.aclose()
         except Exception:
             log.exception("dispatch loop crashed")
         finally:

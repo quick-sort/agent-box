@@ -1,7 +1,7 @@
 """Tests for agent_box.main (App)."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
@@ -113,33 +113,92 @@ async def test_get_or_create_agent_caches(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_dispatch_loop_concurrent(tmp_path: Path):
-    """Multiple messages should be dispatched concurrently."""
+async def test_dispatch_loop_fifo_within_conversation(tmp_path: Path):
+    """Messages in the same conversation are handled in arrival order."""
     app = _make_app(tmp_path)
 
     call_order = []
 
-    async def slow_handle(msg, reply):
+    async def handle(msg, reply):
         call_order.append(f"start-{msg.text}")
-        await anyio.sleep(0.1)
+        await anyio.sleep(0.02)
         call_order.append(f"end-{msg.text}")
 
-    app.handle_message = slow_handle
+    app.handle_message = handle
 
     send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](4)
-    send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+    send_out, _recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(app._dispatch_loop, recv_in, send_out)
         await send_in.send(_msg("a"))
         await send_in.send(_msg("b"))
-        await anyio.sleep(0.05)
         await send_in.aclose()
-        await anyio.sleep(0.2)
+        await anyio.sleep(0.3)
         tg.cancel_scope.cancel()
 
-    assert "start-a" in call_order
-    assert "start-b" in call_order
+    assert call_order == ["start-a", "end-a", "start-b", "end-b"]
+
+
+@pytest.mark.anyio
+async def test_dispatch_loop_parallel_across_conversations(tmp_path: Path):
+    """Messages in different conversations are handled concurrently."""
+    app = _make_app(tmp_path)
+
+    gate = anyio.Event()
+    entered: list[str] = []
+
+    async def handle(msg, reply):
+        entered.append(msg.text)
+        await gate.wait()
+
+    app.handle_message = handle
+
+    send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](4)
+    send_out, _recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app._dispatch_loop, recv_in, send_out)
+        await send_in.send(IncomingMessage(text="a", user_id="u1", channel="test"))
+        await send_in.send(IncomingMessage(text="b", user_id="u2", channel="test"))
+        await anyio.sleep(0.1)
+        # Both workers must have entered their handler (they run in parallel).
+        assert set(entered) == {"a", "b"}
+        gate.set()
+        await send_in.aclose()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_dispatch_loop_stop_bypasses_queue(tmp_path: Path):
+    """A stop command is dispatched immediately, not queued behind a running turn."""
+    app = _make_app(tmp_path)
+
+    release = anyio.Event()
+    stop_called = anyio.Event()
+
+    async def handle(msg, reply):
+        if (msg.text or "").strip().casefold() == "stop":
+            stop_called.set()
+            return
+        await release.wait()
+
+    app.handle_message = handle
+
+    send_in, recv_in = anyio.create_memory_object_stream[IncomingMessage](4)
+    send_out, _recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app._dispatch_loop, recv_in, send_out)
+        await send_in.send(_msg("task"))
+        await anyio.sleep(0.05)
+        await send_in.send(_msg("stop"))
+        await anyio.sleep(0.05)
+        # "stop" must be handled even though "task" is still blocking the worker.
+        assert stop_called.is_set()
+        release.set()
+        await send_in.aclose()
+        tg.cancel_scope.cancel()
 
 
 # ── Project tag when user switches away ──
