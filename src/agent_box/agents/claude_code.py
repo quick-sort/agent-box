@@ -368,6 +368,11 @@ class ClaudeCodeAgent(BaseAgent):
     def __init__(self, project: ProjectInfo) -> None:
         super().__init__(project)
         self._client: ClaudeSDKClient | None = None
+        # The resume session id for this agent's conversation. Lives on the
+        # instance (NOT on the shared ProjectInfo) so that multiple agents
+        # pinned to the same project — one per conversation — keep independent
+        # Claude Code sessions instead of clobbering each other's session id.
+        self._session_id: str | None = None
         # Channel instance id of the turn currently being served. Set at the
         # top of run(); the wecom_mcp tool closure reads it to resolve which
         # WeCom bot's MCP server to talk to.
@@ -408,8 +413,8 @@ class ClaudeCodeAgent(BaseAgent):
             can_use_tool=self._can_use_tool,
             stderr=self._on_stderr,
         )
-        if resume and self.project.session_id:
-            opts.resume = self.project.session_id
+        if resume and self._session_id:
+            opts.resume = self._session_id
         # Conditionally add wecom_mcp tool when WeCom channel is active
         from ..tools.wecom_mcp import is_wecom_mcp_enabled
         if is_wecom_mcp_enabled():
@@ -456,7 +461,7 @@ class ClaudeCodeAgent(BaseAgent):
                 await self._client.disconnect()
             self._client = None
 
-        stale_session = self.project.session_id or ""
+        stale_session = self._session_id or ""
         self._stderr_tail.clear()
         client = ClaudeSDKClient(self._build_options())
         try:
@@ -477,7 +482,7 @@ class ClaudeCodeAgent(BaseAgent):
             )
             with contextlib.suppress(Exception):
                 await client.disconnect()
-            self.project.session_id = ""
+            self._session_id = ""
             self._stderr_tail.clear()
             client = ClaudeSDKClient(self._build_options(resume=False))
             await client.connect()
@@ -904,8 +909,8 @@ class ClaudeCodeAgent(BaseAgent):
                             yield out_msg
                         return
 
-                    if msg.session_id and msg.session_id != self.project.session_id:
-                        self.project.session_id = msg.session_id
+                    if msg.session_id and msg.session_id != self._session_id:
+                        self._session_id = msg.session_id
 
                     if msg.is_error:
                         error_detail = " ".join(msg.errors or []) or msg.result or "未知错误"
@@ -961,7 +966,7 @@ class ClaudeCodeAgent(BaseAgent):
         async for msg in client.receive_response():
             if isinstance(msg, ResultMessage):
                 if msg.session_id:
-                    self.project.session_id = msg.session_id
+                    self._session_id = msg.session_id
                 if msg.is_error:
                     yield OutgoingMessage(
                         text="❌ 自动压缩失败，请手动发送 /compact",
@@ -1023,7 +1028,7 @@ class ClaudeCodeAgent(BaseAgent):
                 )
             elif isinstance(msg, ResultMessage):
                 if msg.session_id:
-                    self.project.session_id = msg.session_id
+                    self._session_id = msg.session_id
                 yield OutgoingMessage(
                     text=msg.result or "", user_id=user_id, channel=channel, type=MessageType.result,
                     data={"session_id": msg.session_id, "cost": msg.total_cost_usd, "duration_ms": msg.duration_ms},

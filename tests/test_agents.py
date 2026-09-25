@@ -135,7 +135,7 @@ async def test_run_collects_text(sample_project: ProjectInfo):
     texts = [m.text for m in msgs if m.type.value == "text"]
     assert "Hello" in texts[0]
     assert "World" in texts[1]
-    assert agent.project.session_id == "sess-abc"
+    assert agent._session_id == "sess-abc"
 
 
 @pytest.mark.anyio
