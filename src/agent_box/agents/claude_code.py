@@ -1101,7 +1101,16 @@ class ClaudeCodeAgent(BaseAgent):
         self._pending_permission = None
 
     async def cancel(self) -> None:
-        """Interrupt the active Claude turn while keeping the client reusable."""
+        """Interrupt the active Claude turn, then drop the client.
+
+        ``client.interrupt()`` stops the CLI's work, but the CLI still
+        flushes the in-flight turn's terminal ResultMessage (an "interrupted"
+        error) onto the SDK stream. If the client were kept, the next
+        ``run()`` would consume that stale ResultMessage and surface it as a
+        spurious "❌ Agent 错误" — the "stop → first message fails → second
+        works" pattern. Rebuilding the client on the next run keeps it clean;
+        the cost is one CLI respawn.
+        """
         self._cancel_pending_permission()
         client = self._client
         if client is None:
@@ -1109,13 +1118,11 @@ class ClaudeCodeAgent(BaseAgent):
         try:
             await client.interrupt()
         except Exception:
-            # If the streaming interrupt cannot be delivered, disconnecting is
-            # the only reliable way to stop the CLI. The next turn reconnects.
             log.exception("failed to interrupt Claude agent for project %s", self.project.name)
-            with contextlib.suppress(Exception):
-                await client.disconnect()
-            if self._client is client:
-                self._client = None
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+        if self._client is client:
+            self._client = None
 
     async def close(self) -> None:
         # Cancel any pending permission future so the ``can_use_tool`` callback
