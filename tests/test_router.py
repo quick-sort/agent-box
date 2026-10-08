@@ -379,3 +379,65 @@ async def test_router_live_prompt_classification(
         assert got == expect_tool, (
             f"expected {expect_tool} for {text!r}, but classifier returned {got!r}"
         )
+
+
+# ── Multi-project disabled ──
+
+
+@pytest.fixture
+def disable_multi_project(monkeypatch):
+    monkeypatch.setattr("agent_box.config.settings.multi_project_enabled", False)
+
+
+@pytest.mark.anyio
+async def test_fast_path_skipped_when_multi_project_disabled(
+    tmp_projects: SessionManager, disable_multi_project
+):
+    """Quick commands like 'newproject foo' must be forwarded, not executed."""
+    router = _make_router(tmp_projects)
+    result = await router.route(_msg("newproject foo"))
+    assert result.reply is None
+    assert result.project == "_default"
+    assert tmp_projects.get("foo") is None
+
+
+@pytest.mark.anyio
+async def test_llm_not_called_when_multi_project_disabled(
+    tmp_projects: SessionManager, disable_multi_project
+):
+    """Natural-language switch requests must not reach the classifier."""
+    router = _make_router(tmp_projects, tool_call=_tool("switch_project", name="foo"))
+    result = await router.route(_msg("切换到 foo 项目"))
+    assert result.reply is None
+    assert result.project == "_default"
+    router._client.messages.create.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_stale_pin_ignored_when_multi_project_disabled(
+    tmp_projects: SessionManager, disable_multi_project
+):
+    """A project pinned before the toggle must not leak through."""
+    tmp_projects.create("pinned")
+    tmp_projects.set_current("pinned")
+    assert tmp_projects.get_current() == "_default"
+
+    router = _make_router(tmp_projects)
+    result = await router.route(_msg("hello"))
+    assert result.reply is None
+    assert result.project == "_default"
+
+
+@pytest.mark.anyio
+async def test_router_constructs_without_model_when_disabled(
+    tmp_projects: SessionManager, disable_multi_project, monkeypatch
+):
+    """With classification off, no router model env var is required."""
+    monkeypatch.delenv("ANTHROPIC_SMALL_FAST_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", raising=False)
+    from agent_box.router.router import Router
+
+    with patch("agent_box.router.router.AsyncAnthropic"):
+        router = Router(tmp_projects)
+    result = await router.route(_msg("hello"))
+    assert result.project == "_default"

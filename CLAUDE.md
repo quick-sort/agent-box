@@ -79,6 +79,7 @@ src/agent_box/
 - `GLM_ASR_MODEL` — GLM ASR model id (default: `glm-asr-2512`)
 - `PROJECTS_DIR` — where project folders live (default: `data/projects`)
 - `ROUTER_MODEL` — model override for router (optional)
+- `MULTI_PROJECT_ENABLED` — set to `false` to disable multi-project management: the router skips both the quick commands (`newproject`/`switchto`/…) and the LLM project-command classification, and every message goes to the `_default` project (default: `true`)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
 - `ANTHROPIC_API_KEY` — required by Claude Code SDK and the project-management Router
 - `AGENTS` — enabled backend JSON array (default `["claude_code"]`)

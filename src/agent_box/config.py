@@ -82,6 +82,11 @@ class Settings(BaseSettings):
             ]
         return []
 
+    # Multi-project management. When False, the router skips both the
+    # fast-path quick commands and the LLM project-command classification,
+    # and every message is forwarded to the _default project.
+    multi_project_enabled: bool = True
+
     # Enabled agents. Pydantic settings expects JSON in AGENTS, for example:
     # AGENTS=["claude_code"]
     agents: list[str] = ["claude_code"]

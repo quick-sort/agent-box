@@ -132,7 +132,14 @@ class SessionManager:
     # ── current (pinned) project ──
 
     def get_current(self) -> str:
-        """Return pinned project name, falling back to ``_default``."""
+        """Return pinned project name, falling back to ``_default``.
+
+        When multi-project management is disabled, the pinned file is
+        ignored and ``_default`` is always returned, so a stale pin left
+        over from before the toggle cannot leak through.
+        """
+        if not settings.multi_project_enabled:
+            return DEFAULT_PROJECT_NAME
         if self._current_path.exists():
             value = self._current_path.read_text().strip()
             if value and value in self._projects:
