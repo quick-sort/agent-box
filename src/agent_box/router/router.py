@@ -234,10 +234,15 @@ class Router(BaseRouter):
             or os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
         )
         if not model:
-            raise RuntimeError(
-                "Router model not configured: set ANTHROPIC_SMALL_FAST_MODEL "
-                "or ANTHROPIC_DEFAULT_HAIKU_MODEL."
-            )
+            if settings.multi_project_enabled:
+                raise RuntimeError(
+                    "Router model not configured: set ANTHROPIC_SMALL_FAST_MODEL "
+                    "or ANTHROPIC_DEFAULT_HAIKU_MODEL."
+                )
+            # Multi-project disabled: route() never calls the LLM, so a
+            # classification model is not needed.
+            model = ""
+            log.info("multi-project disabled — router LLM classification off")
         self._model = model
 
         log.info("router model: %s", self._model)
@@ -267,6 +272,11 @@ class Router(BaseRouter):
     # ── public API ──
 
     async def route(self, msg: IncomingMessage) -> RouteResult:
+        # Multi-project management disabled: skip both the regex fast-path
+        # and the LLM classification — everything goes to the default project.
+        if not settings.multi_project_enabled:
+            return RouteResult(project=self.sessions.get_current())
+
         text = msg.text.strip()
 
         # Fast regex path — skip LLM for common patterns
