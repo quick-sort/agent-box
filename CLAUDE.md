@@ -81,6 +81,7 @@ src/agent_box/
 - `ROUTER_MODEL` — model override for router (optional)
 - `MULTI_PROJECT_ENABLED` — set to `false` to disable multi-project management: the router skips both the quick commands (`newproject`/`switchto`/…) and the LLM project-command classification, and every message goes to the `_default` project (default: `true`)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
+- `AGENT_TOOL_PROGRESS` — set to `false` to stop emitting one-line tool-call progress messages (`🔧`/`📖`/`✏️` …) to channels (default: `true`)
 - `ANTHROPIC_API_KEY` — required by Claude Code SDK and the project-management Router
 - `AGENTS` — enabled backend JSON array (default `["claude_code"]`)
 - `DEFAULT_AGENT` — backend assigned to new projects (default `claude_code`)

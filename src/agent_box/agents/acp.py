@@ -351,7 +351,11 @@ class ACPAgent(BaseAgent):
                 self._text_chunks.append(update.content.text)
             return
         if isinstance(update, ToolCallStart):
+            # Text must still flush before a tool call even when progress
+            # messages are suppressed, so buffered text isn't reordered.
             await self._flush_text()
+            if not settings.agent_tool_progress:
+                return
             await self._events.put(
                 OutgoingMessage(
                     text=self._format_tool_call(update),

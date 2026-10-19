@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     default_agent: str = "claude_code"
     agent_permission_mode: str = "bypassPermissions"
     agent_max_turns: int | None = None
+    # Emit one-line tool-call progress messages (🔧/📖/✏️ …) to the channel.
+    # Set to false to keep IM channels quiet while a turn runs.
+    agent_tool_progress: bool = True
     # Proactively compact a session when post-turn context usage exceeds this
     # percentage of the window (SDK ``ContextUsageResponse.percentage``).
     # None disables proactive compaction (turns fail at the hard limit only).
