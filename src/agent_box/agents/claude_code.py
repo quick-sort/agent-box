@@ -883,6 +883,8 @@ class ClaudeCodeAgent(BaseAgent):
                                         data={"file_path": fp},
                                     )
                         elif isinstance(block, ToolUseBlock):
+                            if not settings.agent_tool_progress:
+                                continue
                             # Brief one-liner so the user knows something is happening.
                             summary = _format_tool_summary(block, prefixes=_path_prefixes)
                             yield OutgoingMessage(
@@ -1074,6 +1076,8 @@ class ClaudeCodeAgent(BaseAgent):
                                     data={"file_path": fp},
                                 )
                     elif isinstance(block, ToolUseBlock):
+                        if not settings.agent_tool_progress:
+                            continue
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
                             text=summary, user_id=user_id, channel=channel, type=MessageType.text,

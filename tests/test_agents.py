@@ -1637,3 +1637,42 @@ async def test_run_resets_dead_client_after_mid_turn_crash(sample_project: Proje
     assert agent._client is None
     mock_client.disconnect.assert_awaited_once()
 
+
+
+# ── AGENT_TOOL_PROGRESS switch ──
+
+
+@pytest.mark.anyio
+async def test_tool_progress_suppressed_when_disabled(
+    sample_project: ProjectInfo, monkeypatch
+):
+    """With agent_tool_progress off, tool calls are not surfaced as text."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
+    monkeypatch.setattr("agent_box.config.settings.agent_tool_progress", False)
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(id="toolu_bash", name="Bash", input={"command": "ls -la"}),
+            ],
+            model="test",
+        )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="sess-quiet",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("list files")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert not any("ls -la" in t for t in texts)
+    # The turn still completes normally.
+    assert any(m.type.value == "result" for m in msgs)
