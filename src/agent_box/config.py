@@ -54,8 +54,8 @@ class Settings(BaseSettings):
     # Odoo Discuss / Live Chat channel (see docs/odoo_channel_design.md)
     odoo_url: str = ""       # e.g. https://your-odoo.example.com (no trailing slash)
     odoo_db: str = ""
-    odoo_login: str = ""
-    odoo_password: str = ""
+    odoo_login: str = ""      # login owning the API key (used to resolve uid)
+    odoo_api_key: str = ""    # API key; cannot create a web session, RPC only
     odoo_channel_id: int = 0  # discuss.channel id to bridge
 
     # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
