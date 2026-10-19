@@ -796,3 +796,191 @@ async def test_wecom_registers_ws_client_by_instance(tmp_path):
     with patch("agent_box.tools.wecom_mcp.set_ws_client") as mock_set:
         channel._on_disconnected("some reason")
         mock_set.assert_called_once_with("wecom:prod", None)
+
+
+# ── OdooChannel ──
+
+
+def _make_odoo_channel(send_stream=None):
+    from agent_box.channels.odoo import OdooChannel
+
+    if send_stream is None:
+        send_stream, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.odoo.settings") as mock_settings:
+        mock_settings.odoo_url = "https://odoo.example.com"
+        mock_settings.odoo_db = "mydb"
+        mock_settings.odoo_login = "bot@example.com"
+        mock_settings.odoo_api_key = "key"
+        mock_settings.odoo_channel_id = 42
+        channel = OdooChannel(send_stream)
+    return channel
+
+
+def test_html_to_text_strips_tags_and_entities():
+    from agent_box.channels.odoo import _html_to_text
+
+    assert _html_to_text("<p>Hello&nbsp;<b>world</b></p>") == "Hello world"
+    assert _html_to_text(False) == ""
+    assert _html_to_text(None) == ""
+    assert _html_to_text("") == ""
+
+
+@pytest.mark.anyio
+async def test_odoo_authenticate_resolves_uid_and_partner():
+    channel = _make_odoo_channel()
+    channel._client = MagicMock()
+
+    calls = []
+
+    async def fake_jsonrpc(service, method, args):
+        calls.append((service, method, args))
+        if service == "common":
+            assert method == "authenticate"
+            assert args[:3] == ["mydb", "bot@example.com", "key"]
+            return 5
+        return [{"partner_id": [7, "Bot"]}]
+
+    channel._jsonrpc = fake_jsonrpc
+    await channel._authenticate()
+
+    assert channel._uid == 5
+    assert channel._self_partner_id == 7
+    # second call is execute_kw reading res.users.partner_id
+    assert calls[1][0] == "object" and calls[1][1] == "execute_kw"
+
+
+@pytest.mark.anyio
+async def test_odoo_authenticate_raises_on_failure():
+    channel = _make_odoo_channel()
+
+    async def fake_jsonrpc(service, method, args):
+        return None
+
+    channel._jsonrpc = fake_jsonrpc
+    with pytest.raises(RuntimeError):
+        await channel._authenticate()
+
+
+@pytest.mark.anyio
+async def test_odoo_handle_message_emits_incoming_message():
+    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = _make_odoo_channel(send)
+    channel._self_partner_id = 99  # "our" account, should be filtered out
+
+    await channel._handle_message(
+        {"id": 1, "author_id": [7, "Alice"], "body": "<p>Hello there</p>", "message_type": "comment"}
+    )
+
+    msg = recv.receive_nowait()
+    assert msg.text == "Hello there"
+    assert msg.user_id == "7"
+    assert msg.channel == "odoo"
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_odoo_handle_message_skips_own_system_and_empty():
+    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = _make_odoo_channel(send)
+    channel._self_partner_id = 99
+
+    # our own echo
+    await channel._handle_message({"id": 1, "author_id": 99, "body": "<p>mine</p>", "message_type": "comment"})
+    # system chatter
+    await channel._handle_message({"id": 2, "author_id": 7, "body": "<p>created</p>", "message_type": "notification"})
+    # empty body
+    await channel._handle_message({"id": 3, "author_id": 7, "body": False, "message_type": "comment"})
+
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_odoo_poll_once_advances_cursor_and_dispatches():
+    send, recv = anyio.create_memory_object_stream[IncomingMessage](4)
+    channel = _make_odoo_channel(send)
+    channel._self_partner_id = 99
+    channel._last_message_id = 100
+
+    async def fake_execute_kw(model, method, args, kwargs=None):
+        assert model == "mail.message" and method == "search_read"
+        assert ["id", ">", 100] in args[0]
+        return [
+            {"id": 101, "author_id": [7, "Alice"], "body": "<p>hi</p>", "message_type": "comment"},
+            {"id": 102, "author_id": 99, "body": "<p>mine</p>", "message_type": "comment"},
+        ]
+
+    channel._execute_kw = fake_execute_kw
+    await channel._poll_once()
+
+    assert channel._last_message_id == 102
+    msg = recv.receive_nowait()
+    assert msg.text == "hi"
+    with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
+        recv.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_odoo_send_reply_posts_message():
+    channel = _make_odoo_channel()
+
+    calls = []
+
+    async def fake_execute_kw(model, method, args, kwargs=None):
+        calls.append((model, method, args, kwargs))
+
+    channel._client = MagicMock()  # just needs to be non-None
+    channel._uid = 5
+    channel._execute_kw = fake_execute_kw
+
+    await channel.send_reply(OutgoingMessage(text="hello back", user_id="7"))
+
+    assert calls == [
+        ("discuss.channel", "message_post", [[42]], {"body": "hello back", "message_type": "comment"})
+    ]
+
+
+@pytest.mark.anyio
+async def test_odoo_send_reply_skips_non_text_messages():
+    from agent_box.models import MessageType
+
+    channel = _make_odoo_channel()
+    channel._client = MagicMock()
+    channel._uid = 5
+    channel._execute_kw = AsyncMock()
+
+    await channel.send_reply(OutgoingMessage(text="x", user_id="7", type=MessageType.result))
+
+    channel._execute_kw.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_odoo_send_reply_noop_when_not_authenticated():
+    channel = _make_odoo_channel()
+    channel._client = MagicMock()
+    channel._uid = None
+    channel._execute_kw = AsyncMock()
+
+    await channel.send_reply(OutgoingMessage(text="x", user_id="7"))
+
+    channel._execute_kw.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_odoo_start_noop_when_not_configured():
+    """start() should warn and return immediately when required settings are missing."""
+    from agent_box.channels.odoo import OdooChannel
+
+    send, _ = anyio.create_memory_object_stream[IncomingMessage](4)
+    with patch("agent_box.channels.odoo.settings") as mock_settings:
+        mock_settings.odoo_url = ""
+        mock_settings.odoo_db = ""
+        mock_settings.odoo_login = ""
+        mock_settings.odoo_api_key = ""
+        mock_settings.odoo_channel_id = 0
+        channel = OdooChannel(send)
+
+    # Should return without ever creating an httpx client.
+    await channel.start()
+    assert channel._client is None
