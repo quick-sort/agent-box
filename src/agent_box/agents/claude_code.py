@@ -296,10 +296,14 @@ async def _parse_user_answer(questions: list[dict], user_reply: str) -> dict:
         messages=[{"role": "user", "content": prompt}],
     )
     text = _extract_text_from_content(resp.content)
-    # Strip optional markdown fences
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+    # Tolerate fenced or prose-wrapped replies: take the outermost JSON object.
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"non-JSON answer response: {text!r}") from e
 
 
 # ── ExitPlanMode approval parser ──
@@ -722,11 +726,11 @@ class ClaudeCodeAgent(BaseAgent):
         try:
             parsed = await _parse_user_answer(questions, reply)
             answers = parsed.get("answers", {})
-        except Exception:
+        except Exception as e:
             log.warning(
-                "failed to parse AskUserQuestion answer with LLM, "
+                "AskUserQuestion answer parser failed (%s: %s), "
                 "falling back to raw user reply",
-                exc_info=True,
+                type(e).__name__, e,
             )
             answers = (
                 {q.get("question", f"question_{i}"): reply
