@@ -9,6 +9,7 @@ import anyio
 
 from .weixin_sdk import AccountClient, StateStore
 from .weixin_sdk.constants import ITEM_TYPE_FILE, ITEM_TYPE_IMAGE, ITEM_TYPE_VIDEO, ITEM_TYPE_VOICE
+from .weixin_sdk.exceptions import WeixinError
 from .weixin_sdk.messages import extract_text_body, iter_media_items
 
 from ..config import settings
@@ -185,7 +186,19 @@ class WeixinChannel(BaseChannel):
                 log.exception("weixin: failed to send image %s", image_path)
             return
 
-        # Text sending
-        await anyio.to_thread.run_sync(
-            lambda: self.account.send_text(to_user_id=msg.user_id, text=msg.text)
-        )
+        # Text sending — retry once on transient network failures (e.g. TLS
+        # handshake timeouts against ilinkai.weixin.qq.com).
+        for attempt in (1, 2):
+            try:
+                await anyio.to_thread.run_sync(
+                    lambda: self.account.send_text(to_user_id=msg.user_id, text=msg.text),
+                    abandon_on_cancel=True,
+                )
+                return
+            except (TimeoutError, WeixinError) as exc:
+                log.warning(
+                    "weixin: send_text to %s failed (attempt %d/2): %s",
+                    msg.user_id, attempt, exc,
+                )
+                if attempt == 1:
+                    await anyio.sleep(2)

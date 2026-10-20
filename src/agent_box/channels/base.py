@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 
 import anyio
 
 from ..models import IncomingMessage, OutgoingMessage
+
+log = logging.getLogger(__name__)
 
 
 class BaseChannel(ABC):
@@ -24,6 +27,17 @@ class BaseChannel(ABC):
         """Send a reply back through this channel."""
 
     async def send_loop(self, recv: anyio.abc.ObjectReceiveStream[OutgoingMessage]) -> None:
-        """Consume outgoing messages and send them."""
+        """Consume outgoing messages and send them.
+
+        A failed send must not kill this loop: every channel shares one task
+        group in ``App.run``, so an escaping exception would cancel the whole
+        application over a single transient network error.
+        """
         async for msg in recv:
-            await self.send_reply(msg)
+            try:
+                await self.send_reply(msg)
+            except Exception:
+                log.exception(
+                    "%s: failed to send reply to %s, message dropped",
+                    type(self).__name__, msg.user_id,
+                )
