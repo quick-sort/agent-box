@@ -1,5 +1,6 @@
 """Tests for agent_box.agents."""
 
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -677,6 +678,50 @@ async def test_can_use_tool_ask_user_question_parse_fallback(sample_project: Pro
 
     assert result.behavior == "allow"
     assert result.updated_input["answers"] == {"Which file?": "just main.py"}
+
+
+@pytest.mark.anyio
+async def test_parse_user_answer_extracts_json_from_prose():
+    """LLM replies with fenced or prose-wrapped JSON are parsed."""
+    from agent_box.agents.claude_code import _parse_user_answer
+
+    def _client(text: str) -> Mock:
+        block = Mock(type="text")
+        block.text = text
+        resp = Mock(content=[block])
+        client = Mock()
+        client.messages = Mock(create=AsyncMock(return_value=resp))
+        return client
+
+    questions = [{"question": "Which file?", "options": [{"label": "main.py"}]}]
+    expected = {"answers": {"Which file?": "main.py"}}
+    with patch(
+        "agent_box.agents.claude_code._get_answer_client",
+        return_value=_client(f'好的，结果是：```json\n{json.dumps(expected)}\n```'),
+    ):
+        assert await _parse_user_answer(questions, "main.py") == expected
+
+    with patch(
+        "agent_box.agents.claude_code._get_answer_client",
+        return_value=_client(json.dumps(expected)),
+    ):
+        assert await _parse_user_answer(questions, "main.py") == expected
+
+
+@pytest.mark.anyio
+async def test_parse_user_answer_non_json_raises():
+    """A response with no JSON object raises ValueError carrying the raw text."""
+    from agent_box.agents.claude_code import _parse_user_answer
+
+    block = Mock(type="text")
+    block.text = ""
+    resp = Mock(content=[block])
+    client = Mock()
+    client.messages = Mock(create=AsyncMock(return_value=resp))
+
+    with patch("agent_box.agents.claude_code._get_answer_client", return_value=client):
+        with pytest.raises(ValueError, match="non-JSON answer response"):
+            await _parse_user_answer([{"question": "q"}], "reply")
 
 
 @pytest.mark.anyio
