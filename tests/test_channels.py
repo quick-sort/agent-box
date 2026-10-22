@@ -49,6 +49,30 @@ async def test_send_loop():
     assert replies[1].text == "b"
 
 
+@pytest.mark.anyio
+async def test_send_loop_survives_send_reply_error():
+    """A failing send_reply must not kill the loop; later messages still go out."""
+    replies = []
+
+    class Flaky(BaseChannel):
+        async def start(self): pass
+        async def send_reply(self, msg: OutgoingMessage):
+            if msg.text == "bad":
+                raise RuntimeError("network down")
+            replies.append(msg)
+
+    send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
+    channel = Flaky(MagicMock())
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(channel.send_loop, recv)
+        await send.send(OutgoingMessage(text="bad", user_id="u1"))
+        await send.send(OutgoingMessage(text="good", user_id="u1"))
+        await send.aclose()
+
+    assert [m.text for m in replies] == ["good"]
+
+
 # ── WeixinChannel ──
 
 @pytest.mark.anyio
@@ -145,6 +169,50 @@ async def test_weixin_send_reply():
     fake_account.send_text.assert_called_once()
     call_kwargs = fake_account.send_text.call_args
     assert call_kwargs.kwargs.get("to_user_id") == "wx_user" or "wx_user" in str(call_kwargs)
+
+
+@pytest.mark.anyio
+async def test_weixin_send_reply_retries_on_timeout():
+    """A transient TimeoutError is retried once and the reply still goes out."""
+    from agent_box.channels.weixin import WeixinChannel
+
+    fake_account = MagicMock()
+    fake_account.send_text = MagicMock(
+        side_effect=[TimeoutError("POST sendmessage timed out after 15.0s"), None]
+    )
+
+    with patch("agent_box.channels.weixin.AccountClient"), \
+         patch("anyio.sleep", new=AsyncMock()) as fake_sleep:
+        channel = WeixinChannel.__new__(WeixinChannel)
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
+        channel.account = fake_account
+
+        await channel.send_reply(OutgoingMessage(text="reply", user_id="wx_user"))
+
+    assert fake_account.send_text.call_count == 2
+    fake_sleep.assert_awaited_once_with(2)
+
+
+@pytest.mark.anyio
+async def test_weixin_send_reply_gives_up_after_second_failure():
+    """Two failed attempts drop the message without raising (send_loop safety net)."""
+    from agent_box.channels.weixin import WeixinChannel
+
+    fake_account = MagicMock()
+    fake_account.send_text = MagicMock(side_effect=TimeoutError("still down"))
+
+    with patch("agent_box.channels.weixin.AccountClient"), \
+         patch("anyio.sleep", new=AsyncMock()):
+        channel = WeixinChannel.__new__(WeixinChannel)
+        channel._account_id = "fake-account"
+        channel._store = MagicMock()
+        channel.account = fake_account
+
+        # Should not raise; both attempts were logged and the message dropped.
+        await channel.send_reply(OutgoingMessage(text="reply", user_id="wx_user"))
+
+    assert fake_account.send_text.call_count == 2
 
 
 @pytest.mark.anyio
