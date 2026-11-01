@@ -86,6 +86,7 @@ cp sample.env .env
 uv run agent-box --tui        # 终端模式
 uv run agent-box              # WeChat 模式
 uv run agent-box --qq         # QQ Bot 模式
+uv run agent-box --relay      # AgentHub relay 模式（推荐，替代 --wecom）
 uv run agent-box --qq --weixin # WeChat + QQ 同时运行
 uv run agent-box --test-router  # 只测试路由，不执行 Agent
 ```
@@ -137,8 +138,11 @@ uv run agent-box --qq
 | `WEIXIN_ACCOUNT_ID` | 微信账号 ID | — |
 | `QQBOT_APP_ID` | QQ Bot AppID | — |
 | `QQBOT_CLIENT_SECRET` | QQ Bot Secret | — |
+| `RELAY_URL` | AgentHub relay 的 agent WebSocket 地址，如 `ws://relay:8090/v1/agent/ws` | — |
+| `RELAY_AGENT_ID` / `RELAY_AGENT_TOKEN` | relay 中的 agent id 与 token | — |
+| `RELAY_HEARTBEAT_SECONDS` | relay 心跳间隔（秒） | `20` |
 | `WECOM_BOTS` | 多个企业微信机器人的 JSON 数组（每项含 `name`/`bot_id`/`secret`/`ws_url`/`scene` 等，见 `sample.env`） | — |
-| `WECOM_BOT_ID` / `WECOM_SECRET` | 单机器人凭据（`WECOM_BOTS` 为空时生效） | — |
+| `WECOM_BOT_ID` / `WECOM_SECRET` | 单机器人凭据（`WECOM_BOTS` 为空时生效；legacy） | — |
 | `GH_TOKEN` | GitHub token（供 Agent 使用 `gh` CLI） | — |
 | `CONFIG_DIR` | 配置根目录 | `~/.agent-box` |
 | `WORKSPACE_DIR` | 项目工作区根目录 | `~/.agent-box/workspace` |
@@ -155,10 +159,28 @@ uv run agent-box --qq
 Agent 执行的模型可通过对话切换：说"切换模型到 claude-sonnet-4-6"即可，无需重启。
 切换模型功能由 Router 的 `switch_model` 工具实现，每个项目独立记忆使用的模型。
 
-### 企业微信机器人（多实例）
+### AgentHub relay 渠道
+
+`--relay` 让 agent-box 作为 agent 连到 AgentHub relay。relay 持有企微 / Discuss
+等实时连接、路由和队列，agent-box 只负责认证、领取 delivery、回传消息并 ack。
+
+```env
+RELAY_URL=ws://relay:8090/v1/agent/ws
+RELAY_AGENT_ID=12
+RELAY_AGENT_TOKEN=<token>
+```
+
+```bash
+uv run agent-box --relay
+```
+
+协议与设计见 [`docs/relay_channel_design.md`](docs/relay_channel_design.md)。
+`--relay` 与 legacy `--wecom` 互斥：relay 接管企微连接后不要再启用 `--wecom`。
+
+### 企业微信机器人（多实例，legacy）
 
 企业微信渠道通过 `--wecom` 启动，支持多个机器人同时在线。多机器人用 `WECOM_BOTS`
-（JSON 数组）配置，优先级高于单机器人字段：
+（JSON 数组）配置，优先级高于单机器人字段。relay 部署请改用 `--relay`：
 
 ```env
 WECOM_BOTS=[{"name":"prod","bot_id":"...","secret":"...","ws_url":"wss://openws.work.weixin.qq.com"},{"name":"test","bot_id":"...","secret":"..."}]

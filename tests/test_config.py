@@ -64,3 +64,21 @@ def test_wecom_instances_prefers_list():
 def test_wecom_instances_empty():
     s = Settings(_env_file=None, wecom_bots=[], wecom_bot_id="", wecom_secret="")
     assert s.wecom_instances() == []
+
+
+def test_relay_defaults():
+    s = Settings(_env_file=None)
+    assert s.relay_url == ""
+    assert s.relay_agent_id == 0
+    assert s.relay_agent_token == ""
+    assert s.relay_heartbeat_seconds == 20.0
+
+
+def test_relay_settings_from_env(monkeypatch):
+    monkeypatch.setenv("RELAY_URL", "ws://relay:8090/v1/agent/ws")
+    monkeypatch.setenv("RELAY_AGENT_ID", "42")
+    monkeypatch.setenv("RELAY_AGENT_TOKEN", "secret")
+    s = Settings(_env_file=None)
+    assert s.relay_url == "ws://relay:8090/v1/agent/ws"
+    assert s.relay_agent_id == 42
+    assert s.relay_agent_token == "secret"

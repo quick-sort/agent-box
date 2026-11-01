@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     odoo_api_key: str = ""    # API key; cannot create a web session, RPC only
     odoo_channel_id: int = 0  # discuss.channel id to bridge
 
+    # AgentHub relay channel: a single agent WebSocket connection to the relay.
+    # The relay owns WeCom/Discuss transports; agent-box only answers deliveries.
+    # RELAY_URL is the full agent WebSocket URL, e.g.
+    # ws://relay:8090/v1/agent/ws
+    relay_url: str = ""
+    relay_agent_id: int = 0
+    relay_agent_token: str = ""
+    relay_heartbeat_seconds: float = 20.0
+
     # GLM (ZhipuAI) ASR — voice-to-text for audio attachments. Empty skips transcription.
     glm_api_key: str = ""
     glm_asr_model: str = "glm-asr-2512"
