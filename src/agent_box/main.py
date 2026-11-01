@@ -125,6 +125,9 @@ class App:
         elif spec.type == "odoo":
             from .channels.odoo import OdooChannel
             return OdooChannel(send_in)
+        elif spec.type == "relay":
+            from .channels.relay import RelayChannel
+            return RelayChannel(send_in, spec=spec)
         else:
             from .channels.weixin import WeixinChannel
             return WeixinChannel(send_in)
@@ -319,9 +322,11 @@ class App:
         send_out: anyio.abc.ObjectSendStream[OutgoingMessage],
     ) -> None:
         async def _safe_handle(msg: IncomingMessage, reply: anyio.abc.ObjectSendStream[OutgoingMessage]) -> None:
+            error: str | None = None
             try:
                 await self.handle_message(msg, reply)
             except Exception as exc:
+                error = str(exc)
                 log.exception("handle_message failed for user=%s channel=%s", msg.user_id, msg.channel)
                 try:
                     await reply.send(OutgoingMessage(
@@ -333,6 +338,24 @@ class App:
                 except Exception:
                     log.debug(
                         "failed to send error reply for user=%s channel=%s",
+                        msg.user_id,
+                        msg.channel,
+                        exc_info=True,
+                    )
+            finally:
+                # Optional end-of-turn signal. Only the relay channel acts on
+                # it; BaseChannel.send_loop swallows it for everyone else.
+                try:
+                    await reply.send(OutgoingMessage(
+                        text="",
+                        user_id=msg.user_id,
+                        channel=msg.channel,
+                        conversation_id=msg.conversation_id,
+                        data={"_turn_end": True, "error": error},
+                    ))
+                except Exception:
+                    log.debug(
+                        "failed to send turn-end marker for user=%s channel=%s",
                         msg.user_id,
                         msg.channel,
                         exc_info=True,
@@ -465,19 +488,22 @@ Usage: agent-box [OPTIONS]
 
 Channel options (at least one required, defaults to --weixin):
   --weixin          Enable WeChat (微信) channel
-  --wecom           Enable WeCom (企业微信) WebSocket channel
+  --relay           Enable AgentHub relay channel (replaces --wecom)
+  --wecom           Enable WeCom (企业微信) WebSocket channel (legacy)
   --qq              Enable QQ Bot channel
   --odoo            Enable Odoo Discuss/Live Chat channel
   --tui             Enable terminal UI channel (for local testing)
 
 Multiple channels can be enabled simultaneously:
-  agent-box --wecom --tui
+  agent-box --relay --tui
 
 Other options:
   --test-router     Launch interactive router REPL for testing
   -h, --help        Show this help message
 
 Environment variables (see sample.env):
+  RELAY_URL, RELAY_AGENT_ID,
+  RELAY_AGENT_TOKEN                  AgentHub relay agent WebSocket credentials
   WECOM_BOTS                         JSON array of WeCom bots (name/bot_id/secret/ws_url/...)
   WECOM_BOT_ID, WECOM_SECRET         Legacy single-bot credentials (fallback)
   QQBOT_APP_ID, QQBOT_CLIENT_SECRET  QQ bot credentials
@@ -496,7 +522,7 @@ Environment variables (see sample.env):
             pass
         return
 
-    # Parse channel flags: --qq --weixin --tui --wecom --odoo
+    # Parse channel flags: --qq --weixin --tui --wecom --odoo --relay
     enabled: set[str] = set()
     if "--qq" in sys.argv:
         enabled.add("qq")
@@ -506,12 +532,24 @@ Environment variables (see sample.env):
         enabled.add("wecom")
     if "--odoo" in sys.argv:
         enabled.add("odoo")
+    if "--relay" in sys.argv:
+        enabled.add("relay")
     if "--weixin" in sys.argv or not enabled:
         enabled.add("weixin")
+    if "relay" in enabled and "wecom" in enabled:
+        print(
+            "--relay and --wecom are mutually exclusive: the relay now owns "
+            "WeCom connections. Use --relay (keep --wecom only for legacy "
+            "deployments without a relay).",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     # Expand enabled types into concrete channel instances. WeCom can expand
     # to N instances (one per configured bot); other types stay single-instance.
     specs: list[ChannelSpec] = []
+    if "relay" in enabled:
+        specs.append(ChannelSpec(type="relay", instance_id="relay"))
     if "wecom" in enabled:
         for inst in settings.wecom_instances():
             specs.append(ChannelSpec(type="wecom", instance_id=f"wecom:{inst.name}", config=inst))

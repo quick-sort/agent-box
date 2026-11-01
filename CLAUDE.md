@@ -8,11 +8,12 @@ IM → Router → Agent pipeline. Chat via WeChat/QQ, route messages to project-
 WeChat ─┐                                       ┌─→ WeixinChannel.send_reply()
         ├─→ IncomingMessage ─→ Router ─→ Agent ─┤
 QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_reply()
-                                    │                   │
-                                    │                   ├─ ClaudeCodeAgent
-                                    │                   │  └─ ClaudeSDKClient
-                                    │                   └─ ACPAgent
-                                    │                      └─ ACP-compatible CLI
+AgentHub relay ─┘                                   RelayChannel.send_reply()
+   (WS: deliver/stream/turn/ack)                       │
+                                    │                  ├─ ClaudeCodeAgent
+                                    │                  │  └─ ClaudeSDKClient
+                                    │                  └─ ACPAgent
+                                    │                     └─ ACP-compatible CLI
                                     ▼
                           SessionManager
                           .router/projects.json
@@ -31,6 +32,8 @@ QQ Bot ─┘     (channel field)  (LLM+tools)      └─→ QQChannel.send_rep
 - **Project identity** — projects are identified by `name` (no slug). The project folder is `<workspace>/<name>`.
 - **Default project** — `_default` is always created and used when nothing else is pinned.
 - **Channel abstraction** — `BaseChannel` ABC; weixin adapter wraps the sync `weixin_sdk` via `anyio.to_thread`
+- **Relay channel** — `RelayChannel` is an outbound WebSocket *client* of the AgentHub relay (`--relay`). The relay owns IM transports/routing/queues; agent-box only answers `deliver` frames, streams replies, then sends `turn` + `ack`. `thread_key` becomes `conversation_id`, so each relay thread gets its own `(project, conversation)` agent. `--relay` and legacy `--wecom` are mutually exclusive. See `docs/relay_channel_design.md`.
+- **End-of-turn marker** — `App._dispatch_loop` sends an `OutgoingMessage` with `data={"_turn_end": True, "error": …}` after every inbound turn; `BaseChannel.send_loop` routes it to the optional `turn_finished()` hook (only relay uses it).
 - **File handling** — both channels download incoming media attachments and inject local paths into `IncomingMessage.text`. Outgoing files are sent via `OutgoingMessage.data = {"file_path": "..."}`. QQ uses chunked upload (up to 100MB), WeChat uses `MediaClient.send_file()` (AES + CDN).
 - **Agent → channel file bridge** — agent uses `[SEND_FILE:/path]` markers (injected via system prompt) to signal file delivery. Agent layer parses markers and generates `OutgoingMessage(data={"file_path": path})`.
 - **Tool progress feedback** — tool calls (Bash, Read, Edit, etc.) are shown as brief one-line status messages on IM channels. File paths are shortened by stripping project/workspace prefixes.
@@ -48,7 +51,8 @@ src/agent_box/
 │   ├── base.py          # BaseChannel ABC
 │   ├── weixin.py        # WeixinChannel (long-poll)
 │   ├── qq.py            # QQChannel (WebSocket gateway, image send/recv)
-│   ├── wecom.py         # WecomChannel (WebSocket long connection)
+│   ├── wecom.py         # WecomChannel (WebSocket long connection, legacy)
+│   ├── relay.py         # RelayChannel (AgentHub relay agent WebSocket client)
 │   ├── odoo.py          # OdooChannel (Odoo Discuss/Live Chat, API-key JSON-RPC + poll)
 │   └── tui.py           # TuiChannel (terminal REPL)
 ├── router/
@@ -75,6 +79,8 @@ src/agent_box/
 - `WEIXIN_ACCOUNT_ID` — weixin_sdk account id (from login)
 - `QQBOT_APP_ID` — QQ Bot application ID
 - `QQBOT_CLIENT_SECRET` — QQ Bot client secret
+- `RELAY_URL`, `RELAY_AGENT_ID`, `RELAY_AGENT_TOKEN` — AgentHub relay agent WebSocket credentials (`--relay`)
+- `RELAY_HEARTBEAT_SECONDS` — relay ping interval (default 20)
 - `WECOM_BOTS` — JSON array of WeCom bots (each: `name`/`bot_id`/`secret` + optional `ws_url`/`scene`/`plug_version`/timing fields; see `sample.env`)
 - `WECOM_BOT_ID` / `WECOM_SECRET` — legacy single-bot credentials (fallback when `WECOM_BOTS` is empty; wrapped as `name="default"`)
 - `GLM_API_KEY` — ZhipuAI (GLM) API key for voice-to-text (fallback). QQ voice messages prefer the platform-provided `asr_refer_text`; this key is used only when that field is absent.
@@ -102,6 +108,9 @@ uv run agent-box
 
 # QQ Bot channel mode
 uv run agent-box --qq
+
+# AgentHub relay channel mode (replaces --wecom)
+uv run agent-box --relay
 
 # Odoo Discuss/Live Chat channel mode
 uv run agent-box --odoo
