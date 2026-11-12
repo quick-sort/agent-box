@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /home/agent \
     && echo "registry=https://registry.npmmirror.com" > /home/agent/.npmrc \
     && npm config set prefix '/home/agent/.npm-global' \
-    && npm install -g @anthropic-ai/claude-code@2.1.110 agent-browser \
+    && npm install -g @anthropic-ai/claude-code@2.1.321 agent-browser \
     && /home/agent/.npm-global/bin/agent-browser install \
     && chmod -R 755 /root/.agent-browser \
     && npm cache clean --force \
