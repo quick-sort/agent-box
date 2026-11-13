@@ -4,11 +4,12 @@ version = "0.1.4"
 description = "IM → Router → Agent pipeline for managing coding projects via chat"
 requires-python = ">=3.12"
 dependencies = [
-    # Pinned: 0.2.132+ (bundled CLI 2.1.224) no longer treats /clear as a
-    # built-in command in SDK mode, so "/clear" leaks to the LLM as plain text.
-    # 0.2.87 is the last known-good version. Do not bump without re-verifying
-    # slash-command (/clear) behaviour through the SDK.
-    "claude-agent-sdk==0.2.87",
+    # Slash-command (/clear) behaviour in SDK mode must be re-verified on each
+    # bump. Verified on 0.2.180 (bundled CLI 2.1.321): "/clear" is treated as
+    # a built-in command (emits ConversationResetMessage + a fresh session id)
+    # and "/compact" still works. Older 0.2.132+ builds leaked "/clear" to the
+    # model as plain text, which is why this stayed pinned at 0.2.87.
+    "claude-agent-sdk==0.2.180",
     "anthropic>=0.40",
     "anyio>=4.0",
     "pycryptodome>=3.20",
