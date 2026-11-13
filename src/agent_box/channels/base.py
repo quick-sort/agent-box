@@ -26,6 +26,13 @@ class BaseChannel(ABC):
     async def send_reply(self, msg: OutgoingMessage) -> None:
         """Send a reply back through this channel."""
 
+    async def turn_finished(self, msg: OutgoingMessage) -> None:
+        """Called when the inbound turn for ``msg.conversation_id`` ends.
+
+        Channels that need an explicit end-of-turn signal (the relay channel
+        acks the delivery here) override this. The default is a no-op.
+        """
+
     async def send_loop(self, recv: anyio.abc.ObjectReceiveStream[OutgoingMessage]) -> None:
         """Consume outgoing messages and send them.
 
@@ -34,6 +41,15 @@ class BaseChannel(ABC):
         application over a single transient network error.
         """
         async for msg in recv:
+            if (msg.data or {}).get("_turn_end"):
+                try:
+                    await self.turn_finished(msg)
+                except Exception:
+                    log.exception(
+                        "%s: failed to finish turn for %s",
+                        type(self).__name__, msg.conversation_id,
+                    )
+                continue
             try:
                 await self.send_reply(msg)
             except Exception:
