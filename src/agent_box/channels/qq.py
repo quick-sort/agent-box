@@ -61,6 +61,16 @@ _MENTION_RE = re.compile(r"<@!?\w+>\s*")
 
 RECONNECT_DELAY = 5.0  # seconds between reconnect attempts
 
+# QQ's passive-reply rules: a reply anchored to an inbound msg_id must be sent
+# within 5 minutes and each msg_id accepts at most 5 replies. Beyond that the
+# API rejects the send, so we drop the anchor and fall back to a proactive
+# push instead of failing outright.
+_PASSIVE_TTL_S = 300.0
+_PASSIVE_MAX_REPLIES = 5
+
+# Smooth bursts of tool-progress messages: QQ rate-limits per chat.
+_SEND_INTERVAL_S = 1.0
+
 # QQ Bot media file_type values (API enum: 1=image 2=video 3=voice 4=file)
 _FILE_TYPE_IMAGE = 1
 _FILE_TYPE_VIDEO = 2
@@ -121,6 +131,8 @@ def _format_size(n: int) -> str:
 class QQChannel(BaseChannel):
     """QQ Bot channel via the Official Bot API WebSocket gateway."""
 
+    min_send_interval = _SEND_INTERVAL_S
+
     def __init__(self, send_stream: anyio.abc.ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
         self._app_id = settings.qqbot_app_id
@@ -131,6 +143,10 @@ class QQChannel(BaseChannel):
         self._last_seq: int | None = None
         # Latest msg_id per user_id; used as passive-reply anchor
         self._last_msg_id: dict[str, str] = {}
+        # When that anchor arrived and how many replies it has used. QQ expires
+        # the anchor after 5 minutes and allows at most 5 replies per msg_id.
+        self._passive_received_at: dict[str, float] = {}
+        self._passive_replies: dict[str, int] = {}
         self._download_dir: Path = settings.config_dir / "channels" / "qq" / "downloads"
         # Voice transcription; None when GLM API key is not configured (skip feature)
         self._asr: GlmASR | None = (
@@ -348,6 +364,7 @@ class QQChannel(BaseChannel):
         file_path: str,
         *,
         msg_id: str | None = None,
+        msg_seq: int | None = None,
     ) -> None:
         """Upload a file (any type) and send as QQ media message."""
         file_type = _detect_file_type(file_path)
@@ -359,7 +376,7 @@ class QQChannel(BaseChannel):
         body: dict[str, Any] = {
             "msg_type": 7,
             "media": {"file_info": file_info},
-            "msg_seq": _next_msg_seq(),
+            "msg_seq": msg_seq if msg_seq is not None else _next_msg_seq(),
         }
         if msg_id:
             body["msg_id"] = msg_id
@@ -441,6 +458,7 @@ class QQChannel(BaseChannel):
         image_url: str | None = None,
         image_path: str | None = None,
         msg_id: str | None = None,
+        msg_seq: int | None = None,
     ) -> None:
         """Upload image and send as QQ media message (msg_type=7)."""
         file_info = await self._upload_image(
@@ -453,7 +471,7 @@ class QQChannel(BaseChannel):
         body: dict[str, Any] = {
             "msg_type": 7,
             "media": {"file_info": file_info},
-            "msg_seq": _next_msg_seq(),
+            "msg_seq": msg_seq if msg_seq is not None else _next_msg_seq(),
         }
         if msg_id:
             body["msg_id"] = msg_id
@@ -697,7 +715,7 @@ class QQChannel(BaseChannel):
             return
 
         user_id = f"c2c:{openid}"
-        self._last_msg_id[user_id] = msg_id
+        self._set_passive_anchor(user_id, msg_id)
         log.debug("QQ c2c from %s: %s", openid, text[:80])
         await self.send_stream.send(IncomingMessage(
             text=text,
@@ -727,7 +745,7 @@ class QQChannel(BaseChannel):
             return
 
         user_id = f"group:{group_openid}"
-        self._last_msg_id[user_id] = msg_id
+        self._set_passive_anchor(user_id, msg_id)
         log.debug("QQ group %s: %s", group_openid, text[:80])
         await self.send_stream.send(IncomingMessage(
             text=text,
@@ -742,6 +760,49 @@ class QQChannel(BaseChannel):
 
     # ── Outbound ──────────────────────────────────────────────────────────────
 
+    def _set_passive_anchor(self, user_id: str, msg_id: str) -> None:
+        """Record the inbound msg_id a reply may be anchored to."""
+        self._last_msg_id[user_id] = msg_id
+        self._passive_received_at[user_id] = time.time()
+        self._passive_replies[user_id] = 0
+
+    def _next_passive_reply(self, user_id: str) -> tuple[str | None, int]:
+        """Pick the passive-reply anchor and msg_seq for one outbound message.
+
+        Returns ``(msg_id, msg_seq)``. ``msg_id`` is None once the 5-minute
+        window has expired or all 5 replies are used — the message is then sent
+        as a proactive push, which is better than a guaranteed API rejection.
+        """
+        msg_id = self._last_msg_id.get(user_id)
+        if not msg_id:
+            return None, _next_msg_seq()
+
+        received_at_map = getattr(self, "_passive_received_at", None)
+        if received_at_map is None:
+            received_at_map = self._passive_received_at = {}
+        replies_map = getattr(self, "_passive_replies", None)
+        if replies_map is None:
+            replies_map = self._passive_replies = {}
+
+        received_at = received_at_map.setdefault(user_id, time.time())
+        used = replies_map.get(user_id, 0)
+
+        if time.time() - received_at > _PASSIVE_TTL_S:
+            log.info(
+                "QQ: passive reply window (%.0fs) expired for %s, sending proactively",
+                _PASSIVE_TTL_S, user_id,
+            )
+            return None, _next_msg_seq()
+        if used >= _PASSIVE_MAX_REPLIES:
+            log.info(
+                "QQ: passive reply limit (%d) reached for %s, sending proactively",
+                _PASSIVE_MAX_REPLIES, user_id,
+            )
+            return None, _next_msg_seq()
+
+        replies_map[user_id] = used + 1
+        return msg_id, used + 1
+
     async def send_reply(self, msg: OutgoingMessage) -> None:
         if msg.type != MessageType.text:
             return
@@ -750,14 +811,16 @@ class QQChannel(BaseChannel):
             return
 
         msg_type, target_id = msg.user_id.split(":", 1)
-        msg_id = self._last_msg_id.get(msg.user_id)
+        msg_id, msg_seq = self._next_passive_reply(msg.user_id)
 
         data = msg.data or {}
 
         # Generic file/media sending via chunked upload
         file_path: str | None = data.get("file_path")
         if file_path and msg_type in ("c2c", "group"):
-            await self._send_media(target_id, msg_type, file_path, msg_id=msg_id)
+            await self._send_media(
+                target_id, msg_type, file_path, msg_id=msg_id, msg_seq=msg_seq,
+            )
             return
 
         # Legacy image sending (backward compatible)
@@ -770,6 +833,7 @@ class QQChannel(BaseChannel):
                     image_url=image_url,
                     image_path=image_path,
                     msg_id=msg_id,
+                    msg_seq=msg_seq,
                 )
             else:
                 log.warning("QQ: unknown msg_type %r for image send", msg_type)
@@ -778,7 +842,7 @@ class QQChannel(BaseChannel):
         # Text sending (Markdown, msg_type=2)
         body: dict[str, Any] = {
             "msg_type": 2,
-            "msg_seq": _next_msg_seq(),
+            "msg_seq": msg_seq,
             "markdown": {"content": msg.text},
         }
         if msg_id:

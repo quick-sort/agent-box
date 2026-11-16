@@ -332,3 +332,42 @@ async def test_route_outbound_dispatches_by_instance_id(tmp_path: Path):
     assert msg.text == "hello"
     with pytest.raises((anyio.WouldBlock, anyio.EndOfStream)):
         recv_a.receive_nowait()
+
+
+@pytest.mark.anyio
+async def test_route_outbound_does_not_block_on_stalled_channel(tmp_path: Path):
+    """A backed-up channel must not stall routing for the other channels.
+
+    Regression test for cross-channel head-of-line blocking: the app wires
+    per-channel queues as unbounded (App.run), so a channel whose consumer is
+    stuck accumulates messages instead of blocking the shared router.
+    """
+    import math
+
+    app = _make_app(tmp_path)
+
+    send_slow, _recv_slow = anyio.create_memory_object_stream[OutgoingMessage](math.inf)
+    send_fast, recv_fast = anyio.create_memory_object_stream[OutgoingMessage](4)
+
+    ch_slow, ch_fast = MagicMock(), MagicMock()
+    ch_slow._outbound_send = send_slow
+    ch_fast._outbound_send = send_fast
+
+    send_out, recv_out = anyio.create_memory_object_stream[OutgoingMessage](4)
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                app._route_outbound, recv_out,
+                {"slow": ch_slow, "fast": ch_fast},
+            )
+            # Far more than any bounded buffer would hold; nothing drains "slow".
+            for i in range(200):
+                await send_out.send(
+                    OutgoingMessage(text=f"s{i}", user_id="u1", channel="slow")
+                )
+            await send_out.send(
+                OutgoingMessage(text="fast", user_id="u1", channel="fast")
+            )
+            await send_out.aclose()
+
+    assert recv_fast.receive_nowait().text == "fast"

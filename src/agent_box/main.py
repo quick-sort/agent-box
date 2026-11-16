@@ -19,6 +19,11 @@ from .session_manager import SessionManager
 log = logging.getLogger(__name__)
 
 _STOP_COMMANDS = frozenset({"stop", "停止", "停下"})
+# Warn when a channel's outbound queue grows past this many messages.
+_OUTBOUND_BACKLOG_WARN = 50
+# Safety valve: above this depth, drop tool-progress lines (never real replies)
+# so a channel that is down for hours cannot grow memory without bound.
+_OUTBOUND_HARD_LIMIT = 500
 _ActiveTurn = tuple[str, BaseAgent, anyio.CancelScope]
 
 
@@ -277,8 +282,13 @@ class App:
             async with anyio.create_task_group() as tg:
                 # Start each channel's inbound listener and outbound sender
                 for ch in channels.values():
-                    # Each channel gets a filtered outbound stream
-                    ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](16)
+                    # Each channel gets its own *unbounded* outbound queue. The
+                    # router below must never block: with a bounded queue, one
+                    # slow channel fills its buffer and stalls routing for every
+                    # other channel (head-of-line blocking), which in turn
+                    # back-pressures every agent turn. Bounded growth is handled
+                    # by the per-send timeout in BaseChannel.send_loop.
+                    ch_send, ch_recv = anyio.create_memory_object_stream[OutgoingMessage](math.inf)
                     tg.start_soon(ch.start)
                     tg.start_soon(ch.send_loop, ch_recv)
                     # Store the send stream for routing
@@ -304,17 +314,37 @@ class App:
         recv: anyio.abc.ObjectReceiveStream[OutgoingMessage],
         channels: dict[str, BaseChannel],
     ) -> None:
-        """Route outgoing messages to the correct channel's send stream."""
+        """Route outgoing messages to the correct channel's send stream.
+
+        The per-channel streams are unbounded (see ``App.run``), so ``send``
+        never blocks: a channel that is slow, reconnecting, or rate-limited
+        accumulates messages in its own queue without affecting other channels
+        or the agent turn that produced this message.
+        """
         async for msg in recv:
             ch = channels.get(msg.channel)
             if ch is None:
                 log.warning("No channel '%s' for outgoing message, dropping", msg.channel)
                 continue
             send_stream: anyio.abc.ObjectSendStream[OutgoingMessage] | None = getattr(ch, "_outbound_send", None)
-            if send_stream is not None:
-                await send_stream.send(msg)
-            else:
+            if send_stream is None:
                 log.warning("Channel '%s' has no outbound stream", msg.channel)
+                continue
+            depth = send_stream.statistics().current_buffer_used
+            # Log at the threshold and then every 100 messages, so a long
+            # backlog is visible without flooding the log on every send.
+            if depth >= _OUTBOUND_BACKLOG_WARN and depth % 100 == _OUTBOUND_BACKLOG_WARN:
+                log.warning(
+                    "outbound backlog on %s: %d messages queued (conversation=%s)",
+                    msg.channel, depth, msg.conversation_id,
+                )
+            if depth >= _OUTBOUND_HARD_LIMIT and (msg.data or {}).get("progress"):
+                log.warning(
+                    "outbound queue for %s is full (%d), dropping tool-progress message",
+                    msg.channel, depth,
+                )
+                continue
+            await send_stream.send(msg)
 
     async def _dispatch_loop(
         self,

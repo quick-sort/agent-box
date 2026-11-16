@@ -28,7 +28,7 @@ from acp.schema import (
 
 from ..config import settings
 from ..models import MessageType, OutgoingMessage, ProjectInfo
-from .base import BaseAgent
+from .base import BaseAgent, ProgressThrottle
 from .delivery import SEND_FILE_INSTRUCTION, parse_send_file_markers
 
 log = logging.getLogger(__name__)
@@ -115,6 +115,8 @@ class ACPAgent(BaseAgent):
         self._text_chunks: list[str] = []
         self._usage: dict[str, Any] | None = None
         self._instructions_sent = False
+        # Throttles tool-progress messages to the channel send quota.
+        self._progress_throttle = ProgressThrottle()
 
     @property
     def has_pending_question(self) -> bool:
@@ -356,6 +358,8 @@ class ACPAgent(BaseAgent):
             await self._flush_text()
             if not settings.agent_tool_progress:
                 return
+            if not self._progress_throttle.allow(settings.agent_tool_progress_interval):
+                return
             await self._events.put(
                 OutgoingMessage(
                     text=self._format_tool_call(update),
@@ -365,6 +369,7 @@ class ACPAgent(BaseAgent):
                         "id": update.tool_call_id,
                         "kind": update.kind,
                         "input": update.raw_input,
+                        "progress": True,
                     },
                 )
             )

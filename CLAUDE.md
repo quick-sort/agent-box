@@ -36,7 +36,8 @@ AgentHub relay ─┘                                   RelayChannel.send_reply(
 - **End-of-turn marker** — `App._dispatch_loop` sends an `OutgoingMessage` with `data={"_turn_end": True, "error": …}` after every inbound turn; `BaseChannel.send_loop` routes it to the optional `turn_finished()` hook (only relay uses it).
 - **File handling** — both channels download incoming media attachments and inject local paths into `IncomingMessage.text`. Outgoing files are sent via `OutgoingMessage.data = {"file_path": "..."}`. QQ uses chunked upload (up to 100MB), WeChat uses `MediaClient.send_file()` (AES + CDN).
 - **Agent → channel file bridge** — agent uses `[SEND_FILE:/path]` markers (injected via system prompt) to signal file delivery. Agent layer parses markers and generates `OutgoingMessage(data={"file_path": path})`.
-- **Tool progress feedback** — tool calls (Bash, Read, Edit, etc.) are shown as brief one-line status messages on IM channels. File paths are shortened by stripping project/workspace prefixes.
+- **Tool progress feedback** — tool calls (Bash, Read, Edit, etc.) are shown as brief one-line status messages on IM channels. File paths are shortened by stripping project/workspace prefixes. Bursts are throttled by `AGENT_TOOL_PROGRESS_INTERVAL` so a turn with many tool calls cannot exhaust a channel's per-conversation send quota.
+- **Outbound backpressure** — every channel has its own unbounded outbound queue and a serial `send_loop` with a per-send timeout and per-conversation pacing (`min_send_interval`). A slow, disconnected, or rate-limited channel therefore stalls only its own queue; it never blocks the shared router, other channels, or agent turns. WeCom sends are retried on errcode 846607 and QQ falls back from an expired passive `msg_id` to a proactive push.
 
 ## Project Structure
 
@@ -92,6 +93,7 @@ src/agent_box/
 - `MULTI_PROJECT_ENABLED` — set to `false` to disable multi-project management: the router skips both the quick commands (`newproject`/`switchto`/…) and the LLM project-command classification, and every message goes to the `_default` project (default: `true`)
 - `AGENT_PERMISSION_MODE` — Claude Code permission mode (default: `bypassPermissions`)
 - `AGENT_TOOL_PROGRESS` — set to `false` to stop emitting one-line tool-call progress messages (`🔧`/`📖`/`✏️` …) to channels (default: `true`)
+- `AGENT_TOOL_PROGRESS_INTERVAL` — minimum seconds between two tool-progress messages in a conversation (default: `5.0`; bursts are dropped to stay inside channel rate limits)
 - `ANTHROPIC_API_KEY` — required by Claude Code SDK and the project-management Router
 - `AGENTS` — enabled backend JSON array (default `["claude_code"]`)
 - `DEFAULT_AGENT` — backend assigned to new projects (default `claude_code`)

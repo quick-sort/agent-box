@@ -31,7 +31,7 @@ from claude_agent_sdk import (
 
 from ..config import settings
 from ..models import MessageType, OutgoingMessage, ProjectInfo
-from .base import BaseAgent
+from .base import BaseAgent, ProgressThrottle
 from .delivery import SEND_FILE_INSTRUCTION as _SEND_FILE_INSTRUCTION
 from .delivery import parse_send_file_markers as _parse_send_file_markers
 
@@ -390,6 +390,15 @@ class ClaudeCodeAgent(BaseAgent):
         # Recent claude CLI stderr lines — the SDK's ProcessError only carries
         # an exit code, so this is the only place the failure reason shows up.
         self._stderr_tail: deque[str] = deque(maxlen=50)
+        # Drops tool-progress bursts so a 20-tool turn cannot exhaust the
+        # channel's per-conversation send quota.
+        self._progress_throttle = ProgressThrottle()
+
+    def _progress_allowed(self) -> bool:
+        throttle = getattr(self, "_progress_throttle", None)
+        if throttle is None:
+            throttle = self._progress_throttle = ProgressThrottle()
+        return throttle.allow(settings.agent_tool_progress_interval)
 
     def _on_stderr(self, line: str) -> None:
         """Log a claude CLI stderr line and keep it for failure diagnosis.
@@ -889,11 +898,16 @@ class ClaudeCodeAgent(BaseAgent):
                         elif isinstance(block, ToolUseBlock):
                             if not settings.agent_tool_progress:
                                 continue
+                            if not self._progress_allowed():
+                                continue
                             # Brief one-liner so the user knows something is happening.
                             summary = _format_tool_summary(block, prefixes=_path_prefixes)
                             yield OutgoingMessage(
                                 text=summary, user_id=user_id, channel=channel, type=MessageType.text,
-                                data={"id": block.id, "name": block.name, "input": block.input},
+                                data={
+                                    "id": block.id, "name": block.name,
+                                    "input": block.input, "progress": True,
+                                },
                             )
                         # ThinkingBlock / ToolResultBlock deliberately skipped —
                         # too noisy for IM channels.
@@ -1082,10 +1096,15 @@ class ClaudeCodeAgent(BaseAgent):
                     elif isinstance(block, ToolUseBlock):
                         if not settings.agent_tool_progress:
                             continue
+                        if not self._progress_allowed():
+                            continue
                         summary = _format_tool_summary(block, prefixes=_path_prefixes)
                         yield OutgoingMessage(
                             text=summary, user_id=user_id, channel=channel, type=MessageType.text,
-                            data={"id": block.id, "name": block.name, "input": block.input},
+                            data={
+                                "id": block.id, "name": block.name,
+                                "input": block.input, "progress": True,
+                            },
                         )
             elif isinstance(msg, SystemMessage):
                 yield OutgoingMessage(

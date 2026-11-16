@@ -71,6 +71,19 @@ _UNSAFE_NAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 _DEFAULT_EXT_BY_KIND = {"image": ".jpg", "voice": ".amr", "video": ".mp4", "file": ".bin"}
 
+# WeCom allows 30 messages/minute per conversation (replies and proactive
+# pushes share the quota), so space sends slightly more than 2s apart to stay
+# under it. Exceeding it returns errcode 846607 and the SDK raises; retry a
+# couple of times with backoff instead of dropping the message on the floor.
+_SEND_INTERVAL_S = 2.1
+_RATE_LIMIT_MARKERS = ("846607", "frequency limit")
+_RATE_LIMIT_RETRY_DELAYS = (2.0, 4.0)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
 
 class MediaRef(NamedTuple):
     """A downloadable media attachment referenced by an inbound message."""
@@ -212,6 +225,9 @@ def _parse_message_body(body: dict[str, Any]) -> tuple[str, list[MediaRef]]:
 
 class WecomChannel(BaseChannel):
     """WeCom Bot WebSocket channel using official wecom-aibot-sdk."""
+
+    # 30 messages/minute per conversation → ~2.1s spacing.
+    min_send_interval = _SEND_INTERVAL_S
 
     def __init__(self, send_stream: ObjectSendStream[IncomingMessage], *, spec: ChannelSpec) -> None:
         super().__init__(send_stream)
@@ -423,16 +439,35 @@ class WecomChannel(BaseChannel):
         await self._send_text(chat_id, msg.text)
 
     async def _send_text(self, chat_id: str, text: str) -> None:
-        """Send a markdown text message."""
+        """Send a markdown text message, retrying on the frequency limit.
+
+        WeCom rejects bursts with errcode 846607 (``aibot send msg frequency
+        limit exceeded``). Dropping the message loses the agent's reply, so back
+        off and try again instead. Non-rate-limit errors are not retried — they
+        are usually permanent (bad chat id, expired connection).
+        """
         if not self._client:
             return
-        try:
-            await self._client.send_message(chat_id, {
-                "msgtype": "markdown",
-                "markdown": {"content": text},
-            })
-        except Exception:
-            log.exception("wecom: failed to send text to %s", chat_id)
+        delays = (0.0, *_RATE_LIMIT_RETRY_DELAYS)
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._client.send_message(chat_id, {
+                    "msgtype": "markdown",
+                    "markdown": {"content": text},
+                })
+                return
+            except Exception as exc:
+                if _is_rate_limited(exc) and attempt < len(delays):
+                    log.warning(
+                        "wecom: send to %s rate limited, retrying in %.0fs "
+                        "(attempt %d/%d): %s",
+                        chat_id, delays[attempt], attempt, len(delays), exc,
+                    )
+                    continue
+                log.exception("wecom: failed to send text to %s", chat_id)
+                return
 
     async def _send_file(self, chat_id: str, file_path: str) -> None:
         """Upload and send a local file as image / voice / video / file."""
@@ -472,12 +507,27 @@ class WecomChannel(BaseChannel):
                 # 视频消息支持标题，缺省时企微只显示一个无名视频卡片。
                 send_kwargs["video_title"] = p.stem
 
-            await self._client.send_media_message(
-                chat_id,
-                media_type=media_type,  # type: ignore[arg-type]
-                media_id=media_id,
-                **send_kwargs,
-            )
+            delays = (0.0, *_RATE_LIMIT_RETRY_DELAYS)
+            for attempt, delay in enumerate(delays, start=1):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await self._client.send_media_message(
+                        chat_id,
+                        media_type=media_type,  # type: ignore[arg-type]
+                        media_id=media_id,
+                        **send_kwargs,
+                    )
+                    break
+                except Exception as exc:
+                    if _is_rate_limited(exc) and attempt < len(delays):
+                        log.warning(
+                            "wecom: media send to %s rate limited, retrying in "
+                            "%.0fs (attempt %d/%d)",
+                            chat_id, delays[attempt], attempt, len(delays),
+                        )
+                        continue
+                    raise
             log.info(
                 "wecom: media sent: type=%s size=%d name=%s chat=%s",
                 media_type, len(file_data), p.name, chat_id,
