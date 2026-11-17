@@ -126,6 +126,47 @@ async def test_send_loop_paces_per_conversation():
     assert sent_at[1] - sent_at[0] >= 0.09
 
 
+@pytest.mark.anyio
+async def test_send_loop_does_not_pace_undeliverable_messages():
+    """Frames the channel drops must not delay deliverable messages.
+
+    A turn can emit thousands of transient system frames. Pacing those (2.1s
+    each on WeCom) starves the real reply behind them — the queue grows faster
+    than it drains and the user never sees anything.
+    """
+    import time as _time
+    from agent_box.models import MessageType
+
+    sent_at: list[float] = []
+
+    class Paced(BaseChannel):
+        min_send_interval = 0.2
+
+        def delivers(self, msg: OutgoingMessage) -> bool:
+            return msg.type == MessageType.text
+
+        async def start(self): pass
+        async def send_reply(self, msg: OutgoingMessage):
+            if msg.type == MessageType.text:
+                sent_at.append(_time.monotonic())
+
+    send, recv = anyio.create_memory_object_stream[OutgoingMessage](16)
+    channel = Paced(MagicMock())
+
+    start = _time.monotonic()
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(channel.send_loop, recv)
+        for i in range(20):
+            await send.send(OutgoingMessage(
+                text="thinking_tokens", user_id="u1", type=MessageType.system,
+            ))
+        await send.send(OutgoingMessage(text="answer", user_id="u1", type=MessageType.text))
+        await send.aclose()
+
+    assert len(sent_at) == 1
+    assert sent_at[0] - start < 0.15
+
+
 # ── WeixinChannel ──
 
 @pytest.mark.anyio

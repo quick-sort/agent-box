@@ -46,6 +46,11 @@ class WeixinChannel(BaseChannel):
     # per second per chat keeps bursts (tool progress) under the radar.
     min_send_interval = 1.0
 
+    def delivers(self, msg: OutgoingMessage) -> bool:
+        # Only text is rendered; other frames are dropped in send_reply and
+        # must not consume the pacing budget.
+        return msg.type == MessageType.text
+
     def __init__(self, send_stream: anyio.abc.ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
         self._store = StateStore(settings.weixin_state_dir)
