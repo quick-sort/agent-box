@@ -133,6 +133,11 @@ class QQChannel(BaseChannel):
 
     min_send_interval = _SEND_INTERVAL_S
 
+    def delivers(self, msg: OutgoingMessage) -> bool:
+        # Only text is rendered; other frames are dropped in send_reply and
+        # must not consume the pacing budget.
+        return msg.type == MessageType.text
+
     def __init__(self, send_stream: anyio.abc.ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
         self._app_id = settings.qqbot_app_id

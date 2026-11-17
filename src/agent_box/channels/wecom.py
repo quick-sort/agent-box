@@ -229,6 +229,11 @@ class WecomChannel(BaseChannel):
     # 30 messages/minute per conversation → ~2.1s spacing.
     min_send_interval = _SEND_INTERVAL_S
 
+    def delivers(self, msg: OutgoingMessage) -> bool:
+        # Only text is rendered; system/result frames are dropped in
+        # send_reply, so they must not consume the pacing budget.
+        return msg.type == MessageType.text
+
     def __init__(self, send_stream: ObjectSendStream[IncomingMessage], *, spec: ChannelSpec) -> None:
         super().__init__(send_stream)
         assert isinstance(spec.config, WecomBotConfig)

@@ -56,6 +56,17 @@ class BaseChannel(ABC):
         acks the delivery here) override this. The default is a no-op.
         """
 
+    def delivers(self, msg: OutgoingMessage) -> bool:
+        """Whether this channel will actually deliver ``msg``.
+
+        Adapters that can only render some message types (the IM channels only
+        send ``text`` in ``send_reply``) override this so ``send_loop`` does
+        not spend their per-conversation pacing budget on messages nobody will
+        ever see. The agent emits a high-frequency stream of transient
+        ``system`` frames; pacing those starves the real replies behind them.
+        """
+        return True
+
     def send_interval_for(self, msg: OutgoingMessage) -> float:
         """Pacing interval to apply before sending ``msg`` (0 = send now)."""
         return self.min_send_interval
@@ -97,7 +108,11 @@ class BaseChannel(ABC):
                 continue
 
             key = msg.conversation_id or msg.user_id
-            interval = self.send_interval_for(msg)
+            # Messages this channel drops (non-text status frames) still flow
+            # through the queue, but they must not burn the conversation's
+            # pacing budget — otherwise a burst of invisible frames delays the
+            # real answer by minutes on a rate-limited platform.
+            interval = self.send_interval_for(msg) if self.delivers(msg) else 0.0
             if interval > 0:
                 wait = last_sent.get(key, 0.0) + interval - time.monotonic()
                 if wait > 0:
@@ -133,5 +148,7 @@ class BaseChannel(ABC):
                 )
             finally:
                 # Pace from the last attempt even when it failed, otherwise a
-                # failing platform is hammered in a tight retry loop.
-                last_sent[key] = time.monotonic()
+                # failing platform is hammered in a tight retry loop. Sends we
+                # did not pace must not start a new pacing window either.
+                if interval > 0:
+                    last_sent[key] = time.monotonic()

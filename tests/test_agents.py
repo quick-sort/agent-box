@@ -161,6 +161,41 @@ async def test_run_no_response(sample_project: ProjectInfo):
 
 
 @pytest.mark.anyio
+async def test_run_drops_thinking_token_system_frames(sample_project: ProjectInfo):
+    """The high-frequency ``thinking_tokens`` stream must not reach channels.
+
+    The CLI emits one per few thinking tokens; forwarding them floods the
+    outbound queue (and, on paced channels, starves the real reply). Ordinary
+    system frames are still forwarded.
+    """
+    from claude_agent_sdk import ResultMessage, SystemMessage
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield SystemMessage(subtype="init", data={"session_id": "s1"})
+        for n in range(1, 50):
+            yield SystemMessage(
+                subtype="thinking_tokens",
+                data={"estimated_tokens": n, "estimated_tokens_delta": 1},
+            )
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=100, duration_api_ms=90,
+            num_turns=1, total_cost_usd=0.0, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("test")]
+
+    system = [m for m in msgs if m.type.value == "system"]
+    assert [m.text for m in system] == ["init"]
+
+
+@pytest.mark.anyio
 async def test_close(sample_project: ProjectInfo):
     mock_client = AsyncMock()
     agent = ClaudeCodeAgent(sample_project)

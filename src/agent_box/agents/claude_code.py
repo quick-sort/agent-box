@@ -52,6 +52,13 @@ _TOOLS_REQUIRING_USER_INPUT = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # Reply "Yes" to approve, or "No <feedback>" to send feedback to the agent.
 _PLAN_APPROVAL_HINT = "\n\n— 回复 Yes 批准 / No <修改意见> 退回修改"
 
+# ``system`` frames the CLI emits at streaming frequency rather than once per
+# event. ``thinking_tokens`` is a progress counter (one frame every couple of
+# thinking tokens), so a single turn can produce thousands. They carry no
+# information any channel renders — forwarding them floods the outbound queue
+# and, on rate-limited channels, starves the actual replies behind them.
+_NOISY_SYSTEM_SUBTYPES = frozenset({"thinking_tokens"})
+
 def _build_path_prefixes(project_path: str) -> tuple[str, ...]:
     """Collect directory prefixes to strip from file paths in tool summaries.
 
@@ -912,6 +919,8 @@ class ClaudeCodeAgent(BaseAgent):
                         # ThinkingBlock / ToolResultBlock deliberately skipped —
                         # too noisy for IM channels.
                 elif isinstance(msg, SystemMessage):
+                    if msg.subtype in _NOISY_SYSTEM_SUBTYPES:
+                        continue
                     yield OutgoingMessage(
                         text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
                         data=msg.data,
@@ -1107,6 +1116,8 @@ class ClaudeCodeAgent(BaseAgent):
                             },
                         )
             elif isinstance(msg, SystemMessage):
+                if msg.subtype in _NOISY_SYSTEM_SUBTYPES:
+                    continue
                 yield OutgoingMessage(
                     text=msg.subtype, user_id=user_id, channel=channel, type=MessageType.system,
                     data=msg.data,
