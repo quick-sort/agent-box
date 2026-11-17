@@ -42,6 +42,10 @@ def _resolve_account_id(store: StateStore) -> str | None:
 class WeixinChannel(BaseChannel):
     """Long-poll based adapter for personal WeChat via weixin_sdk."""
 
+    # The unofficial protocol throttles/risks-controls rapid sends; one message
+    # per second per chat keeps bursts (tool progress) under the radar.
+    min_send_interval = 1.0
+
     def __init__(self, send_stream: anyio.abc.ObjectSendStream[IncomingMessage]) -> None:
         super().__init__(send_stream)
         self._store = StateStore(settings.weixin_state_dir)

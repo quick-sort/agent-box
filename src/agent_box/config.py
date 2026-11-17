@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     # Emit one-line tool-call progress messages (🔧/📖/✏️ …) to the channel.
     # Set to false to keep IM channels quiet while a turn runs.
     agent_tool_progress: bool = True
+    # Minimum seconds between two tool-progress messages in a conversation.
+    # Bursts are dropped: channels rate-limit by conversation (WeCom 30/min,
+    # QQ 5 passive replies per inbound message), and a turn with 20 tool calls
+    # would otherwise exhaust the quota and lose the actual answer.
+    agent_tool_progress_interval: float = 5.0
     # Proactively compact a session when post-turn context usage exceeds this
     # percentage of the window (SDK ``ContextUsageResponse.percentage``).
     # None disables proactive compaction (turns fail at the hard limit only).

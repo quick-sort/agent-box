@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -49,6 +50,10 @@ class OutgoingMessage:
     # channels set it to the group id so the reply lands in the same group the
     # original message came from.
     conversation_id: str | None = None
+    # Monotonic timestamp of construction. Used to measure how long a message
+    # waited in the outbound queues before the channel actually sent it — the
+    # key signal when diagnosing backlog reports.
+    created_at: float = field(default_factory=time.monotonic)
 
     def __post_init__(self) -> None:
         if not self.conversation_id:

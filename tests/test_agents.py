@@ -1081,9 +1081,15 @@ def test_format_question_multiple_questions():
 
 
 @pytest.mark.anyio
-async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
+async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo, monkeypatch):
     """Multiple tool calls should each yield a brief text line."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+
+    # Progress throttling is covered separately; disable it so both tool calls
+    # in this burst are surfaced.
+    monkeypatch.setattr(
+        "agent_box.config.settings.agent_tool_progress_interval", 0.0
+    )
 
     mock_client = AsyncMock()
     mock_client.query = AsyncMock()
@@ -1120,6 +1126,55 @@ async def test_run_yields_tool_summary_as_text(sample_project: ProjectInfo):
     assert "📖 a.py" in texts
     assert "🔧 npm test" in texts
     assert "Done!" in texts
+
+
+@pytest.mark.anyio
+async def test_run_throttles_tool_progress_bursts(sample_project: ProjectInfo, monkeypatch):
+    """Only the first progress message in a burst is surfaced; answers are not throttled."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+
+    monkeypatch.setattr(
+        "agent_box.config.settings.agent_tool_progress_interval", 60.0
+    )
+
+    mock_client = AsyncMock()
+    mock_client.query = AsyncMock()
+
+    async def fake_receive():
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"})],
+            model="test",
+        )
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="t2", name="Bash", input={"command": "npm test"})],
+            model="test",
+        )
+        yield AssistantMessage(content=[TextBlock(text="Done!")], model="test")
+        yield ResultMessage(
+            subtype="result", is_error=False, duration_ms=1000, duration_api_ms=900,
+            num_turns=1, total_cost_usd=0.01, usage=None, session_id="s1",
+        )
+
+    mock_client.receive_response = fake_receive
+
+    agent = ClaudeCodeAgent(sample_project)
+    agent._client = mock_client
+    msgs = [m async for m in agent.run("test")]
+
+    texts = [m.text for m in msgs if m.type.value == "text"]
+    assert "📖 a.py" in texts
+    assert "🔧 npm test" not in texts
+    assert "Done!" in texts
+
+
+def test_progress_throttle_allows_first_then_suppresses():
+    from agent_box.agents.base import ProgressThrottle
+
+    throttle = ProgressThrottle()
+    assert throttle.allow(60.0) is True
+    assert throttle.allow(60.0) is False
+    # interval <= 0 disables throttling entirely
+    assert throttle.allow(0.0) is True
 
 
 # ── SEND_FILE marker parsing ──

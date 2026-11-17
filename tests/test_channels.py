@@ -73,6 +73,59 @@ async def test_send_loop_survives_send_reply_error():
     assert [m.text for m in replies] == ["good"]
 
 
+@pytest.mark.anyio
+async def test_send_loop_times_out_hung_send():
+    """A send that never returns is abandoned; later messages still go out."""
+    replies = []
+
+    class Hanging(BaseChannel):
+        send_timeout = 0.05
+
+        async def start(self): pass
+        async def send_reply(self, msg: OutgoingMessage):
+            if msg.text == "hang":
+                await anyio.sleep(5)
+            replies.append(msg)
+
+    send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
+    channel = Hanging(MagicMock())
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(channel.send_loop, recv)
+        await send.send(OutgoingMessage(text="hang", user_id="u1"))
+        await send.send(OutgoingMessage(text="after", user_id="u1"))
+        await send.aclose()
+
+    assert [m.text for m in replies] == ["after"]
+
+
+@pytest.mark.anyio
+async def test_send_loop_paces_per_conversation():
+    """Consecutive sends to one conversation are spaced by min_send_interval."""
+    import time as _time
+
+    sent_at: list[float] = []
+
+    class Paced(BaseChannel):
+        min_send_interval = 0.1
+
+        async def start(self): pass
+        async def send_reply(self, msg: OutgoingMessage):
+            sent_at.append(_time.monotonic())
+
+    send, recv = anyio.create_memory_object_stream[OutgoingMessage](4)
+    channel = Paced(MagicMock())
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(channel.send_loop, recv)
+        await send.send(OutgoingMessage(text="a", user_id="u1"))
+        await send.send(OutgoingMessage(text="b", user_id="u1"))
+        await send.aclose()
+
+    assert len(sent_at) == 2
+    assert sent_at[1] - sent_at[0] >= 0.09
+
+
 # ── WeixinChannel ──
 
 @pytest.mark.anyio
@@ -569,7 +622,7 @@ async def test_send_reply_with_file_path():
 
     called_with = {}
 
-    async def mock_send_media(target_id, target_type, file_path, *, msg_id=None):
+    async def mock_send_media(target_id, target_type, file_path, *, msg_id=None, msg_seq=None):
         called_with["target_id"] = target_id
         called_with["target_type"] = target_type
         called_with["file_path"] = file_path
@@ -601,7 +654,7 @@ async def test_send_reply_with_image_path_fallback():
 
     called_with = {}
 
-    async def mock_send_image(target_id, target_type, *, image_url=None, image_path=None, msg_id=None):
+    async def mock_send_image(target_id, target_type, *, image_url=None, image_path=None, msg_id=None, msg_seq=None):
         called_with["target_id"] = target_id
         called_with["image_path"] = image_path
 
@@ -615,6 +668,53 @@ async def test_send_reply_with_image_path_fallback():
 
     assert called_with["target_id"] == "user-1"
     assert called_with["image_path"] == "/tmp/photo.jpg"
+
+
+# ── QQ Channel passive-reply window ──
+
+
+def _make_qq_anchor(msg_id="msg-0", age=0.0, used=0):
+    import time
+
+    from agent_box.channels.qq import QQChannel
+
+    channel = QQChannel.__new__(QQChannel)
+    channel._last_msg_id = {"c2c:user-1": msg_id}
+    channel._passive_received_at = {"c2c:user-1": time.time() - age}
+    channel._passive_replies = {"c2c:user-1": used}
+    return channel
+
+
+def test_qq_passive_reply_stops_after_five():
+    """QQ accepts at most 5 replies per inbound msg_id; the 6th goes proactive."""
+    channel = _make_qq_anchor()
+
+    replies = [channel._next_passive_reply("c2c:user-1") for _ in range(6)]
+
+    assert [r[0] for r in replies[:5]] == ["msg-0"] * 5
+    assert [r[1] for r in replies[:5]] == [1, 2, 3, 4, 5]
+    assert replies[5][0] is None
+
+
+def test_qq_passive_reply_expires_after_five_minutes():
+    """A long-running turn outlives the 5-minute anchor; reply goes proactive."""
+    channel = _make_qq_anchor(age=301)
+
+    msg_id, _ = channel._next_passive_reply("c2c:user-1")
+
+    assert msg_id is None
+
+
+def test_qq_passive_reply_rejects_unknown_anchor():
+    from agent_box.channels.qq import QQChannel
+
+    channel = QQChannel.__new__(QQChannel)
+    channel._last_msg_id = {}
+
+    msg_id, msg_seq = channel._next_passive_reply("c2c:user-1")
+
+    assert msg_id is None
+    assert 0 <= msg_seq < 65536
 
 
 # ── QQ Channel voice transcription (GLM ASR) ──
@@ -864,6 +964,55 @@ async def test_wecom_registers_ws_client_by_instance(tmp_path):
     with patch("agent_box.tools.wecom_mcp.set_ws_client") as mock_set:
         channel._on_disconnected("some reason")
         mock_set.assert_called_once_with("wecom:prod", None)
+
+
+@pytest.mark.anyio
+async def test_wecom_retries_on_frequency_limit(tmp_path, monkeypatch):
+    """errcode 846607 is retried with backoff instead of dropped."""
+    import types
+
+    channel = _make_wecom_channel(tmp_path)
+    calls = {"n": 0}
+
+    async def send_message(chat_id, body):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError(
+                "Reply ack error: errcode=846607, errmsg=aibot send msg "
+                "frequency limit exceeded"
+            )
+
+    fake_client = MagicMock()
+    fake_client.send_message = send_message
+    channel._client = fake_client
+    # Don't actually wait between retries.
+    monkeypatch.setattr(
+        "agent_box.channels.wecom.asyncio",
+        types.SimpleNamespace(sleep=AsyncMock()),
+    )
+
+    await channel._send_text("chat-1", "hello")
+
+    assert calls["n"] == 3
+
+
+@pytest.mark.anyio
+async def test_wecom_does_not_retry_other_errors(tmp_path):
+    """Non-rate-limit failures are permanent and must not be retried."""
+    channel = _make_wecom_channel(tmp_path)
+    calls = {"n": 0}
+
+    async def send_message(chat_id, body):
+        calls["n"] += 1
+        raise RuntimeError("bad chat id")
+
+    fake_client = MagicMock()
+    fake_client.send_message = send_message
+    channel._client = fake_client
+
+    await channel._send_text("chat-1", "hello")
+
+    assert calls["n"] == 1
 
 
 # ── OdooChannel ──
